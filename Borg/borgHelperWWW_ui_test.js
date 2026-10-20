@@ -52,6 +52,16 @@ eq('liste',routePath({view:'view-machines'}),'/');
 eq('connexion : pas d\'adresse',routePath({view:'view-login'}),null);
 eq('chemin avec / de tête et doublés',routePath({view:'view-browse',nick:'s',path:'/etc//x/',archive:null}),'/explorer/s/etc/x');
 eq('nick avec / encodé',routePath({view:'view-detail',nick:'a/b'}),'/serveur/a%2Fb');
+// borgHelperWWW 1.32.0 (story 86) : mode dossier, nick exposé « préfixe:nick » — adresse encodée, relue telle quelle
+eq('nick préfixé (mode dossier) encodé',routePath({view:'view-detail',nick:'web:db'}),'/serveur/web%3Adb');
+roundTrip('nick préfixé : serveur',{view:'view-detail',nick:'web:db'});
+roundTrip('nick préfixé : explorateur',{view:'view-browse',nick:'mail:db',path:'etc/x',archive:null,changes:null});
+eq('nick préfixé non encodé (lien tapé)',parseRoute('/historique/web:db',''),{view:'view-history',nick:'web:db'});
+// UI 1.24.3 : conseil du badge « base non chiffrée » — commande CLI juste en mode dossier (rc du préfixe nommé, nick nu, aucun chemin)
+const dbEncryptCmd=new Function(grab('dbEncryptCmd')+'\nreturn dbEncryptCmd;')();
+eq('badge base non chiffrée : nick nu (mode -C)',dbEncryptCmd('srv'),'borgHelper -c DbEncrypt -n srv -y');
+eq('badge base non chiffrée : préfixe:nick -> -C <rc du préfixe>, nick nu',dbEncryptCmd('web:db'),
+   'borgHelper -C <rc du préfixe web> -c DbEncrypt -n db -y');
 
 // Adresse -> état
 eq('racine',parseRoute('/',''),{view:'view-machines'});

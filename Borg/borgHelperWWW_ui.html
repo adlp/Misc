@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.24.2 -->
+<!-- UI_VERSION: 1.24.3 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -618,11 +618,17 @@ document.getElementById('apiKeyInput').addEventListener('keydown', e=>{ if(e.key
 
 // Base restée en clair alors qu'elle devrait être chiffrée (UI 1.17.0, /access -> db_plain) : badge d'anomalie
 // seulement — rien pour une base chiffrée ni pour DB_ENCRYPT=false volontaire.
+// UI 1.24.3 (borgHelperWWW 1.32.0, mode dossier) : nick « préfixe:nick » -> la CLI vise le rc de ce préfixe, avec le nick nu
+function dbEncryptCmd(nick){
+  const i=String(nick).indexOf(':');
+  if(i<0) return `borgHelper -c DbEncrypt -n ${nick} -y`;
+  return `borgHelper -C <rc du préfixe ${nick.slice(0,i)}> -c DbEncrypt -n ${nick.slice(i+1)} -y`;
+}
 function plainDbBadge(nick){
   const bad=myAccess && myAccess.nicks[nick] && myAccess.nicks[nick].db_plain;
   if(!bad || !bad.length) return '';
   const tip=`Base(s) ${bad.join(', ')} non chiffrée(s) alors que DB_ENCRYPT est actif — les noms de fichiers y sont en clair. `
-    +`Chiffrer : borgHelper -c DbEncrypt -n ${nick} -y (sur le serveur borgHelper).`;
+    +`Chiffrer : ${dbEncryptCmd(nick)} (sur le serveur borgHelper).`;
   return `<span class="badge warn" title="${escapeAttr(tip)}">🔓 base non chiffrée</span>`;
 }
 

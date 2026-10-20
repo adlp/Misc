@@ -3173,6 +3173,140 @@ consultée directement par la suite du code.
 `trusted_proxies`) ne sont consommés que par le bloc `uvicorn.run()` en exécution directe — sans effet
 sous `uvicorn borgHelperWWW:app` externe (voir section suivante).
 
+Mode dossier (1.32.0) : clés `cfgdir`/`master` de `_CONF_KEYS` ; les trois clés de mode (`cfgfile`, `cfgdir`, `master`,
+`_MODE_ENV`) vont en bloc — un fichier ne les comble jamais si l'environnement ou la CLI ont déjà choisi un mode, ni depuis le
+`[_borgHelperWWW]` d'un rc (`_apply_conf_section(..., from_rc=True)`). En CLI, `-C` retire de l'environnement un mode dossier
+hérité, `--cfgdir`/`--master` retirent `BORGHELPERWWW_CFGFILE` ; les deux en CLI : refus.
+
+---
+
+## borgHelperWWW — mode dossier : plusieurs `.borghelperrc` (1.32.0, story 86, D194)
+
+Lancement `--cfgdir <dossier> --master <rc>` (`BORGHELPERWWW_CFGDIR`/`_MASTER`, vides = absentes), exclusif de `-C`. Résolu au
+niveau module juste après le fichier de conf ; `CFGFILE` vaut alors le chemin (lien) du maître (réglages de WWW, emplacement de
+ses bases) — jamais le rc d'un nick. `--selftest` exige `-C`. Mode `-C` : chaque site garde son appel d'avant (`_bhn(n)` rend
+`(_bh_paths, n)`, `_cfgread(n)` appelle `_bh_paths.borg.cfgread(n)`) ; seul écart voulu : le nettoyage horaire ne retire plus un
+nom `préfixe:nick` (retour du mode dossier). Mesure de non-régression (ponctuelle, `work/s86/cmp86.py`, hors push selftest) :
+38 requêtes identiques sur le bac lk, 1.31.19 et 1.32.0, trois variantes (sans groupes ; groupe `g` qui lit `la`/`lb` : 27
+réponses 200 ; groupe `gs` borné par GROUPS_PATHS : 24 réponses 200, chemins filtrés et scopecache.db) — seuls la version, la
+clé VAPID et le chemin de travail diffèrent. Elle ne couvre que ces requêtes.
+
+**Liste du maître** (`_rc_parse_master`) : `[_borgHelperWWW_rc]`, `fichier = préfixe`, lue sans interpolation et avec un
+`default_section` neutre (une clé de `[DEFAULT]` n'est jamais prise pour un rc), clés sensibles à la casse. Chemin du LIEN
+(`abspath`) gardé pour `-C` et `BorgHelper` (préfixe des bases tiré du nom listé, comme la CLI) ; chemin réel seulement pour le
+confinement sous le dossier, les doublons (un lien vers un fichier listé est un doublon) et l'identité d'un fichier (`_RcEntry.real`).
+Préfixe validé par `_valid_nick_name` de borgHelper. Chaque rc listé est ouvert puis analysé comme `BorgHelper.__init__` le lit
+(`_rc_cache_dir`). Deux rc au même `CACHE_DIR` : refus — `_DB_CFG_READERS` (borgHelper, résolution paresseuse de la passphrase par
+`_open_db`) est indexé par `CACHE_DIR`, le dernier BorgHelper construit gagnerait ; `cleanup_scan` d'un rc y verrait les fichiers de
+l'autre comme des nicks retirés ; deux rc de même nom de fichier (sous-dossiers) ont le même préfixe de base
+(`_db_name_from_cfg`) : au même `CACHE_DIR`, mêmes fichiers. `BorgHelper` impossible à construire (`CACHE_DIR` non créable) :
+problème de liste.
+
+**État** (`_RcState`, `_RC`) : `entries` {préfixe: `_RcEntry`} dans l'ordre de la liste, `unavailable` (listés, absents ou
+illisibles), `master`. `_rc_live()` compare la signature (mtime_ns, taille, inode, ctime_ns) du maître et des rc de la dernière
+liste, prise AVANT la lecture (une écriture pendant la relecture est revue à l'appel suivant) ; changée : relecture sous
+`_RC_LOCK` (`_rc_build`, BorgHelper d'un rc gardé tant que chemin, fichier réel et CACHE_DIR sont les mêmes). Liste invalide :
+`[WARN]` une fois, ancienne liste gardée, `_RC['failed']` (aucun nettoyage d'abonnement, aucune entrée borg proposée) ; rc
+indisponible : `[WARN]` une fois, retiré de `entries`. Rc devenu illisible dans une liste gardée : `_rc_bare_nicks` -> [],
+`_cfgread` -> None (jamais une erreur). Démarrage (`_rc_startup`) : tout problème en `[ERREUR]` puis `sys.exit`, avant la
+création de toute base. Requête : le middleware fige l'état et les nicks de chaque rc (`_RC_REQ`, contextvar recopiée dans les
+fils d'anyio) — `ALL` développé une fois pour le contrôle des droits et l'exécution. `_bh_paths` = BorgHelper du maître
+(scopecache.db, push.db, préférences push).
+
+**Résolution** : nick exposé `préfixe:nick` (préfixe sans « : »). `_rc_entry_of` -> (entrée, nick nu) ; `préfixe:ALL` inconnu ;
+`_bhn` -> (BorgHelper du rc, nick nu) ou HTTPException 404 ; `_cfgread` -> section ou None ; `_rc_groups` : liste vide -> 404.
+Clés internes par nick (`_RECONCILE`, `_BKPSTATE_LAST`, `_ROSTER_LAST`, `_PROBES`, `_SCHEMA_BUSY`, `_NICK_CODEC_MEMO`,
+`_RESPONSE_CACHE`, lignes de scopecache.db, `overdue_alerts`, préférences push) : nom exposé ; appels de borgHelper : nick nu,
+BorgHelper du rc. `_rc_scrub_all` retire les chemins de rc du détail d'une erreur de configuration (`_check_external_ops`).
+
+**Lancements** : `_build_borghelper_argv_env(..., cfgfile=)` — obligatoire en mode dossier (RuntimeError sinon). `_exec_dir` :
+`_rc_groups` (`ALL` : `-n ALL` par rc qui a des nicks ; absent : sans `-n` ; liste : nicks nus de ce rc), un borgHelper par rc,
+séquentiels. Plusieurs rc pour Report `-l`, RepoHistory, ArchiveHistory, LstBkpFls, DiffBkp, IdxTop/DiffTop `-j` : 400 avant tout
+lancement (`_ONE_RC_CMDS`, décision 11). Délai dépassé au k-ième rc (k > 1) : parties faites + marqueur `[ERREUR]`, code 124.
+`_rc_scrub` (stderr) : chemins du rc (lien, réel, forme JSON) -> `<rc préfixe>`, « borgHelper -c » -> « borgHelper -C <rc préfixe>
+-c » ; `_rc_scrub_out` (stdout) : seulement « … pas trouvé dans <rc> » et « Fichier <rc> absent », ligne entière — jamais les
+données. `_merge_parts` : un rc -> `_expose_stdout` ; plusieurs -> code max, stderr sous `── préfixe ──` ; JSON demandé (`-j`,
+`-R`) : objets réunis, sortie non objet d'un rc dans stderr ; sinon objets réunis s'ils le sont tous, texte concaténé sinon.
+`_merge_json` : même clé, valeur différente -> `préfixe:clé` (objets réunis récursivement) ; Report : `Totaux` = `_report_totaux`
+(somme des Totaux affichés : au plus 0,005 unité affichée d'écart par rc). `_expose_json` : clés des lecteurs multi-nicks, champ
+`nick`, Report : summary/backups, `nom`, `bkp_voisin.nick`, champ au nom du nick d'une ligne d'archive. DuIdx `-j` sur plusieurs rc :
+`-R` puis `_recompute_duidx`, `error` « préfixe : … » de chaque rc gardée, aucune ligne -> `{}`. `_launch_bkp_detached` : un
+détaché par rc ; refusé sur certains rc seulement : `_PartialLaunch` -> 500 qui dit les rc lancés. `_reconcile_run` : `_argv_env_for`.
+
+**Empreintes** : `_cache_db_paths`, `_capture_fingerprints` (`cfgfile:` = mtime du rc du nick), `_bkp_markers_state` (marqueurs de
+chaque rc). Constat mesuré en story 86 (bac lk, Python système, les deux modes, 1.31.19 compris) : le `-wal` vide d'une base
+est recréé par chaque lecture — sa date change, l'empreinte des routes à périmètre aussi : leurs lignes de scopecache.db ne sont
+jamais resservies (non corrigé ici).
+
+**Nettoyage** (`_dir_cleanup_scan`) : fichiers borgHelper = réunion des `cleanup_scan` des rc ; entrées borg = intersection par
+id des scans des rc qui ont des nicks (`_borg_leftovers` ne dépend des dépôts d'un rc que pour un emplacement ABSENT) ; rc listé
+indisponible ou liste invalide : aucune entrée borg (doute).
+
+**Abonnements** (`_migrate_push_bare_nicks`, démarrage, décisions 7 et 9) : nom sans « : » que le MAÎTRE a -> `maître:nick` dans
+`scope_nicks` et `hosts` (réglages de la forme préfixée gardés si les deux existent), et dans `overdue_alerts` (« #sentry »
+compris, `UPDATE OR IGNORE`) ; sinon `[WARN]` par nom (« jamais rattaché à » l'homonyme d'un autre rc), laissé. Essai à blanc sur
+une copie, écriture seulement si quelque chose change. **Préfixe réattribué** (décision 10, `_rc_files_check`, à chaque liste
+prise) : `<préférences push sans .json>-rc-files.json` (à côté des préférences, verrou `.lock`, écriture atomique) mémorise le fichier
+réel (relatif au dossier) de chaque préfixe vu ; autre fichier -> préfixe dans `_RC['suspended']` : `_push_muted` rend « préfixe réattribué » (aucun
+envoi), `_check_overdue` s'arrête (ni push ni Sentry de retard), `[WARN]` une fois ; jamais réécrit pour un préfixe connu (reprise :
+ancien fichier remis, ou ligne retirée par l'administrateur). `_push_prune_keep` garde en mode dossier : nick connu, nom nu, nick
+d'un rc indisponible ou d'un préfixe suspendu ; tout si la dernière relecture a échoué ; en mode `-C` : tout nom préfixé.
+Notification : nom exposé (décision 8).
+
+**Login** (mode dossier) : `nickname` `préfixe:nick` obligatoire, préfixe servi, nick nu validé ; `_default_section_groups(nick)`
+lit le `[DEFAULT]` du rc du préfixe (droit admin d'un nick neuf ; inconnu : {} -> 403).
+
+**Garde AST** (push selftest) : hors `push_selftest`, `_bh_paths` et `CFGFILE` ne sont lus que par une liste exacte de fonctions.
+
+**Revue 2** : `_check_group_access` — `nick` absent = défaut de la route (`_ROUTE_NICK_DEFAULT`, tous les nicks), contrôlé
+(correctif de sécurité, mode `-C` compris). `_rc_build` : CACHE_DIR d'un rc indisponible réservé (`_RC['known_cache']`), liste
+entière validée (`_rc_dir_usable`, rien créé) avant toute construction de BorgHelper, `_DB_CFG_READERS` rendu si une
+construction échoue. `_rc_live` : fichiers servis toujours surveillés sous une liste refusée, nouvel essai toutes les `_RC_RETRY`
+s, mémoire des préfixes dans la signature, `on_build` gardé (`[WARN]`, jamais une erreur), `[WARN]` section `[_borgHelperWWW]`
+d'un rc ajouté à chaud ; maître relu par `realpath` à chaque construction. Middleware : `_rc_req_new` par `run_in_threadpool` ;
+`_rc_snapshot` autour des passes du watcher, du contrôle de schéma et du nettoyage horaire. `_rc_groups(nick, cmd, args, skipped)`
+: `ALL`/absent -> liste explicite des nicks de l'instantané, moins ceux dont `command_op(cmd)` n'est pas permis (`op_allowed`, comme
+`-n ALL` de la CLI) ; groupe vide : rien lancé. `_rc_launch_check` (chaque lancement) : CACHE_DIR relu dans le rc = celui de
+l'état servi, sinon 503. `_exec_dir` : `X-Borg-Passphrase` sur plusieurs rc -> 400. `_SCOPED_CALL` (`_scoped_exec`) : sortie non
+JSON d'un rc jamais recopiée pour un appelant à périmètre. `_cfgread` (mode dossier) : erreur de configparser remontée (500
+« configuration illisible »). Report : champ nick d'une sauvegarde renommé seulement si sa valeur est la clé de la ligne.
+Mémoire des préfixes (`PUSH_RC_FILES`) : identité = chemin réel relatif au dossier (`_rc_ident`), suspensions calculées avant
+l'écriture, doute (illisible, verrou) -> préfixes non prouvés inchangés dans ce processus (`_RC['proven']`) suspendus, fsync.
+`_push_suspended` : 409 à l'abonnement et au PATCH, hôtes suspendus hors du périmètre et de la synchro, `/access`
+`suspended_prefixes`/`prefix_suspended` (mode dossier). Migration : `db_meta` `dirmode_migrated` (une fois par push.db), ligne nue
+d'`overdue_alerts` retirée si la préfixée existe. `--selftest` refusé dès la résolution du mode. **Limite** : DuIdx `-R` sur
+plusieurs rc lit les lignes brutes de chaque rc entières en mémoire.
+
+**Revue 3** : `_single_nick_scope(request, nick, for_restore)` (LstBkpFls, DiffBkp, `require_path_in_scope` : Restore, Restore -L,
+téléchargements) — périmètre de chaque nick de `_nick_list(nick)` ; appelant à périmètre sur l'un d'eux : `nick` doit être
+exactement ce nick unique (`ALL`, vide, espaces, liste, doublon -> 400). `_rc_groups` : `nick=''` -> 404 (seul `None` = défaut de la
+route) ; `stats` sans nick -> chaque rc ayant des sections, sans `-n` ; opération de Restore lue `read` seulement si `-L` est un
+drapeau (`_opt_values`), jamais la valeur de `-f`. `_check_group_access` : `/stats` sans nick contrôle `_stats_sections()` (sections
+de `stats(None)` : toutes sauf DEFAULT et `_*`, via `_rc_sections`). Mode dossier : `BORGHELPERC_RUNTIME_PASSPHRASE` dans
+l'environnement -> refus au démarrage. `_apply_conf_section` : `BORGHELPERWWW_CFGFILE` présent (même vide) et section sans
+cfgdir/master -> jamais comblé (1.31.19). Abonnements : hôtes suspendus filtrés de `body.hosts` (POST, PATCH) sans 409 ; ceux de
+l'entrée existante gardés (`_set`, `_sync`). `/access` : `suspended_prefixes`/`prefix_suspended` limités aux nicks de niveau ≠ none.
+Migration : marque `dirmode_migrated` seulement si les préférences ont été lues (`probe is not None`) ; marque posée : `[WARN]`
+par nom nu restant. Mémoire des préfixes : `_rc_on_build` — échec -> `_RC['mem_retry_at']` (nouvel essai à l'échéance dans
+`_rc_live`, même sans changement de fichier), `[WARN]` une fois. **Limite** (row 54) : la liste explicite est filtrée par
+`op_allowed` sur l'instantané de la requête ; un nick devenu externe (rc modifié) entre ce filtre et le lancement fait sortir
+l'enfant en code 4 (`require_op` d'un nick nommé) — tout son rc sauté pour cette requête, là où `-n ALL` n'aurait écarté que lui.
+Fenêtre étroite (une modification du rc pendant la requête), aucune action faite à tort.
+
+**Push selftest** (25 contrôles) : liste du maître (liens), sorties exposées/fusionnées (appelant à périmètre, colonne au nom d'un
+nick), nettoyage, correctif `nick` absent (mode `-C`, chaque route à défaut, sans droit 403 / avec droits inchangé), route à un nick
+à périmètre (mode `-C` : 20 formes refusées sans lancement, témoin lancé), `/stats` sans nick (section à clé ALL contrôlée), nettoyage
+en `-C`, miroir DuIdx, garde AST, 14 démarrages (refusés et valide), précédence des modes (`--selftest` : aucun fichier créé),
+passphrase d'environnement refusée en mode dossier, `cfgfile` vide en `-C`, migration réessayée après préférences illisibles, puis un
+enfant RÉEL en `--cfgdir/--master` : noms, `[_borgHelperWWW]` du maître seul, bases de WWW au maître, fichiers par préfixe, argv de
+chaque borgHelper lancé (listes explicites, passphrase multi-rc 400, 503 au lancement), 400 de la décision 11, lancement partiel et
+délai, nick inconnu (comparé à la CLI), groupes, périmètres et Login par rc, migration (maître seulement, une fois, ligne nue
+retirée) et nom de la notification, rechargement à chaud (ajout, modification, retrait, doublon, rc illisible et absent, préfixe
+réattribué : alertes, 409, `/access`, doute, levée ; CACHE_DIR inutilisable ou réservé, lien, écriture pendant la relecture,
+instantané de requête), lectures réelles par rc (dépôts du bac : LstBkp, Report, TreeHist, téléchargements, invalidation des
+caches par rc, DuIdx `ALL`, `/access`, watcher, rapprochement). Les lectures réelles exigent deux nicks à dépôt local et
+`BORG_EXE` (bac lk) : FAIL sinon.
+
 ---
 
 ## borgHelperWWW — IP client réelle derrière un reverse proxy (`FORWARDED_ALLOW_IPS`)

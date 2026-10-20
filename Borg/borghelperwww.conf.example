@@ -14,6 +14,12 @@
 ; .borghelperrc dédié à l'API (distinct de celui de l'admin CLI) — BORGHELPERWWW_CFGFILE / -C
 cfgfile = /etc/borghelperrc-www
 
+; Mode dossier (borgHelperWWW >= 1.32.0), À LA PLACE de cfgfile : plusieurs .borghelperrc servis, nicks
+; « préfixe:nick » — BORGHELPERWWW_CFGDIR / --cfgdir et BORGHELPERWWW_MASTER / --master. Le maître (relatif
+; au dossier) porte [_borgHelperWWW] et la liste [_borgHelperWWW_rc] « fichier = préfixe » (README.md).
+;cfgdir = /etc/borghelper
+;master = web.rc
+
 ; Clé partagée attendue dans le header X-API-Key — BORGHELPERWWW_API_KEY / -K
 ; Absente : borgHelperWWW en génère une aléatoirement au démarrage et l'affiche sur stderr
 ; (pratique en dev/démo, perdue au redémarrage — pour une clé stable, la fournir explicitement).

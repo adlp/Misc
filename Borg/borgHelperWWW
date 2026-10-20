@@ -71,7 +71,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
-                         op_allowed, allowed_ops, is_external, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,
+                         op_allowed, allowed_ops, is_external, command_op, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,   # command_op : 1.32.0 (row 26)
                          _group_pids, _group_alive, _group_wait,   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
                          RK_CLOSED, RK_ABSENT, RK_ALIVE, RK_ORPHAN, RK_BADEND, RK_NOTCLOSED,   # 1.31.8 : états de BkpReconcile
                          RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE, RK_NOPASS,   # 1.31.15 : passphrase absente (story 77)
@@ -81,12 +81,12 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.31.19"
+WWW_VERSION="1.32.0"
 # Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
 # nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
 # selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
 _SCG_WL_WWW={'_push_conn':1}
-_SCG_SEEN_WWW=18
+_SCG_SEEN_WWW=20   # 1.32.0 (story 86) : + _migrate_push_bare_nicks (marque, overdue_alerts)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -107,6 +107,10 @@ if __name__=='__main__':
                      "la ligne de commande/l'environnement (déf. BORGHELPERWWW_CONF, voir "
                      "borghelperwww.conf.example)")
     _p.add_argument('-C','--cfgfile',help="Chemin vers le .borghelperrc dédié à l'API (déf. BORGHELPERWWW_CFGFILE)")
+    _p.add_argument('--cfgdir',help="Mode dossier (1.32.0) : dossier des .borghelperrc servis, avec --master — exclusif de -C ; "
+                     "nicks exposés en préfixe:nick (déf. BORGHELPERWWW_CFGDIR)")
+    _p.add_argument('--master',help="Mode dossier : rc maître (relatif à --cfgdir, ou absolu dedans) — seul lu pour "
+                     "[_borgHelperWWW], porte la liste [_borgHelperWWW_rc] « fichier = préfixe » (déf. BORGHELPERWWW_MASTER)")
     _p.add_argument('-K','--api-key',help="Clé partagée attendue dans X-API-Key (déf. BORGHELPERWWW_API_KEY)")
     _p.add_argument('--borghelper-bin',help="Chemin du script borgHelper (déf. BORGHELPERWWW_BORGHELPER_BIN)")
     _p.add_argument('--ui-file',help="Chemin de borgHelperWWW_ui.html (déf. BORGHELPERWWW_UI_FILE, sinon à "
@@ -163,6 +167,13 @@ if __name__=='__main__':
     _args=_p.parse_args()
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
+    # 1.32.0 (story 86) : la ligne de commande choisit le mode — un mode venu de l'environnement est écarté (les deux en CLI : refus)
+    if _args.cfgfile and not (_args.cfgdir or _args.master):
+        os.environ.pop('BORGHELPERWWW_CFGDIR',None); os.environ.pop('BORGHELPERWWW_MASTER',None)
+    if _args.cfgdir or _args.master:
+        if not _args.cfgfile: os.environ.pop('BORGHELPERWWW_CFGFILE',None)
+        if _args.cfgdir: os.environ['BORGHELPERWWW_CFGDIR']=_args.cfgdir
+        if _args.master: os.environ['BORGHELPERWWW_MASTER']=_args.master
     if _args.api_key: os.environ['BORGHELPERWWW_API_KEY']=_args.api_key
     if _args.borghelper_bin: os.environ['BORGHELPERWWW_BORGHELPER_BIN']=_args.borghelper_bin
     if _args.ui_file: os.environ['BORGHELPERWWW_UI_FILE']=_args.ui_file
@@ -196,15 +207,26 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
             'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB',
             'push_prefs':'BORGHELPERWWW_PUSH_PREFS',
-            'user_header':'BORGHELPERWWW_USER_HEADER','require_user':'BORGHELPERWWW_REQUIRE_USER'}
+            'user_header':'BORGHELPERWWW_USER_HEADER','require_user':'BORGHELPERWWW_REQUIRE_USER',
+            'cfgdir':'BORGHELPERWWW_CFGDIR','master':'BORGHELPERWWW_MASTER'}   # 1.32.0 (story 86) : mode dossier
+_MODE_ENV=('BORGHELPERWWW_CFGFILE','BORGHELPERWWW_CFGDIR','BORGHELPERWWW_MASTER')
 
-def _apply_conf_section(sect):
+def _apply_conf_section(sect,from_rc=False):
     """Comble os.environ depuis une SectionProxy configparser selon _CONF_KEYS — ne touche jamais une
     variable déjà présente (priorité : CLI/env toujours prioritaires sur tout fichier). Factorisé pour
     être partagé par borghelperwww.conf et .borghelperrc[_borgHelperWWW] (spec-
-    borghelperrc-www-section) — même règle, deux sources possibles."""
+    borghelperrc-www-section) — même règle, deux sources possibles.
+    1.32.0 (story 86) : clés de mode (cfgfile, cfgdir, master) en bloc — jamais comblées si un mode est déjà choisi (CLI/env),
+    jamais depuis le [_borgHelperWWW] d'un rc (`from_rc` : le rc lu est déjà celui du mode choisi)."""
+    mode_set=any(os.environ.get(v) for v in _MODE_ENV)   # revue 1 (row 18) : variable de mode vide = absente
     for _key,_envvar in _CONF_KEYS.items():
-        if _envvar not in os.environ and _key in sect:
+        if _envvar in _MODE_ENV:
+            if from_rc or mode_set or _key not in sect: continue
+            # revue 3 (row 53) : -C seul en jeu (ni cfgdir ni master dans la section) — BORGHELPERWWW_CFGFILE présent, même vide,
+            # jamais comblé (comportement de 1.31.19)
+            if _envvar=='BORGHELPERWWW_CFGFILE' and _envvar in os.environ and not ({'cfgdir','master'}&set(sect.keys())): continue
+            os.environ[_envvar]=sect[_key]
+        elif _envvar not in os.environ and _key in sect:
             os.environ[_envvar]=sect[_key]
 
 _conf_path=os.environ.get('BORGHELPERWWW_CONF')
@@ -225,7 +247,34 @@ if _conf_path:
 # ci-dessus (BORGHELPERWWW_CFGFILE) — jamais un autre, et jamais 'cfgfile' lui-même (circulaire, la clé
 # est de toute façon déjà dans os.environ à ce stade si elle existe, donc naturellement ignorée par
 # _apply_conf_section). Même style que ci-dessus (configparser par défaut, options insensibles à la casse).
-_www_cfgfile=os.environ.get('BORGHELPERWWW_CFGFILE')
+# 1.32.0 (story 86, D194, décisions de l'utilisateur) : mode dossier — `--cfgdir <dossier> --master <rc>` (exclusif de -C) ; le
+# maître porte [_borgHelperWWW] (seul lu) et la liste des rc servis [_borgHelperWWW_rc] (`fichier = préfixe`). Résolu ICI (après
+# borghelperwww.conf, qui peut le donner) : la section [_borgHelperWWW] lue juste dessous est celle du maître, jamais une autre.
+_CFGDIR_RAW=os.environ.get('BORGHELPERWWW_CFGDIR') or None; _MASTER_RAW=os.environ.get('BORGHELPERWWW_MASTER') or None
+DIR_MODE=bool(_CFGDIR_RAW or _MASTER_RAW)
+# revue 1 (row 12) : chemins du LIEN (abspath) pour -C et BorgHelper — préfixe des bases tiré du nom listé, comme la CLI ;
+# chemins réels (realpath, *_REAL) seulement pour le confinement, les doublons et l'identité d'un fichier
+CFGDIR=MASTER=CFGDIR_REAL=MASTER_REAL=None
+if DIR_MODE:
+    if os.environ.get('BORGHELPERWWW_CFGFILE'):
+        sys.exit("[ERREUR] -C/--cfgfile (BORGHELPERWWW_CFGFILE) et --cfgdir/--master (BORGHELPERWWW_CFGDIR/_MASTER) sont "
+                 "exclusifs — un seul mode de configuration")
+    if not (_CFGDIR_RAW and _MASTER_RAW):
+        sys.exit("[ERREUR] mode dossier : --cfgdir (BORGHELPERWWW_CFGDIR) et --master (BORGHELPERWWW_MASTER) vont ensemble")
+    CFGDIR=os.path.abspath(_CFGDIR_RAW); CFGDIR_REAL=os.path.realpath(_CFGDIR_RAW)
+    if not os.path.isdir(CFGDIR): sys.exit(f"[ERREUR] mode dossier : dossier des rc introuvable : {CFGDIR}")
+    MASTER=os.path.abspath(_MASTER_RAW if os.path.isabs(_MASTER_RAW) else os.path.join(CFGDIR,_MASTER_RAW))
+    MASTER_REAL=os.path.realpath(MASTER)
+    if os.path.commonpath([MASTER_REAL,CFGDIR_REAL])!=CFGDIR_REAL:
+        sys.exit(f"[ERREUR] mode dossier : le maître {MASTER} n'est pas dans le dossier des rc {CFGDIR}")
+    if not os.path.isfile(MASTER): sys.exit(f"[ERREUR] mode dossier : maître introuvable : {MASTER}")
+    if _SELFTEST_REQUESTED:   # revue 1 (row 19) / revue 2 (row 37) : refusé AVANT tout effet (bases, mémoire, migration)
+        sys.exit("[ERREUR] --selftest exige -C (rc du bac à sable) — jamais --cfgdir/--master")
+    if 'BORGHELPERC_RUNTIME_PASSPHRASE' in os.environ:   # revue 3 (row 46) : jamais la passphrase d'un hôte remise aux rc de tous
+        sys.exit("[ERREUR] mode dossier : BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement du serveur refusée — elle serait "
+                 "transmise au borgHelper de chaque rc ; passphrase dans chaque rc, ou X-Borg-Passphrase par requête")
+
+_www_cfgfile=MASTER if DIR_MODE else os.environ.get('BORGHELPERWWW_CFGFILE')
 if _www_cfgfile and os.path.isfile(_www_cfgfile):
     _cp2=configparser.ConfigParser()
     try:
@@ -234,7 +283,7 @@ if _www_cfgfile and os.path.isfile(_www_cfgfile):
         pass  # fichier réellement invalide : cfgread() (borgHelper) donnera l'erreur détaillée plus bas
     else:
         if _cp2.has_section('_borgHelperWWW'):
-            _apply_conf_section(_cp2['_borgHelperWWW'])
+            _apply_conf_section(_cp2['_borgHelperWWW'],from_rc=True)
 
 def _env_bool(name,default):
     v=os.environ.get(name)
@@ -242,7 +291,8 @@ def _env_bool(name,default):
     return v.strip().lower() in ('1','true','yes','on')
 
 BORGHELPER_BIN=Path(os.environ.get('BORGHELPERWWW_BORGHELPER_BIN',Path(__file__).resolve().parent/'borgHelper'))
-CFGFILE=os.environ.get('BORGHELPERWWW_CFGFILE')
+# Mode dossier (1.32.0) : le maître — réglages de WWW et emplacement de ses bases propres ; jamais le rc d'un nick (_bhn)
+CFGFILE=MASTER if DIR_MODE else os.environ.get('BORGHELPERWWW_CFGFILE')
 API_KEY=os.environ.get('BORGHELPERWWW_API_KEY')
 TIMEOUT=int(os.environ.get('BORGHELPERWWW_TIMEOUT','3600')) or None
 if TIMEOUT is not None and TIMEOUT<0:   # 1.31.0 (revue story 41) : négatif = borg tué à la première vérification
@@ -434,6 +484,338 @@ def _warn_stray_borghelperwww_keys(cfgfile):
               file=sys.stderr,flush=True)
 
 _warn_stray_borghelperwww_keys(CFGFILE)
+
+# ── Mode dossier : rc servis (1.32.0, story 86, D194) ─────────────────────────────────────────────
+# Table « préfixe -> (rc, BorgHelper de ce rc) » construite depuis [_borgHelperWWW_rc] du maître. Nick exposé = `préfixe:nick`
+# partout côté WWW (API, clés internes, abonnements, caches) ; chaque borgHelper lancé reçoit le -C du rc du nick et le nick NU
+# (_rc_groups, _argv_env_for) ; toute lecture de base passe par le BorgHelper de ce rc (_bhn). Relue à chaud : signature
+# (mtime, taille, inode, ctime) du maître et de chaque rc listé, comparée à chaque _rc_state().
+_RC_LIST_SECTION='_borgHelperWWW_rc'
+
+class _RcEntry:
+    """Un rc servi : préfixe, chemin du lien (abspath : seul -C passé à borgHelper, nom des bases), chemin réel (identité),
+    nom listé (journal), CACHE_DIR réel, BorgHelper."""
+    def __init__(self,prefix,path,listed,cache_dir,bh,real=None):
+        self.prefix=prefix; self.path=path; self.listed=listed; self.cache_dir=cache_dir; self.bh=bh
+        self.real=real or os.path.realpath(path)
+
+class _RcState:
+    """Liste en vigueur : entries {préfixe: _RcEntry} (ordre de la liste du maître, rc disponibles seulement), unavailable
+    {préfixe} (listés mais absents ou illisibles), master (_RcEntry du maître)."""
+    def __init__(self,entries,unavailable,master):
+        self.entries=entries; self.unavailable=unavailable; self.master=master
+
+def _rc_parse_master(master,cfgdir):
+    """Liste [_borgHelperWWW_rc] du maître -> ([(préfixe, chemin du lien, nom listé)], problèmes). Lue sans interpolation et sans
+    fusion de [DEFAULT] (default_section neutre : une clé de [DEFAULT] n'est jamais prise pour un rc), clés sensibles à la casse
+    (noms de fichiers). Problèmes : maître illisible, section absente, préfixe invalide (mêmes caractères qu'un nick,
+    _valid_nick_name) ou en double, fichier absolu ou hors du dossier, fichier listé deux fois, maître absent de sa liste.
+    Revue 1 (row 12) : chemin du lien (abspath) rendu ; chemin réel pour le confinement et les doublons seulement."""
+    try:
+        with open(master,encoding='utf-8') as f: txt=f.read()
+        cp=configparser.ConfigParser(interpolation=None,default_section='\x00defaut-neutre'); cp.optionxform=str
+        cp.read_string(txt,source=os.path.basename(master))
+    except (OSError,UnicodeDecodeError,configparser.Error) as e:
+        return [],[f"maître illisible ({type(e).__name__} : {e})"]
+    if not cp.has_section(_RC_LIST_SECTION):
+        return [],[f"section [{_RC_LIST_SECTION}] absente du maître (une ligne « fichier = préfixe » par rc servi, maître compris)"]
+    creal=os.path.realpath(cfgdir)
+    out=[]; probs=[]; by_prefix={}; by_path={}
+    for fname,prefix in cp.items(_RC_LIST_SECTION):
+        fname=fname.strip(); prefix=(prefix or '').strip()
+        if not _valid_nick_name(prefix):
+            probs.append(f"préfixe invalide {prefix!r} ({fname}) — lettres, chiffres, « . », « _ », « - » (début : lettre ou chiffre), "
+                         "ni ALL ni DEFAULT"); continue
+        if prefix in by_prefix: probs.append(f"préfixe en double : {prefix} ({by_prefix[prefix]}, {fname})"); continue
+        if not fname or os.path.isabs(fname):
+            probs.append(f"{fname or '(vide)'} : chemin relatif au dossier des rc attendu"); continue
+        path=os.path.abspath(os.path.join(cfgdir,fname)); real=os.path.realpath(path)
+        if os.path.commonpath([real,creal])!=creal: probs.append(f"{fname} : hors du dossier des rc"); continue
+        if real in by_path: probs.append(f"{fname} listé deux fois ({by_path[real]})"); continue
+        by_prefix[prefix]=fname; by_path[real]=fname; out.append((prefix,path,fname))
+    if not probs and os.path.realpath(master) not in by_path:
+        probs.append(f"le maître {os.path.basename(master)} n'est pas dans sa propre liste [{_RC_LIST_SECTION}]")
+    return out,probs
+
+def _rc_cache_dir(path):
+    """CACHE_DIR réel d'un rc, lu comme BorgHelper.__init__ (ConfigParser par défaut, [DEFAULT] cache_dir, ~ développé). Lève
+    OSError/UnicodeDecodeError/configparser.Error si le rc est absent, illisible ou invalide (configparser.read ignore en
+    silence un fichier qu'il ne peut pas ouvrir : ouverture d'abord)."""
+    with open(path,encoding='utf-8') as f: txt=f.read()
+    cp=configparser.ConfigParser(); cp.read_string(txt,source=os.path.basename(path))
+    return os.path.realpath(os.path.expanduser(cp.defaults().get('cache_dir','~/.cache/borghelper')))
+
+def _rc_dir_usable(d):
+    """CACHE_DIR créable/utilisable SANS rien créer (revue 2, row 28) : dossier existant accessible en écriture, ou plus proche
+    ancêtre existant qui l'est."""
+    p=d
+    while not os.path.exists(p):
+        q=os.path.dirname(p)
+        if q==p: return False
+        p=q
+    return os.path.isdir(p) and os.access(p,os.W_OK|os.X_OK)
+
+def _rc_build(old=None):
+    """-> (_RcState | None, problèmes de liste, rc indisponibles, chemins listés). Problème de liste (dont deux rc au même
+    CACHE_DIR : la passphrase d'une base y serait lue dans l'autre rc — _DB_CFG_READERS de borgHelper est indexé par CACHE_DIR —
+    et BorgCleanup d'un rc y verrait les bases de l'autre comme des nicks retirés ; revue 1 (row 4) : BorgHelper impossible à
+    construire, CACHE_DIR non créable) : None. BorgHelper d'un rc gardé (`old`) tant que son chemin et son CACHE_DIR ne changent
+    pas (état par processus de borgHelper conservé). Revue 2 : rc indisponible compté avec son dernier CACHE_DIR connu (row 24) ;
+    liste ENTIÈRE validée avant toute construction de BorgHelper, lecteurs de passphrase de borgHelper rendus si une construction
+    échoue quand même (row 28 : jamais un lecteur enregistré pour une liste refusée)."""
+    lst,probs=_rc_parse_master(MASTER,CFGDIR)
+    files=[path for _x,path,_y in lst]
+    if probs: return None,probs,[],files
+    found=[]; unav=[]; caches={}
+    for prefix,path,fname in lst:
+        try: cache=_rc_cache_dir(path)
+        except (OSError,UnicodeDecodeError,configparser.Error) as e:
+            unav.append((prefix,f"{fname} (préfixe {prefix}) absent ou illisible ({type(e).__name__} : {e})"))
+            k=_RC['known_cache'].get(path)   # dernier CACHE_DIR connu de ce rc (même devenu indisponible) : toujours réservé
+            if k is not None: caches.setdefault(k,fname)
+            continue
+        if cache in caches:
+            probs.append(f"{fname} et {caches[cache]} partagent CACHE_DIR {cache} — un CACHE_DIR distinct par rc (bases et passphrases "
+                         "jamais mélangées)"); continue
+        caches[cache]=fname; found.append((prefix,path,fname,cache))
+    for prefix,path,fname,cache in found:
+        if not _rc_dir_usable(cache): probs.append(f"{fname} (préfixe {prefix}) : CACHE_DIR {cache} inutilisable (non créable)")
+    if probs: return None,probs,unav,files
+    readers=getattr(sys.modules.get(BorgHelper.__module__),'_DB_CFG_READERS',None); saved=dict(readers) if readers is not None else None
+    entries={}
+    for prefix,path,fname,cache in found:
+        e=(old or {}).get(prefix)
+        if e is None or e.path!=path or e.real!=os.path.realpath(path) or e.cache_dir!=cache:
+            try: e=_RcEntry(prefix,path,fname,cache,BorgHelper(cfgfile=path))
+            except (Exception,SystemExit) as x:
+                probs.append(f"{fname} (préfixe {prefix}) : CACHE_DIR {cache} inutilisable ({type(x).__name__} : {x})"); break
+        else: e.listed=fname
+        entries[prefix]=e
+    if probs:
+        if saved is not None: readers.clear(); readers.update(saved)
+        return None,probs,unav,files
+    mreal=os.path.realpath(MASTER)   # revue 2 (row 38) : maître lien re-ciblé : relu à chaque relecture
+    master=next((e for e in entries.values() if e.real==mreal),None)
+    if master is None:   # maître listé mais illisible à la relecture (lu juste avant : course) — liste refusée cette fois
+        return None,[f"maître {os.path.basename(MASTER)} illisible pendant la relecture"],unav,files
+    return _RcState(entries,{p for p,_m in unav},master),[],unav,files
+
+def _rc_www_section_warn(e):
+    """[WARN] : section [_borgHelperWWW] d'un rc qui n'est pas le maître — jamais lue (décision 3) ; au démarrage et à chaud (row 42)."""
+    try:
+        with open(e.path,encoding='utf-8') as f: txt=f.read()
+        cp=configparser.ConfigParser(interpolation=None); cp.read_string(txt)
+        if cp.has_section('_borgHelperWWW'):
+            print(f"[WARN] mode dossier : {e.listed} (préfixe {e.prefix}) a une section [_borgHelperWWW] — ignorée : seule celle "
+                  f"du maître est lue",file=sys.stderr,flush=True)
+    except (OSError,UnicodeDecodeError,configparser.Error): pass
+
+def _rc_stat(p):
+    try: s=os.stat(p); return (s.st_mtime_ns,s.st_size,s.st_ino,s.st_ctime_ns)
+    except OSError: return None
+
+# failed : la dernière relecture a échoué (ancienne liste gardée — aucun nettoyage d'abonnement sur un état périmé, row 11) ;
+# suspended : préfixes réattribués à un autre fichier (décision 10, _rc_files_check) ; on_build : appelé après chaque liste prise
+_RC={'state':None,'sig':None,'files':[],'warned':set(),'failed':False,'suspended':set(),'on_build':None,'known_cache':{}}
+_RC_LOCK=threading.Lock()
+import contextvars
+_RC_REQ=contextvars.ContextVar('borghelperwww_rc_req',default=None)   # revue 1 (row 7) : instantané de la requête en cours
+
+def _rc_warn(msgs):
+    """[WARN] une fois par problème tant qu'il dure (un problème disparu puis revenu est redit)."""
+    cur=set(msgs)
+    for m in msgs:
+        if m not in _RC['warned']: print(f"[WARN] mode dossier : {m}",file=sys.stderr,flush=True)
+    _RC['warned']=cur
+
+_RC_RETRY=30.0   # s : liste refusée — nouvel essai même sans changement de fichier (état extérieur : CACHE_DIR corrigé, row 34)
+
+def _rc_sig(files):
+    """Signature : maître, rc listés, et mémoire des fichiers par préfixe (row 36 : une levée de suspension vue sans attendre)."""
+    mem=globals().get('PUSH_RC_FILES')
+    return (_rc_stat(MASTER),tuple(_rc_stat(f) for f in files),_rc_stat(mem) if mem else None)
+
+def _rc_live():
+    """Liste en vigueur, relue si le maître, un rc listé ou la mémoire des préfixes a changé (requête suivante : pris en compte
+    sans redémarrage). Liste invalide : [WARN] une fois, ancienne liste gardée — ses fichiers restent surveillés avec ceux de la
+    nouvelle liste, nouvel essai toutes les _RC_RETRY s (row 34) ; rc listé absent ou illisible : [WARN] une fois, ses nicks
+    absents (dits « indisponibles » : jamais retirés des abonnements). Revue 1 (row 3) : signature prise AVANT la lecture.
+    Revue 2 (row 30) : mémoire des préfixes en échec : [WARN], jamais une erreur."""
+    sig=_rc_sig(_RC['files'])
+    retry=_RC['failed'] and time.monotonic()>=_RC.get('retry_at',0)
+    mem=_RC.get('mem_retry_at') is not None and time.monotonic()>=_RC['mem_retry_at']   # revue 3 (row 51)
+    if sig==_RC['sig'] and not retry and not mem: return _RC['state']
+    with _RC_LOCK:
+        sig=_rc_sig(_RC['files'])
+        retry=_RC['failed'] and time.monotonic()>=_RC.get('retry_at',0)
+        if sig==_RC['sig'] and not retry:
+            if _RC.get('mem_retry_at') is not None and time.monotonic()>=_RC['mem_retry_at']: _rc_on_build(_RC['state'])
+            return _RC['state']
+        old=_RC['state']
+        st,probs,unav,files=_rc_build({p:e for p,e in old.entries.items()})
+        if st is None:
+            served=[e.path for e in old.entries.values()]
+            if files or served: _RC['files']=list(dict.fromkeys(served+files))
+            _RC['failed']=True; _RC['retry_at']=time.monotonic()+_RC_RETRY
+            _rc_warn([f"{m} — ancienne liste des rc gardée" for m in probs]+[m for _x,m in unav])
+        else:
+            if files: _RC['files']=files
+            _RC['state']=st; _RC['failed']=False; _rc_warn([m for _x,m in unav])
+            _RC['known_cache'].update({e.path:e.cache_dir for e in st.entries.values()})
+            for p,e in st.entries.items():
+                if e is not st.master and old.entries.get(p) is not e: _rc_www_section_warn(e)   # rc ajouté ou changé à chaud
+            _rc_on_build(st)
+        _RC['sig']=sig
+        return _RC['state']
+
+def _rc_on_build(st):
+    """Mémoire des préfixes après une liste prise. Revue 2 (row 30) : échec -> [WARN], jamais une erreur ; revue 3 (row 51) :
+    réessayée toutes les _RC_RETRY s (mem_retry_at) même sans changement de fichier, [WARN] une fois tant qu'elle échoue."""
+    if _RC['on_build'] is None: return
+    try: _RC['on_build'](st)
+    except Exception as x:
+        if _RC.get('mem_retry_at') is None:
+            print(f"[WARN] mode dossier : mémoire des fichiers par préfixe non écrite ({type(x).__name__} : {x}) — nouvel essai toutes "
+                  f"les {_RC_RETRY:.0f} s",file=sys.stderr,flush=True)
+        _RC['mem_retry_at']=time.monotonic()+_RC_RETRY
+    else: _RC['mem_retry_at']=None
+
+def _rc_state():
+    """État des rc : celui figé pour la requête en cours (_RC_REQ : `ALL` développé une fois — contrôle d'accès et exécution sur
+    la même liste), sinon la liste en vigueur (_rc_live : watcher, démarrage)."""
+    r=_RC_REQ.get()
+    return r['state'] if r is not None else _rc_live()
+
+def _rc_req_new():
+    """Instantané d'une requête : état des rc et nicks de chaque rc lus une fois."""
+    return {'state':_rc_live(),'nicks':{}}
+
+@contextlib.contextmanager
+def _rc_snapshot():
+    """Revue 2 (row 33) : un instantané pour toute une passe (watcher, contrôle de schéma, nettoyage horaire) — jamais deux états
+    dans une passe. Mode -C, ou instantané déjà posé : rien."""
+    if not DIR_MODE or _RC_REQ.get() is not None:
+        yield; return
+    tok=_RC_REQ.set(_rc_req_new())
+    try: yield
+    finally: _RC_REQ.reset(tok)
+
+def _rc_startup():
+    """Démarrage du mode dossier : toute anomalie de la liste, tout rc listé absent ou illisible, tout CACHE_DIR inutilisable ->
+    [ERREUR], refus."""
+    sig=_rc_sig([path for _x,path,_y in _rc_parse_master(MASTER,CFGDIR)[0]])
+    st,probs,unav,files=_rc_build()
+    errs=probs+[m for _x,m in unav]
+    if errs:
+        for m in errs: print(f"[ERREUR] mode dossier ({MASTER}) : {m}",file=sys.stderr,flush=True)
+        sys.exit(f"[ERREUR] mode dossier : démarrage refusé ({len(errs)} problème(s) ci-dessus)")
+    _RC['files']=files; _RC['state']=st; _RC['sig']=sig
+    _RC['known_cache'].update({e.path:e.cache_dir for e in st.entries.values()})
+    for e in st.entries.values():   # [_borgHelperWWW] d'un autre rc : jamais lu (décision 3)
+        if e is not st.master: _rc_www_section_warn(e)
+    print(f"Mode dossier : {len(st.entries)} rc servi(s) — préfixes {', '.join(st.entries)} (maître : {st.master.prefix})",file=sys.stderr)
+
+if DIR_MODE: _rc_startup()
+
+def _rc_bare_nicks(e):
+    """Nicks NUS du rc (cfgreadnicks : relu à chaque appel, comme en mode -C ; une fois par requête : instantané _RC_REQ).
+    Revue 1 (row 11) : rc devenu illisible (liste ancienne gardée) -> aucun nick, jamais une erreur."""
+    r=_RC_REQ.get()
+    if r is not None and e.prefix in r['nicks']: return r['nicks'][e.prefix]
+    try: v=[n.strip() for n in (e.bh.borg.cfgreadnicks() or '').split(',') if n.strip()]
+    except (OSError,UnicodeDecodeError,configparser.Error): v=[]
+    if r is not None: r['nicks'][e.prefix]=v
+    return v
+
+def _rc_sections(path):
+    """Sections que `borgHelper -c Stats` sans -n affiche (stats(None) : toutes sauf DEFAULT et `_*`, celles portant une clé ALL
+    comprises — pas cfgreadnicks). Revue 3 (row 47). Rc illisible : l'erreur remonte (500, comme en -C)."""
+    if not path or not os.path.isfile(path): return []
+    cp=configparser.ConfigParser(); cp.optionxform=str; cp.read(path)
+    return [n for n in cp.keys() if n!='DEFAULT' and not n.startswith('_')]
+
+def _stats_sections():
+    """Noms (exposés) des sections que /stats sans nick affiche — mode -C : CFGFILE ; mode dossier : chaque rc servi."""
+    if not DIR_MODE: return _rc_sections(CFGFILE)
+    return [f"{e.prefix}:{b}" for e in _rc_state().entries.values() for b in _rc_sections(e.path)]
+
+def _rc_entry_of(nick):
+    """(_RcEntry, nick nu) d'un nick exposé `préfixe:nick` d'un rc disponible ; sinon (None, None). `préfixe:ALL` : inconnu
+    (revue 1, row 5 — jamais un 3e moyen de viser tout un rc)."""
+    p,sep,b=str(nick or '').partition(':')
+    e=_rc_state().entries.get(p) if sep and b and b!='ALL' else None
+    return (e,b) if e is not None else (None,None)
+
+def _bhn(nick):
+    """(BorgHelper, nick nu) du nick exposé. Mode -C : (_bh_paths, nick) — appels d'avant inchangés. Mode dossier : BorgHelper du
+    rc du préfixe ; nom sans préfixe, préfixe inconnu ou rc indisponible -> HTTPException 404 « Nick inconnu » (routes ; le
+    watcher et les sondes l'attrapent comme toute erreur d'un nick)."""
+    if not DIR_MODE: return _bh_paths,nick
+    e,b=_rc_entry_of(nick)
+    if e is None: raise HTTPException(404,detail=f"Nick inconnu : {nick}")
+    return e.bh,b
+
+def _cfgread(nick):
+    """Section rc du nick exposé, ou None (inconnu ; mode dossier : préfixe inconnu ou rc indisponible compris). Mode -C :
+    _bh_paths.borg.cfgread(nick), comme avant. Revue 2 (row 41) : rc servi devenu illisible -> l'erreur de configparser remonte,
+    comme en mode -C (500 « configuration illisible » des actions)."""
+    if not DIR_MODE: return _bh_paths.borg.cfgread(nick)
+    e,b=_rc_entry_of(nick)
+    return e.bh.borg.cfgread(b) if e is not None else None
+
+def _rc_groups(nick,cmd=None,args=(),skipped=None):
+    """Mode dossier : nicks d'une requête regroupés par rc -> [(_RcEntry, valeur de -n pour CE rc, {nu: exposé})]. `ALL` ou absent :
+    revue 2 (row 26) — liste EXPLICITE des nicks de chaque rc lus dans l'instantané de la requête (ceux qu'a vus le contrôle des
+    droits ; jamais `-n ALL`, relu par l'enfant), moins, comme la CLI pour `-n ALL`, les nicks dont l'opération de `cmd` n'est pas
+    permise (dépôt externe : dit dans `skipped`) ; rc sans nick restant : sauté. Liste : nicks nus du rc, dans l'ordre de la
+    requête ; nom non résolu, liste vide (`,`) -> 404 « Nick inconnu ». Revue 3 : `nick=` VIDE -> 404 (row 45 : seul l'absent prend
+    la valeur par défaut) ; Stats sans nick -> chaque rc lancé SANS -n (stats(None) : sections affichées = _rc_sections, toutes
+    contrôlées par _check_group_access, row 47) ; `-L` reconnu comme option seulement, jamais comme valeur de -f (row 48)."""
+    st=_rc_state()
+    if nick is not None and not nick: raise HTTPException(404,detail="Nick inconnu : (vide)")
+    if nick is None and cmd=='stats':
+        return [(e,None,{b:f"{e.prefix}:{b}" for b in secs}) for e in st.entries.values() for secs in [_rc_sections(e.path)] if secs]
+    if nick is None or nick=='ALL':
+        op='read' if cmd=='restore' and '-L' in {args[i] for i in _opt_values(list(args))[1]} else command_op(cmd or '')
+        gs=[]
+        for e in st.entries.values():
+            keep=[]
+            for b in _rc_bare_nicks(e):
+                if op!='read':
+                    c=e.bh.borg.cfgread(b)
+                    if c is not None and not op_allowed(c,op,f"{e.prefix}:{b}"):
+                        if skipped is not None: skipped.append(f"{e.prefix}:{b}: dépôt externe — {cmd} non permis, nick écarté")
+                        continue
+                keep.append(b)
+            if keep: gs.append((e,','.join(keep),{b:f"{e.prefix}:{b}" for b in keep}))
+        return gs
+    groups={}
+    for n in _nick_list(nick):
+        e,b=_rc_entry_of(n)
+        if e is None: raise HTTPException(404,detail=f"Nick inconnu : {n}")
+        g=groups.setdefault(e.prefix,(e,[],{}))
+        if b not in g[2]: g[1].append(b); g[2][b]=n
+    if not groups: raise HTTPException(404,detail=f"Nick inconnu : {nick}")
+    return [(e,','.join(bs),mp) for e,bs,mp in groups.values()]
+
+def _rc_launch_check(e):
+    """Revue 2 (row 24) : au lancement, le CACHE_DIR que l'enfant lira dans son rc = celui de l'état servi (liste refusée à chaud,
+    ancienne gardée : un rc modifié pointerait un autre CACHE_DIR) ; sinon 503 + [WARN], rien lancé."""
+    try: cur=_rc_cache_dir(e.path)
+    except (OSError,UnicodeDecodeError,configparser.Error): cur=None
+    if cur!=e.cache_dir:
+        print(f"[WARN] mode dossier : {e.listed} (préfixe {e.prefix}) : CACHE_DIR changé depuis la liste servie ({cur or 'rc illisible'}) "
+              "— lancement refusé jusqu'à une liste valide",file=sys.stderr,flush=True)
+        raise HTTPException(503,detail=f"rc du préfixe {e.prefix} modifié depuis la liste servie (CACHE_DIR) — lancement refusé, "
+                            "corriger le rc ou la liste")
+
+def _rc_scrub_all(text):
+    """Chemins de TOUS les rc servis (lien et réel) remplacés par « <rc préfixe> » — messages d'erreur rendus par l'API."""
+    if not DIR_MODE or not text: return text
+    for e in _rc_state().entries.values():
+        for pth in sorted({e.path,e.real},key=len,reverse=True): text=text.replace(pth,f"<rc {e.prefix}>")
+    return text
+
 if not API_KEY:
     API_KEY=secrets.token_urlsafe(32)
     print("─"*70,file=sys.stderr)
@@ -460,22 +842,27 @@ def _bkp_timeout(nick):
     """Délai du nick (1.28.4, story 18) : clé rc BKP_STATUS_TIMEOUT du nick ou [DEFAULT], sinon BKP_STATUS_TIMEOUT
     (variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h) — le même que Status (BorgHelper.bkp_status_timeout).
     Jamais d'exception (watcher, /access)."""
-    try: return _bh_paths.bkp_status_timeout(nick)
+    try:
+        bh,b=_bhn(nick); return bh.bkp_status_timeout(b)   # 1.32.0 : rc du nick (mode dossier)
     except (Exception,SystemExit): return BKP_STATUS_TIMEOUT
 
 def _bkp_status_watcher_pass():
+    with _rc_snapshot(): return _bkp_status_watcher_pass_1()   # revue 2 (row 33)
+
+def _bkp_status_watcher_pass_1():
     """Un passage d'interrogation : parcourt chaque nick connu, réclame les lignes bkp_status prêtes
     — à la fois le passage de FIN (terminées, ou bloquées depuis plus de BKP_STATUS_TIMEOUT secondes,
     AD-7) et le passage de DÉBUT (Story 2b : `started_at` écrit, aucun délai à attendre) — et envoie
     un push réel pour chaque réclamation que CE worker a effectivement gagnée au CAS."""
     for nick in _nick_list('ALL'):
         try:
-            db_path=_bh_paths.db.get_diff_db(nick)
-            _bh_paths.db.ensure_diff_db(db_path,create=False)  # AD-12 : jamais créer pour un nick sans historique ; migre une base antérieure (1.0.139)
-            hist=_bh_paths.db.get_history_db(nick)              # bkp_status vit dans history.db (borgHelper 1.0.139) ; absente -> rien
+            bh,b=_bhn(nick)   # 1.32.0 (story 86) : BorgHelper du rc du nick, nick nu (mode -C : _bh_paths, nick)
+            db_path=bh.db.get_diff_db(b)
+            bh.db.ensure_diff_db(db_path,create=False)  # AD-12 : jamais créer pour un nick sans historique ; migre une base antérieure (1.0.139)
+            hist=bh.db.get_history_db(b)              # bkp_status vit dans history.db (borgHelper 1.0.139) ; absente -> rien
             timeout_s=_bkp_timeout(nick)   # 1.28.4 : délai du nick (clé rc, sinon variable, sinon 6 h)
-            for row in _bh_paths.db.list_pending_bkp_status(nick,timeout_s,hist):
-                if not _bh_paths.db.claim_bkp_status(nick,row['run_id'],hist):
+            for row in bh.db.list_pending_bkp_status(b,timeout_s,hist):
+                if not bh.db.claim_bkp_status(b,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
                 # borgHelper >= 1.0.118 : statuts C/E de borg create (absents = inconnus).
@@ -487,11 +874,11 @@ def _bkp_status_watcher_pass():
                     # Bloquée au-delà de BKP_STATUS_TIMEOUT (AD-7) : seul le watcher le constate. Un échec
                     # ordinaire est déjà signalé à Sentry par borgHelper lui-même (même réglage) — pas de doublon.
                     sentry_alert('bkp_error',nick,f"Sauvegarde bloquée ou interrompue — {nick} "
-                                 f"(sans fin après {timeout_s} s)",_bh_paths.borg.cfgread(nick),
+                                 f"(sans fin après {timeout_s} s)",bh.borg.cfgread(b),
                                  extra={'run_id':row['run_id'],'timeout_s':timeout_s},release=f"borgHelperWWW@{WWW_VERSION}")
             _reconcile_interrupted(nick)   # 1.31.8 (story 63) : Bkp tué -> rapprochement en fil, fin notifiée aussitôt
-            for row in _bh_paths.db.list_pending_bkp_status_start(nick,hist):
-                if not _bh_paths.db.claim_bkp_status_start(nick,row['run_id'],hist):
+            for row in bh.db.list_pending_bkp_status_start(b,hist):
+                if not bh.db.claim_bkp_status_start(b,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 print(f"[watcher] bkp_status (début) réclamé : nick={nick} run_id={row['run_id']}",
                       file=sys.stderr,flush=True)
@@ -523,9 +910,10 @@ def _reconcile_interrupted(nick):
     st=_bkp_state(nick); bi=st.get('bkp_interrupted')
     if st.get('bkp_running') is not False or not bi or not bi.get('verifie'): return
     try:
-        row=_bh_paths.db.get_running_bkp_status(nick)
+        bh,b=_bhn(nick)   # 1.32.0 : rc du nick
+        row=bh.db.get_running_bkp_status(b)
         run_id=(row or {}).get('run_id')
-        if not run_id or _bh_paths.db.bkp_status_notified(nick,run_id): return   # revue : fin déjà notifiée (autre worker, avant redémarrage)
+        if not run_id or bh.db.bkp_status_notified(b,run_id): return   # revue : fin déjà notifiée (autre worker, avant redémarrage)
     except (Exception,SystemExit): return
     now=time.monotonic(); key=(nick,run_id)
     with _RECONCILE_LOCK:
@@ -544,16 +932,17 @@ def _reconcile_claim_error(nick,run_id):
     workers), push « échec », Sentry « Sauvegarde interrompue ». Exception : propagée (l'appelant réessaie). Revue 2 : claim_bkp_status
     rend False aussi sur une erreur SQLite (avalée, dite) — notified_at relu : toujours vide = réclamation refusée par la base,
     exception (nouvel essai), jamais confondue avec un CAS perdu (autre worker : notified_at posé)."""
-    hist=_bh_paths.db.get_history_db(nick)
-    if not _bh_paths.db.claim_bkp_status(nick,run_id,hist):
-        if not _bh_paths.db.bkp_status_notified(nick,run_id,hist):
+    bh,b=_bhn(nick)   # 1.32.0 : rc du nick, nick nu ; notification et Sentry sous le nick exposé
+    hist=bh.db.get_history_db(b)
+    if not bh.db.claim_bkp_status(b,run_id,hist):
+        if not bh.db.bkp_status_notified(b,run_id,hist):
             raise RuntimeError(f"réclamation de la fin refusée par la base (run {run_id[:8]})")
     else:
         print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={run_id} result=error (Bkp interrompu, aucune archive de ce run)",
               file=sys.stderr,flush=True)
         _send_bkp_push(nick,'end','error',{})
         sentry_alert('bkp_error',nick,f"Sauvegarde interrompue — {nick} (borgHelper arrêté, aucune archive de ce Bkp)",
-                     _bh_paths.borg.cfgread(nick),extra={'run_id':run_id},release=f"borgHelperWWW@{WWW_VERSION}")
+                     bh.borg.cfgread(b),extra={'run_id':run_id},release=f"borgHelperWWW@{WWW_VERSION}")
 
 def _reconcile_run(nick,run_id):
     """Fil de _reconcile_interrupted : BkpReconcile (délai TIMEOUT, 3600 s s'il est illimité : jamais un fil en vol à vie), puis
@@ -570,11 +959,11 @@ def _reconcile_run(nick,run_id):
     Avant : borg list refait toutes les 10 min jusqu'au délai."""
     state,nxt='à refaire',_RECONCILE_RETRY
     try:
-        argv,env=_build_borghelper_argv_env('BkpReconcile',nick,['-j'])
+        argv,env,bare=_argv_env_for('BkpReconcile',nick,['-j'])   # 1.32.0 : -C du rc du nick, nick nu
         proc=_run_group(argv,TIMEOUT or 3600,env)
         try: data=json.loads(proc.stdout or '[]')
         except ValueError: data=[]
-        o=next((x for x in data if isinstance(x,dict) and x.get('nick')==nick),None)
+        o=next((x for x in data if isinstance(x,dict) and x.get('nick')==bare),None)
         ok=bool(o and o.get('verified')); runs=(o or {}).get('runs') or {}
         rs=runs.get(run_id) if ok else None
         if ok:
@@ -654,11 +1043,13 @@ def _check_overdue(nick,db_path):
     rien de vivant ne suspend plus l'alerte), si l'envoi push est indisponible, ou si personne n'est abonné aux échecs de ce host —
     dans ces trois derniers cas l'alerte n'est PAS consommée : un abonnement pris pendant le retard
     reçoit l'alerte au passage suivant, pas seulement au rappel d'après."""
-    last=_bh_paths.db.last_archive_stat(nick,db_path)
+    if DIR_MODE and nick.partition(':')[0] in _RC['suspended']: return   # décision 10 : préfixe réattribué, alertes suspendues
+    bh,b=_bhn(nick)   # 1.32.0 : rc du nick ; réservation et notification sous le nick exposé
+    last=bh.db.last_archive_stat(b,db_path)
     if last is None: return
     archive,archive_date=last
     age=_archive_age_hours(archive_date)
-    cfg=_bh_paths.borg.cfgread(nick)
+    cfg=bh.borg.cfgread(b)
     max_age=_max_age_bkp(cfg)
     if age is None or age<=max_age: return
     r=_bkp_state(nick)['bkp_running']   # 1.31.5 (story 59) : état de Status — Bkp tué sans rien de vivant : alerte possible
@@ -715,14 +1106,29 @@ def _push_realign_entry(raw,nicks):
     new.pop('notify_start',None); new.pop('notify_end',None)  # format 1 converti par _prefs_entry
     return new,[n for n in nicks if n not in old],[n for n in old if n not in nicks]
 
+def _push_prune_keep(known):
+    """Prédicat « gardé » du nettoyage des abonnements. Mode -C : nick du rc ; 1.32.0 (revue 1, row 10) : aussi tout nom
+    `préfixe:nick` (venu du mode dossier : un retour au mode -C ne coûte aucun abonnement). Mode dossier (story 86) : nick exposé
+    connu, nom NU (reste du passage au mode dossier, sans effet — décisions 7 et 9), nick d'un rc listé mais indisponible (absent,
+    illisible : un rc remplacé ne coûte aucun abonnement) ou d'un préfixe suspendu (décision 10) ; tout, tant que la dernière
+    relecture de la liste a échoué (row 11 : jamais sur un état périmé) ; retiré : préfixe plus listé, ou nick absent de son rc."""
+    if not DIR_MODE: return lambda n: n in known or ':' in n
+    if _RC['failed']: return lambda n: True
+    st=_rc_state(); keep_p=set(st.unavailable)|set(_RC['suspended'])
+    return lambda n: n in known or ':' not in n or n.partition(':')[0] in keep_p
+
 def _push_prune_unknown_nicks():
+    with _rc_snapshot(): return _push_prune_unknown_nicks_1()   # revue 2 (row 33)
+
+def _push_prune_unknown_nicks_1():
     """Watcher (1.27.4) : retire des abonnements les nicks qui n'existent plus dans le rc. -> nb d'abonnements modifiés."""
     known=set(_nick_list('ALL'))
+    kept=_push_prune_keep(known)
     def _prune(subs):
         changed=0
         for ep,raw in list(subs.items()):
             cur=_prefs_entry(raw)['scope_nicks']
-            keep=[n for n in cur if n in known]
+            keep=[n for n in cur if kept(n)]
             if keep!=cur:
                 subs[ep],_a,_r=_push_realign_entry(raw,keep); subs[ep]['updated_at']=_utc_now_str(); changed+=1
         return changed
@@ -739,8 +1145,9 @@ if PUSH_DISABLED:
 def _push_muted(nick):
     """Raison de la suspension de l'envoi push pour ce nick, ou None."""
     if PUSH_DISABLED: return 'BORGHELPERWWW_PUSH_DISABLED'
+    if DIR_MODE and str(nick).partition(':')[0] in _RC['suspended']: return 'préfixe réattribué'   # 1.32.0, décision 10
     try:
-        if _cfg_bool(_bh_paths.borg.cfgread(nick),'PUSH_MUTE',False): return 'PUSH_MUTE'
+        if _cfg_bool(_cfgread(nick),'PUSH_MUTE',False): return 'PUSH_MUTE'
     except (Exception,SystemExit):
         pass
     return None
@@ -761,6 +1168,9 @@ def _borghelper_disk_version():
         return None
 
 def _schema_watch_pass():
+    with _rc_snapshot(): return _schema_watch_pass_1()   # revue 2 (row 33)
+
+def _schema_watch_pass_1():
     """Passe du contrôle périodique (1.26.6) : (1) borgHelper mis à jour sur disque depuis le démarrage ->
     [WARN] « redémarrer » (le code en mémoire est périmé) ; (2) pour chaque nick, vue archive_snapshot_v
     comparée à la définition du code : réparée si elle diffère — SAUF si le code en mémoire est périmé ou
@@ -780,11 +1190,13 @@ def _schema_watch_pass():
               "chargée à son démarrage — redémarrer borgHelperWWW pour l'appliquer à ses traitements internes")
     states={}
     for n in _nick_list('ALL'):
-        p=_bh_paths.db.get_diff_db(n)
+        try: bh,b=_bhn(n)   # 1.32.0 : rc du nick (mode dossier : rc retiré entre-temps -> sauté)
+        except HTTPException: continue
+        p=bh.db.get_diff_db(b)
         if not os.path.exists(p): continue
         # 1.31.19 (story 84, D198) : réparation à délai court (2 s) — base tenue par une bascule (_swap_db) : 'error: …', nouvel
         # essai à la passe suivante ; jamais 60 s par nick dans la boucle du watcher
-        errs=[]; st=_bh_paths.db.archive_view_check(p,repair=not stale,timeout=2,errors=errs)
+        errs=[]; st=bh.db.archive_view_check(p,repair=not stale,timeout=2,errors=errs)
         states[n]=st
         busy=st.startswith('error') and bool(errs) and _db_busy(errs[-1])
         if busy: _SCHEMA_BUSY[n]=_SCHEMA_BUSY.get(n,0)+1
@@ -862,14 +1274,14 @@ app=FastAPI(
     version=BORGHELPER_VERSION,
     description=(
         "API HTTP au-dessus de borgHelper (exécute le binaire borgHelper en sous-processus, "
-        f"avec -C {CFGFILE}).\n\n"
+        +("avec -C <rc du nick> — mode dossier, nicks « préfixe:nick »).\n\n" if DIR_MODE else f"avec -C {CFGFILE}).\n\n")+
         "Authentification : header `X-API-Key`.\n\n"
         "Passphrase du dépôt borg : header `X-Borg-Passphrase` (optionnel) — complète ou "
         "supplante `BORG_PASSPHRASE` du borghelperrc pour cet appel uniquement (transmise au "
         "sous-processus via variable d'environnement, jamais visible dans `ps aux`).\n\n"
         "⚠️ Toutes les commandes CLI sont exposées sauf Mount/UMount (accès FUSE local, "
         "sans objet pour un serveur HTTP). `Login` écrit en clair la passphrase fournie dans "
-        f"{CFGFILE} — à réserver au provisioning, pas à un usage courant."
+        +("le rc du préfixe du nick" if DIR_MODE else f"{CFGFILE}")+" — à réserver au provisioning, pas à un usage courant."
     ),
     **_fastapi_compat_kw(),
 )
@@ -961,6 +1373,11 @@ async def _access_log_and_user_guard(request: Request, call_next):
     ip=_client_ip(request.client.host if request.client else None,
                   request.headers.get('x-forwarded-for'),_TRUSTED_PROXY_NETS)
     status=500; issue=''; deferred=False
+    # 1.32.0 (revue 1, row 7) : rc et nicks figés pour la requête ; revue 2 (row 32) : relecture HORS de la boucle d'événements
+    rc_tok=None
+    if DIR_MODE:
+        from starlette.concurrency import run_in_threadpool
+        rc_tok=_RC_REQ.set(await run_in_threadpool(_rc_req_new))
     def line(status,issue=''):
         print(f"[req] {ip} {user or '-'} \"{request.method} {_loggable_path(request.url.path,request.url.query)}\" "
               f"{status} {int((time.monotonic()-t0)*1000)}ms{issue}",file=sys.stderr,flush=True)
@@ -988,6 +1405,7 @@ async def _access_log_and_user_guard(request: Request, call_next):
         status=response.status_code
         return response
     finally:
+        if rc_tok is not None: _RC_REQ.reset(rc_tok)
         if not deferred: line(status,issue)
 
 _bkp_watcher_task=None
@@ -1115,6 +1533,10 @@ _ROUTE_LEVELS={
     # la documentation/cohérence uniquement, jamais consultées en pratique pour ces chemins.
     '/push/subscribe':1,'/push/subscribe/sync':1,'/push/subscriptions':1,'/push/test':1,
 }
+
+# 1.32.0 (row 23) : routes dont `nick` a une valeur par défaut — tous les nicks (ALL ; /stats sans -n : tous les nicks du rc)
+_ROUTE_NICK_DEFAULT={'/stats':'ALL','/report':'ALL','/cacheinfo':'ALL','/cacheclean':'ALL','/idxtop':'ALL','/difftop':'ALL',
+                     '/idxpurge':'ALL'}
 
 def _parse_groups(header_value):
     if not header_value: return set()
@@ -1303,7 +1725,7 @@ def _resolve_scopes_for_request(request,nicks,for_restore=False):
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     out={}
     for n in nicks:
-        cfg=_bh_paths.borg.cfgread(n)
+        cfg=_cfgread(n)   # 1.32.0 : rc du nick
         out[n]=_resolve_path_scope(user_groups,cfg,for_restore=for_restore) if cfg is not None else None
     return out
 
@@ -1312,6 +1734,20 @@ def _any_scoped(scopes):
     -> force JSON + filtrage a posteriori (Boundaries du spec 1.3 : une requête multi-nick ne peut
     pas mélanger texte et JSON dans un seul corps HTTP, donc UN nick scopé force tout le corps)."""
     return any(s is not None for s in scopes.values())
+
+def _single_nick_scope(request,nick,for_restore=False):
+    """Revue 3 (row 44) : routes à UN nick (LstBkpFls, DiffBkp, Restore, Restore -L, téléchargements) — périmètre calculé sur le
+    nick RÉELLEMENT lancé (développé par _nick_list : mode dossier, _rc_groups nettoie le nom avant le lancement), jamais sur la
+    chaîne brute (cfgread('ALL'), « ␣web:x » -> None = « illimité »). Appelant à périmètre restreint sur l'un des nicks visés :
+    ALL, vide, espaces, liste ou doublon -> 400. Sinon : périmètre du nick (None = illimité), comme avant."""
+    if not GROUPS_HEADER: return None
+    nicks=list(dict.fromkeys(_nick_list(nick)))
+    scopes=_resolve_scopes_for_request(request,nicks,for_restore=for_restore)
+    if not _any_scoped(scopes): return None
+    if nick in (None,'','ALL') or nicks!=[nick]:
+        raise HTTPException(400,detail="un seul nick, nommé exactement (ni ALL, ni liste, ni espaces), pour un appelant à périmètre "
+                            "restreint sur cette route")
+    return scopes[nick]
 
 def require_path_in_scope(request: Request, nick: str, path: Optional[str]) -> bool:
     """Story 2.1, AD-2 : garde PRÉ-appel pour Restore/Restore -L/téléchargements — jamais un
@@ -1340,18 +1776,28 @@ def require_path_in_scope(request: Request, nick: str, path: Optional[str]) -> b
     (`download_file`, `download_tar`, `restore_perms`, `restore`) sont tous des routes de
     restauration/téléchargement — le périmètre appliqué est donc `GROUPS_PATHS_RESTORE` (repli par
     groupe sur `GROUPS_PATHS`), jamais celui de lecture."""
-    scope=_resolve_scopes_for_request(request,[nick],for_restore=True).get(nick)
+    scope=_single_nick_scope(request,nick,for_restore=True)   # revue 3 (row 44) : nick réellement lancé
     return _path_in_scope(path,scope)
 
-def _default_section_groups():
+def _default_section_groups(nick=None):
     """[DEFAULT] brut du .borghelperrc — utilisé par Login quand le nick visé n'existe pas encore
-    (rien à lire depuis une section qui n'existe pas : politique globale de qui peut en créer une)."""
+    (rien à lire depuis une section qui n'existe pas : politique globale de qui peut en créer une).
+    1.32.0 (story 86) : mode dossier — [DEFAULT] du rc du préfixe de `nick` ; préfixe inconnu : {} (aucun groupe : 403)."""
     cp=configparser.ConfigParser(); cp.optionxform=str
+    if DIR_MODE:
+        p,sep,_b=str(nick or '').partition(':')
+        e=_rc_state().entries.get(p) if sep else None
+        if e is None: return {}
+        cp.read(e.path)
+        return cp.defaults()
     if os.path.isfile(CFGFILE): cp.read(CFGFILE)
     return cp.defaults()
 
 def _nick_list(nick_param):
+    """Nicks d'une requête — ALL : ceux du rc ; 1.32.0 (story 86) mode dossier : nicks exposés (`préfixe:nick`) de tous les rc
+    disponibles, dans l'ordre de la liste du maître."""
     if not nick_param or nick_param=='ALL':
+        if DIR_MODE: return [f"{e.prefix}:{b}" for e in _rc_state().entries.values() for b in _rc_bare_nicks(e)]
         return [n.strip() for n in (_bh_paths.borg.cfgreadnicks() or '').split(',') if n.strip()]
     return [n.strip() for n in nick_param.split(',') if n.strip()]
 
@@ -1366,8 +1812,8 @@ def _check_group_access(request: Request):
 
     if path=='/login':
         nick=request.query_params.get('nickname') or request.query_params.get('servername') or ''
-        cfg=_bh_paths.borg.cfgread(nick) if nick else None
-        eff=_effective_level(user_groups, cfg if cfg is not None else _default_section_groups())
+        cfg=_cfgread(nick) if nick else None
+        eff=_effective_level(user_groups, cfg if cfg is not None else _default_section_groups(nick))
         if eff<3:
             raise HTTPException(403,detail=f"Groupe insuffisant pour Login sur '{nick}' — accès admin requis "
                 f"({GROUPS_HEADER}: {', '.join(sorted(user_groups)) or '(vide)'})")
@@ -1376,9 +1822,15 @@ def _check_group_access(request: Request):
     required=_ROUTE_LEVELS.get(path)
     if required is None: required=3  # route non cataloguée : refus par défaut (fail-closed), jamais censé arriver
     nick_param=request.query_params.get('nick')
-    if nick_param is None: return  # route sans notion de nick (ne devrait pas se produire ici)
-    for n in _nick_list(nick_param):
-        cfg=_bh_paths.borg.cfgread(n)
+    # 1.32.0 (revue 2, row 23 — correctif de sécurité, mode -C compris) : `nick` absent = valeur par défaut de la route (tous les
+    # nicks), contrôlée comme si elle était donnée. Avant : contrôle sauté — /stats, /report, /cacheinfo, /idxtop, /difftop sans
+    # `nick` rendaient les données de tous les nicks à un groupe sans droit, /cacheclean et /idxpurge agissaient (mesuré sur 1.31.19).
+    names=None
+    if nick_param is None and path=='/stats': names=_stats_sections()   # revue 3 (row 47) : chaque section que stats(None) affiche
+    if nick_param is None: nick_param=_ROUTE_NICK_DEFAULT.get(path)
+    if nick_param is None: return  # route sans notion de nick (/push/*)
+    for n in (names if names is not None else _nick_list(nick_param)):
+        cfg=_cfgread(n)   # 1.32.0 : rc du nick (mode dossier : inconnu -> 0, comme un nick absent)
         eff=_effective_level(user_groups, cfg) if cfg is not None else 0
         if eff<required:
             raise HTTPException(403,detail=f"Groupe insuffisant pour '{n}' — accès {_LEVEL_NAMES[required]} requis "
@@ -1402,9 +1854,9 @@ def _check_external_ops(request: Request):
     # ALL : comme la CLI (-n ALL), les nicks refusés sont écartés par borgHelper lui-même, les autres traités.
     if not target or target=='ALL': return
     for n in _nick_list(target):
-        try: cfg=_bh_paths.borg.cfgread(n)
+        try: cfg=_cfgread(n)
         except (Exception,SystemExit) as e:
-            raise HTTPException(500,detail=f"{n} : configuration illisible ({e}) — action refusée")
+            raise HTTPException(500,detail=f"{n} : configuration illisible ({_rc_scrub_all(str(e))}) — action refusée")   # row 8 : aucun chemin de rc
         if cfg is None: continue   # nick inconnu (Login d'un nouveau nick) : la route répond comme avant
         try: ok=op_allowed(cfg,op,n)
         except SystemExit: ok=False   # EXTERNAL invalide (code 2 en CLI) : jamais d'action à l'aveugle
@@ -1436,7 +1888,9 @@ class CommandResult(BaseModel):
 # recalculée APRÈS l'exécution de la commande (couvre le cas DiffBkp qui peut écrire dans
 # diff.db lors de son tout premier appel sur une paire non indexée) et comparée à l'entrée en
 # cache : si identique, le résultat mis en cache est restitué sans relancer borgHelper.
-_bh_paths=BorgHelper(cfgfile=CFGFILE)
+# 1.32.0 (story 86) : mode dossier — BorgHelper du MAÎTRE, pour les bases propres à WWW seulement (scopecache.db, push.db, préférences
+# push : dossier et préfixe du maître) ; tout le reste passe par _bhn/_cfgread (garde AST du push selftest : liste blanche)
+_bh_paths=_RC['state'].master.bh if DIR_MODE else BorgHelper(cfgfile=CFGFILE)
 
 def _validate_groups_paths_startup():
     """Fail-fast à l'import : valide la syntaxe GROUPS_PATHS de chaque nick connu (repli [DEFAULT]
@@ -1445,8 +1899,8 @@ def _validate_groups_paths_startup():
     .borghelperrc à chaque appel, donc _resolve_path_scope()/_parse_groups_paths() doivent aussi
     échouer bruyamment plus tard si la config est modifiée pendant que le process tourne (voir
     leurs docstrings et Boundaries du spec 1.1) — cette fonction ne les dispense pas de ça."""
-    for n in [x.strip() for x in (_bh_paths.borg.cfgreadnicks() or '').split(',') if x.strip()]:
-        cfg=_bh_paths.borg.cfgread(n)
+    for n in _nick_list('ALL'):   # 1.32.0 : tous les rc servis en mode dossier (même liste qu'avant en mode -C)
+        cfg=_cfgread(n)
         if cfg is None: continue
         try:
             _parse_groups_paths(cfg.get(_GROUPS_PATHS_KEY,'') or '')
@@ -1508,14 +1962,18 @@ def _never_cache(result: CommandResult) -> bool:
             or _ORPHAN_TXT in text or _MIGR_PENDING_TXT in text)
 
 def _cache_db_paths(nick: Optional[str]):
-    nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
-        [n.strip() for n in _bh_paths.borg.cfgreadnicks().split(',')]
+    if DIR_MODE: nicks=_nick_list(nick)   # 1.32.0 (story 86) : nicks exposés, bases du rc de chacun
+    else:
+        nicks=[n.strip() for n in nick.split(',')] if (nick and nick!='ALL') else \
+            [n.strip() for n in _bh_paths.borg.cfgreadnicks().split(',')]
     paths=[]
     for n in nicks:
         if not n: continue
-        paths.append(_bh_paths.db.get_diff_db(n))
-        paths.append(_bh_paths.db.get_cache_db(n))
-        paths.append(_bh_paths.db.get_history_db(n))   # mesures (RepoHistory, ArchiveHistory, Report -o) : 1.0.139
+        try: bh,b=_bhn(n)
+        except HTTPException: continue   # mode dossier, nick non résolu : la requête répond 404 (_rc_groups)
+        paths.append(bh.db.get_diff_db(b))
+        paths.append(bh.db.get_cache_db(b))
+        paths.append(bh.db.get_history_db(b))   # mesures (RepoHistory, ArchiveHistory, Report -o) : 1.0.139
     return paths
 
 def _cache_fingerprint(nick: Optional[str]) -> str:
@@ -1559,7 +2017,10 @@ def _repo_presence(n: str) -> str:
     """'ok' | 'absent' | '?' (nick illisible) — repoLocalAbsent dans une sonde bornée (_bounded_probe, 1 s) : un montage réseau
     figé (os.open sans délai) ne bloque jamais un thread de requête ; sans réponse -> 'ok' (présent mais muet, comme
     repoLocalAbsent pour un dépôt inaccessible), une seule sonde en attente par nick (revue story 37, verrou : revue story 56)."""
-    return _bounded_probe('presence',n,lambda: 'absent' if _bh_paths.borg.repoLocalAbsent(n) else 'ok',lambda: 'ok')
+    def probe():
+        bh,b=_bhn(n)   # 1.32.0 : rc du nick (non résolu : '?' par la sonde)
+        return 'absent' if bh.borg.repoLocalAbsent(b) else 'ok'
+    return _bounded_probe('presence',n,probe,lambda: 'ok')
 
 def _pid_alive(pid) -> bool:
     """1.31.3 (revue story 56) : processus vivant au sens de /proc/<pid>/stat — zombie (Z) ou mort (X), absent : non. Un
@@ -1588,16 +2049,17 @@ def _bkp_state(n: str) -> dict:
     nick ; figée : dernier état lu, sinon inconnu)."""
     unknown={'bkp_running':None,'bkp_detail':None,'bkp_interrupted':None}
     try:
-        base=_bh_paths.db.bkp_running_state(n,_bkp_timeout(n))
+        bh,b=_bhn(n)   # 1.32.0 : rc du nick ; repli d'une sonde figée et clés internes sous le nick exposé
+        base=bh.db.bkp_running_state(b,_bkp_timeout(n))
         if base is None: return unknown
-        if not base and not _bh_paths.db.bkp_markers(n):
+        if not base and not bh.db.bkp_markers(b):
             _BKPSTATE_LAST.pop(n,None)   # revue : un état d'un Bkp précédent n'est jamais le repli d'une sonde figée plus tard
             return {'bkp_running':False,'bkp_detail':None,'bkp_interrupted':None}
     except (Exception,SystemExit): return unknown
     def read():
-        bs=_bh_paths.bkp_state(n); r=bs['bkp_running']
+        bs=bh.bkp_state(b); r=bs['bkp_running']
         if bs.get('bkp_unknown') and not r: v=unknown
-        elif base and not r and not bs['bkp_interrupted'] and not bs['bkp_stale'] and _bh_paths.db.bkp_running_state(n,_bkp_timeout(n)) is not False:
+        elif base and not r and not bs['bkp_interrupted'] and not bs['bkp_stale'] and bh.db.bkp_running_state(b,_bkp_timeout(n)) is not False:
             v=unknown   # revue : ligne ouverte vue par la garde mais rien rendu (get_running_bkp_status avale une erreur SQLite)
         else: v={'bkp_running':bool(r),'bkp_interrupted':bs['bkp_interrupted'],
                  'bkp_detail':('orphelin' if r['orphelin'] else 'en_attente' if r['en_attente'] else 'en_cours') if r else None}
@@ -1621,7 +2083,8 @@ def _repo_roster_state(n: str) -> str:
         alive,start=_pid_alive_start(p)
         return f"{p}:1:{start}" if alive else f"{p}:0"
     def read():
-        v=','.join(holder(p) for p in sorted(_bh_paths.db.repo_lock_holders(n)))
+        bh,b=_bhn(n)   # 1.32.0 : rc du nick
+        v=','.join(holder(p) for p in sorted(bh.db.repo_lock_holders(b)))
         _ROSTER_LAST[n]=v; return v
     return _bounded_probe('roster',n,read,lambda: _ROSTER_LAST.get(n,'?'))
 
@@ -1636,8 +2099,12 @@ def _bkp_markers_state() -> str:
     après son apparition. Erreur : '?'."""
     import glob
     try:
-        db=_bh_paths.db; out=[]
-        for p in sorted(glob.glob(os.path.join(glob.escape(db.cache_dir),f"{glob.escape(db.db_prefix)}-*-bkp.lock.*"))):
+        # 1.32.0 (story 86) : mode dossier — marqueurs de chaque rc servi (CACHE_DIR distincts), dans l'ordre des chemins
+        dbs=[e.bh.db for e in _rc_state().entries.values()] if DIR_MODE else [_bh_paths.db]; out=[]
+        found=sorted(((p,db) for db in dbs
+                      for p in glob.glob(os.path.join(glob.escape(db.cache_dir),f"{glob.escape(db.db_prefix)}-*-bkp.lock.*"))),
+                     key=lambda x: x[0])
+        for p,db in found:
             if not _MARKER_RE.search(p): continue
             h=db._lock_holder(p)
             if h in ('alive','me'):
@@ -1999,6 +2466,155 @@ except (OSError,sqlite3.Error) as _e:
     print(f"[WARN] préférences push : migration/création de {PUSH_PREFS_FILE} impossible ({_e})",
           file=sys.stderr,flush=True)
 
+def _migrate_push_bare_nicks():
+    """1.32.0 (story 86, décisions 7 et 9) : passage du mode -C au mode dossier, au démarrage. Nick NU (sans « : ») d'un abonnement
+    (scope_nicks et réglages par host du fichier de préférences) et des alertes de retard déjà envoyées (overdue_alerts de push.db,
+    suffixe « #sentry » compris) rattaché au MAÎTRE seulement — `préfixe-du-maître:nick`, si le maître a ce nick (le rc unique du
+    mode -C devient le maître) ; sinon [WARN] une fois (abonnements), laissé tel quel — sans effet (jamais notifié), jamais retiré
+    par le watcher (_push_prune_keep) ; jamais rattaché à l'homonyme d'un autre rc (autre hôte, autres droits). Préférences : sous
+    leur verrou, remplacement atomique (_push_prefs_update), jamais une perte (nom déjà présent sous sa forme préfixée : réglages de
+    celle-ci gardés). push.db : une transaction (UPDATE OR IGNORE : une ligne préfixée déjà là est gardée).
+    -> (abonnements modifiés, lignes d'alerte réécrites, {nom laissé: motif})."""
+    # revue 2 (row 29) : UNE fois par push.db (db_meta dirmode_migrated) — jamais rejouée : un nick nu laissé ne se rattache jamais
+    # plus tard à un hôte ajouté au maître. Limite : push.db explicite repris avec un AUTRE maître que l'ancien rc -C : rattaché
+    # à ce maître sans pouvoir vérifier qu'il est l'ancien rc.
+    conn=_push_conn('read')
+    try: done=conn.execute("SELECT value FROM db_meta WHERE key='dirmode_migrated'").fetchone() is not None
+    finally: conn.close()
+    if done:   # revue 3 (row 50) : noms nus encore là (créés après un retour en -C) — jamais migrés, dits
+        try: subs=_push_prefs_load()['subscriptions']
+        except PushPrefsError: subs={}
+        bare=sorted({n for raw in subs.values() if isinstance(raw,dict)
+                     for n in list(raw.get('scope_nicks') or [])+list(raw.get('hosts') or {}) if isinstance(n,str) and ':' not in n})
+        for n in bare:
+            print(f"[WARN] mode dossier : abonnement(s) push au nick nu « {n} » (passage au mode dossier déjà fait pour ce push.db) — "
+                  "sans effet (aucune notification pour lui) : se réabonner depuis la page Notifications",file=sys.stderr,flush=True)
+        return 0,0,{n:'passage déjà fait' for n in bare}
+    st=_rc_state(); mst=st.master; mine=set(_rc_bare_nicks(mst))
+    def target(n):
+        return f"{mst.prefix}:{n}" if isinstance(n,str) and ':' not in n and n in mine else None
+    left={}
+    def note(n):
+        other=[f"{e.prefix}:{n}" for e in st.entries.values() if e is not mst and n in _rc_bare_nicks(e)]
+        left[n]=(f"absent du maître (préfixe {mst.prefix})"+(f" — jamais rattaché à {', '.join(other)} (autre rc)" if other else ''))
+    def _mig(subs):
+        changed=0
+        for ep,raw in subs.items():
+            if not isinstance(raw,dict) or not isinstance(raw.get('scope_nicks'),list): continue
+            nicks=raw['scope_nicks']; hosts=raw.get('hosts') if isinstance(raw.get('hosts'),dict) else None
+            bare=[n for n in nicks if isinstance(n,str) and ':' not in n]+[n for n in (hosts or {}) if ':' not in n]
+            if not bare: continue
+            for n in bare:
+                if target(n) is None: note(n)
+            new=[]
+            for n in nicks:
+                t=target(n) or n
+                if t not in new: new.append(t)
+            nh=None
+            if hosts is not None:
+                nh={}
+                for n,h in hosts.items():
+                    t=target(n) or n
+                    if t not in nh or t==n: nh[t]=h   # forme préfixée déjà là : ses réglages gardés
+            if new!=nicks or (nh is not None and nh!=hosts):
+                raw['scope_nicks']=new
+                if nh is not None: raw['hosts']=nh
+                changed+=1
+        return changed
+    import copy
+    changed=0
+    try: probe=copy.deepcopy(_push_prefs_load()['subscriptions'])   # essai à blanc : fichier réécrit seulement s'il change
+    except PushPrefsError: probe=None   # illisible : dit par les routes /push/* et le watcher, jamais écrasé
+    if probe and _mig(probe): changed=_push_prefs_update(_mig)
+    rows=0
+    conn=_push_conn('write')
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for (n,) in conn.execute("SELECT nick FROM overdue_alerts").fetchall():
+            base,sep,sfx=n.partition('#')
+            t=target(base)
+            if t is None: continue
+            if conn.execute("UPDATE OR IGNORE overdue_alerts SET nick=? WHERE nick=?",(t+sep+sfx,n)).rowcount: rows+=1
+            else: conn.execute("DELETE FROM overdue_alerts WHERE nick=?",(n,))   # row 39 : la ligne préfixée existe, la nue périmée part
+        if probe is not None:   # revue 3 (row 50) : marqueur seulement si les préférences ont été lues (illisibles : réessayé)
+            conn.execute("INSERT OR REPLACE INTO db_meta (key,value) VALUES ('dirmode_migrated',datetime('now'))")
+        conn.commit()
+    finally:
+        conn.close()
+    for n,why in sorted(left.items()):
+        print(f"[WARN] mode dossier : abonnement(s) push au nick nu « {n} » {why} — laissé tel quel (aucune notification pour "
+              f"lui) : se réabonner depuis la page Notifications",file=sys.stderr,flush=True)
+    if changed or rows:
+        print(f"[push] mode dossier : {changed} abonnement(s) et {rows} alerte(s) de retard passés aux noms « préfixe:nick »",
+              file=sys.stderr,flush=True)
+    return changed,rows,left
+
+# 1.32.0 (story 86, décision 10) : fichier de chaque préfixe, mémorisé là où vit l'état push (à côté des préférences) — un préfixe
+# réattribué à un AUTRE fichier par le maître : ses abonnements et alertes de retard suspendus (rien envoyé, jamais les événements
+# du nouvel hôte), [WARN] une fois. Reprise : remettre l'ancien fichier, ou retirer la ligne du préfixe de ce fichier (le nouveau
+# fichier est alors accepté : décision de l'administrateur).
+PUSH_RC_FILES=os.path.splitext(os.path.abspath(PUSH_PREFS_FILE))[0]+'-rc-files.json' if DIR_MODE else None   # row 38 : nom tiré de PUSH_PREFS
+
+def _rc_ident(e):
+    """Identité du fichier d'un préfixe (revue 2, row 31) : chemin réel RELATIF au dossier des rc — un dossier déplacé ne
+    change rien."""
+    return os.path.relpath(e.real,os.path.realpath(CFGDIR))
+
+def _rc_files_check(st):
+    """Préfixes de `st` comparés au fichier mémorisé : nouveau -> mémorisé ; autre fichier -> suspendu. Revue 2 (row 30) :
+    suspensions calculées AVANT toute écriture ; mémoire illisible, verrou impossible : DOUTE — tout préfixe non prouvé inchangé
+    dans ce processus (même fichier qu'à la dernière vérification réussie) est suspendu, [WARN], mémoire jamais réécrite ;
+    écriture : fsync puis remplacement atomique."""
+    import fcntl
+    cur={p:_rc_ident(e) for p,e in st.entries.items()}
+    def doubt(why):
+        susp={p for p,i in cur.items() if _RC.get('proven',{}).get(p)!=i}
+        _rc_susp(st,susp,f" (mémoire {os.path.basename(PUSH_RC_FILES)} : {why})")
+    try: fd=os.open(PUSH_RC_FILES+'.lock',os.O_RDWR|os.O_CREAT,0o600)
+    except OSError as e: return doubt(f"verrou impossible : {e}")
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        try:
+            with open(PUSH_RC_FILES,encoding='utf-8') as f: data=json.load(f)
+            rec=data.get('rc_files') if isinstance(data,dict) else None
+            if not isinstance(rec,dict): raise ValueError("clé rc_files absente")
+        except FileNotFoundError: data,rec={'version':1},{}
+        except (OSError,ValueError) as e: return doubt(f"illisible, jamais réécrite : {e}")
+        susp={p for p,i in cur.items() if p in rec and rec[p]!=i}
+        _rc_susp(st,susp,'')
+        _RC['proven']={p:i for p,i in cur.items() if p not in susp}
+        new={p:i for p,i in cur.items() if p not in rec}
+        if new:
+            import tempfile
+            rec.update(new); data['rc_files']=rec
+            tfd,tmp=tempfile.mkstemp(prefix='.push-rc-',suffix='.tmp',dir=os.path.dirname(PUSH_RC_FILES))
+            try:
+                with os.fdopen(tfd,'w',encoding='utf-8') as f:
+                    json.dump(data,f,ensure_ascii=False,indent=2,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
+                os.replace(tmp,PUSH_RC_FILES)
+            except BaseException:
+                with contextlib.suppress(OSError): os.unlink(tmp)
+                raise
+    finally:
+        fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
+
+def _rc_susp(st,susp,why):
+    for p in sorted(susp-_RC['suspended']):
+        print(f"[WARN] mode dossier : préfixe « {p} » réattribué ou non vérifiable ({st.entries[p].listed}){why} — ses abonnements push "
+              f"et alertes de retard sont suspendus (rien envoyé) ; reprise : remettre l'ancien fichier, ou retirer « {p} » de "
+              f"{os.path.basename(PUSH_RC_FILES)}",file=sys.stderr,flush=True)
+    _RC['suspended']=set(susp)
+
+if DIR_MODE:
+    _RC['on_build']=_rc_files_check
+    _rc_on_build(_RC['state'])   # revue 3 (row 51) : échec au démarrage -> réessayé comme à chaud
+
+if DIR_MODE:
+    try: _migrate_push_bare_nicks()
+    except (OSError,sqlite3.Error,PushPrefsError) as _e:
+        print(f"[WARN] mode dossier : passage des abonnements push aux noms « préfixe:nick » impossible ({_e}) — réessayé au "
+              "prochain démarrage",file=sys.stderr,flush=True)
+
 # ── Envoi push réel (Story 2b, spec-notifications-push) ────────────────────────
 # Remplace la simple journalisation de la Story 1 : chaque réclamation CAS gagnée (début OU fin)
 # déclenche ici un envoi `pywebpush` réel à chaque abonnement matché — jamais de retry par
@@ -2121,7 +2737,7 @@ def _current_scope_nicks(request: Request):
     nicks=_nick_list('ALL')
     if not GROUPS_HEADER: return nicks
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
-    return _scope_nicks_for_groups(user_groups,((n,_bh_paths.borg.cfgread(n)) for n in nicks))
+    return _scope_nicks_for_groups(user_groups,((n,_cfgread(n)) for n in nicks))
 
 def _scope_signature(scope):
     """AD-5 : signature canonique et univoque d'un périmètre déjà résolu/canonicalisé par
@@ -2163,10 +2779,12 @@ def _nick_owner_codec(nick):
     absente ou incorrecte — dans ce dernier cas l'appelant ne doit ni lire ni écrire de ligne de
     cache pour ce nick (jamais d'erreur visible, jamais de lecture erronée). Mémoïsé par
     (nick, empreinte de passphrase) en mémoire du processus WWW, jamais persisté sur disque."""
-    diff_db=_bh_paths.db.get_diff_db(nick)
+    try: bh,b=_bhn(nick)   # 1.32.0 (story 86) : diff.db et passphrase du rc du nick ; mémo par nick exposé
+    except HTTPException: return _CACHE_LOCKED   # mode dossier, nick non résolu : jamais de ligne de cache
+    diff_db=bh.db.get_diff_db(b)
     if not os.path.exists(diff_db): return None  # jamais indexé : rien à ouvrir (AD-12)
     try:
-        cfg=_bh_paths.borg.cfgread(nick)
+        cfg=bh.borg.cfgread(b)
     except (configparser.Error,OSError):
         cfg=None  # rc absent/section manquante/erreur de lecture attendue : passphrase absente, silencieux
     except Exception as e:
@@ -2190,7 +2808,7 @@ def _nick_owner_codec(nick):
     try:
         # 1.28.7 : empty_ok=False — base vide née d'une autre passphrase (borgHelper 1.0.169, A53) : jamais prise pour une base
         # en clair (lignes de cache écrites en clair) ; reste verrouillée jusqu'à la réparation par l'Index suivant
-        conn=_open_db(diff_db,nick=nick,role='read',passphrase=pw,empty_ok=False)
+        conn=_open_db(diff_db,nick=b,role='read',passphrase=pw,empty_ok=False)
         result=conn.codec  # None (base plain) ou DbCodec (siv1 + passphrase correcte)
     except (DbKeyError,DbTamperError,DbCodecError,sqlite3.Error):
         result=_CACHE_LOCKED
@@ -2312,15 +2930,25 @@ def _capture_fingerprints(nick,cmd=None):
     doit invalider le cache même s'il ne touche ni cache.db ni diff.db) — une par nick réel, pour
     qu'un backup/index sur un seul nick n'invalide que la ligne de CE nick (I/O matrix)."""
     if not GROUPS_HEADER: return {}
+    if DIR_MODE:   # 1.32.0 (story 86) : mtime du rc de CHAQUE nick (porte ses GROUPS_*)
+        def rc_mtime(n):
+            e,_b=_rc_entry_of(n)
+            try: return os.path.getmtime(e.path) if e is not None else 'absent'
+            except OSError: return 'absent'
+        return {n:f"{_cache_fingerprint(n)}{_external_fingerprint(cmd,n)}|cfgfile:{rc_mtime(n)}" for n in _nick_list(nick)}
     try: cfg_mtime=os.path.getmtime(CFGFILE)
     except OSError: cfg_mtime='absent'
     return {n:f"{_cache_fingerprint(n)}{_external_fingerprint(cmd,n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}   # cmd : 1.29.0
 
-def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None):
+def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None, cfgfile: Optional[str]=None):
     """argv/env communs à tout lancement de borgHelper en sous-processus — factorisé pour être
     partagé entre `_exec_borghelper` (attend le résultat) et `_launch_bkp_detached` (AD-2, ne
-    l'attend jamais)."""
-    argv=[sys.executable,str(BORGHELPER_BIN),'-C',CFGFILE,'-c',cmd]
+    l'attend jamais). 1.32.0 (story 86) : `cfgfile` = rc du nick, OBLIGATOIRE en mode dossier (jamais le maître par défaut) ;
+    mode -C : CFGFILE."""
+    if cfgfile is None:
+        if DIR_MODE: raise RuntimeError(f"mode dossier : rc du nick non fourni pour borgHelper -c {cmd}")
+        cfgfile=CFGFILE
+    argv=[sys.executable,str(BORGHELPER_BIN),'-C',cfgfile,'-c',cmd]
     if nick: argv+=['-n',nick]
     argv+=list(extra_args)
     env=os.environ.copy()
@@ -2422,17 +3050,233 @@ def _signal_groups(sig):
         try: os.killpg(pr.pid,sig)
         except OSError: pass
 
+# ── Mode dossier : sorties de borgHelper exposées et fusionnées (1.32.0, story 86) ──────────────────────────────────
+_NICK_KEYED_CMDS=('search','filehist','treehist','treefind')   # JSON {nick: …} des lecteurs multi-nicks
+_SIZE_UNITS=('B','KB','MB','GB','TB','PB','EB','ZB','YB')       # convert_octets_readable de borgHelper (base 1000)
+
+def _rc_scrub(text,e):
+    """stderr d'un borgHelper du rc `e` : chemin du rc (lien et réel, forme JSON échappée comprise — droits du rc, « pas trouvé
+    dans … ») remplacé par « <rc préfixe> » : l'API n'expose jamais un chemin de rc au-delà du préfixe ; conseils de commande
+    « borgHelper -c … » complétés en « borgHelper -C <rc préfixe> -c … » (revue 1, row 22 : la commande vise le bon rc)."""
+    if not text: return text
+    for pth in sorted({e.path,e.real},key=len,reverse=True):
+        for q in (pth,json.dumps(pth)[1:-1]): text=text.replace(q,f"<rc {e.prefix}>")
+    return text.replace('borgHelper -c ',f"borgHelper -C <rc {e.prefix}> -c ")
+
+def _rc_scrub_out(text,e):
+    """stdout d'un borgHelper du rc `e` : revue 1 (row 15) — jamais les données (chemins d'archives) ; seulement les deux messages
+    de borgHelper qui citent le rc (« <nick> pas trouvé dans <rc> », « Fichier <rc> absent »), ligne entière."""
+    if not text: return text
+    for pth in sorted({e.path,e.real},key=len,reverse=True):
+        q=re.escape(pth)
+        text=re.sub(rf'(?m)^(.* pas trouvé dans ){q}$',lambda m: m.group(1)+f"<rc {e.prefix}>",text)
+        text=re.sub(rf'(?m)^Fichier {q} absent$',f"Fichier <rc {e.prefix}> absent",text)
+    return text
+
+def _expose_nom(nom,bare,exp):
+    """`nom` d'une ligne de résumé de Report (« nick », « ***nick », « *** nick ») -> même forme au nom exposé."""
+    m=re.fullmatch(r'(\*\*\* ?)?'+re.escape(bare),nom)
+    return (m.group(1) or '')+exp if m else nom
+
+def _expose_row(r,k,mp):
+    """Ligne de résumé de Report du nick nu `k` : `nom` exposé (« *** » gardé), `bkp_voisin.nick` (voisin du même dépôt, même rc)."""
+    if not isinstance(r,dict): return r
+    if isinstance(r.get('nom'),str): r=dict(r,nom=_expose_nom(r['nom'],k,mp[k]))
+    v=r.get('bkp_voisin')
+    if isinstance(v,dict) and isinstance(v.get('nick'),str) and v['nick'] in mp: r=dict(r,bkp_voisin=dict(v,nick=mp[v['nick']]))
+    return r
+
+def _expose_json(cmd,data,mp):
+    """Nicks NUS d'une sortie JSON de borgHelper -> noms exposés (`mp` {nu: exposé}, nicks de CE rc dans la requête) : clés des
+    lecteurs multi-nicks (_NICK_KEYED_CMDS) ; champ `nick` (objet, ou liste d'objets) ; Report : clés de summary et backups, `nom`
+    d'une ligne de résumé (« *** » gardé), `bkp_voisin.nick`, champ au nom du nick d'une ligne d'archive. Rien d'autre (chemins,
+    archives)."""
+    if isinstance(data,list):
+        return [dict(x,nick=mp[x['nick']]) if isinstance(x,dict) and isinstance(x.get('nick'),str) and x['nick'] in mp else x
+                for x in data]
+    if not isinstance(data,dict): return data
+    if cmd in _NICK_KEYED_CMDS: data={mp.get(k,k):v for k,v in data.items()}
+    if isinstance(data.get('nick'),str) and data['nick'] in mp: data=dict(data,nick=mp[data['nick']])
+    if cmd=='report':
+        if isinstance(data.get('summary'),dict):
+            data=dict(data,summary={mp.get(k,k):(_expose_row(r,k,mp) if k in mp else r) for k,r in data['summary'].items()})
+        if isinstance(data.get('backups'),dict):
+            def rows(k,arch):
+                if k not in mp or not isinstance(arch,dict): return arch
+                # revue 2 (row 35) : seul le champ nick d'une ligne (« {nick: <nom de l'archive>} » de report_offline : valeur = clé de
+                # la ligne) est renommé — jamais une colonne qui porterait le même nom qu'un nick (borg, duration…)
+                return {a:({(mp[k] if kk==k and vv==a else kk):vv for kk,vv in r.items()} if isinstance(r,dict) else r) for a,r in arch.items()}
+            data=dict(data,backups={mp.get(k,k):rows(k,a) for k,a in data['backups'].items()})
+    return data
+
+def _expose_stdout(cmd,out,mp):
+    """stdout d'UN rc : JSON aux nicks exposés (réécrit seulement s'il change), texte tel quel (nicks nus de borgHelper)."""
+    if not mp or not (out or '').strip(): return out
+    try: d=json.loads(out)
+    except ValueError: return out
+    x=_expose_json(cmd,d,mp)
+    return out if x==d else json.dumps(x,ensure_ascii=False,indent=2)
+
+def _readable_bytes(v):
+    m=re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?) ([A-Z]{1,2})\s*',str(v))
+    return float(m.group(1))*1000**_SIZE_UNITS.index(m.group(2)) if m and m.group(2) in _SIZE_UNITS else None
+
+def _report_totaux(rows):
+    """Totaux de Report sur plusieurs rc : somme des Totaux de chaque rc — valeurs AFFICHÉES (2 décimales, base 1000) additionnées :
+    écart au total exact au plus 0,005 unité affichée par rc (limite écrite dans README) ; durée « N min » additionnée ; valeur
+    illisible : « — »."""
+    out={}
+    for k in rows[0]:
+        vals=[r.get(k) for r in rows]
+        if k=='nom': out[k]='Totaux'; continue
+        mins=[re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?) min\s*',str(v)) for v in vals]
+        if all(mins): out[k]=f"{sum(float(m.group(1)) for m in mins):.2f} min"; continue
+        b=[_readable_bytes(v) for v in vals]
+        out[k]=convert_octets_readable(sum(b)) if None not in b else '—'
+    return out
+
+def _merge_json(cmd,parts):
+    """Sorties JSON (objets, déjà exposées) de plusieurs rc -> une. parts : [(préfixe, objet)]. Clés réunies ; objets de même clé
+    réunis (summary, backups) ; revue 1 (row 6) : jamais une valeur perdue en silence — même clé, valeur différente : gardée sous
+    « préfixe:clé » pour les rc suivants ; Report : Totaux du résumé additionnés, en dernier."""
+    out={}
+    def put(o,k,v,pfx):
+        if k not in o: o[k]=v
+        elif o[k]==v: pass
+        elif isinstance(o[k],dict) and isinstance(v,dict):
+            o[k]=dict(o[k])
+            for kk,vv in v.items():
+                if cmd=='report' and k=='summary' and kk=='Totaux': continue   # recalculé plus bas
+                put(o[k],kk,vv,pfx)
+        else: o[f"{pfx}:{k}"]=v
+    for pfx,d in parts:
+        for k,v in d.items(): put(out,k,v,pfx)
+    if cmd=='report' and isinstance(out.get('summary'),dict):
+        tots=[d['summary']['Totaux'] for _p,d in parts if isinstance(d.get('summary'),dict) and isinstance(d['summary'].get('Totaux'),dict)]
+        s={k:v for k,v in out['summary'].items() if k!='Totaux'}
+        if tots: s['Totaux']=_report_totaux(tots) if len(tots)>1 else tots[0]
+        out['summary']=s
+    return out
+
+def _merge_parts(cmd,parts,duidx=None,json_req=False):
+    """parts : [(_RcEntry, {nu: exposé}, code, stdout, stderr)] (chemins de rc déjà retirés). Un rc : sa sortie, JSON exposé.
+    Plusieurs : code = le plus grand ; stderr de chaque rc sous « ── préfixe ── » ; stdout : objets JSON fusionnés (_merge_json),
+    sinon textes concaténés sous « ── préfixe ── » (nicks nus de borgHelper). Revue 1 (row 6) : réponse JSON demandée (-j, -R) :
+    stdout reste du JSON — la sortie non JSON d'un rc passe dans stderr, sous son préfixe ; DuIdx -j : lignes brutes -R réunies
+    puis _recompute_duidx, erreurs de chaque rc gardées (`error`, « préfixe : … »), aucune ligne : `{}` comme sur un rc."""
+    if len(parts)==1:
+        e,mp,code,out,err=parts[0]
+        return CommandResult(exitcode=code,stdout=_expose_stdout(cmd,out,mp),stderr=err)
+    hdr=lambda e,t: f"── {e.prefix} ──\n{t}"+('' if t.endswith('\n') else '\n')
+    code=max(p[2] for p in parts)
+    err=''.join(hdr(e,t) for e,_m,_c,_o,t in parts if t)
+    objs=[]; other=[]
+    for e,mp,_c,o,_t in parts:
+        if not (o or '').strip(): continue
+        try: d=json.loads(o)
+        except ValueError: d=None
+        if isinstance(d,dict): objs.append((e,_expose_json(cmd,d,mp)))
+        else: other.append((e,o))
+    if not json_req and other:
+        return CommandResult(exitcode=code,stdout=''.join(hdr(e,o) for e,_m,_c,o,_t in parts if o),stderr=err)
+    if other and _SCOPED_CALL.get():   # revue 2 (row 25) : appelant à périmètre — jamais une sortie non filtrée, même dans stderr
+        err+=''.join(hdr(e,"[ERREUR] sortie non JSON de ce rc — non relayée (appelant à périmètre restreint)") for e,_o in other)
+        code=max(code,1)
+    elif other:   # JSON demandé : jamais un corps texte
+        err+=''.join(hdr(e,f"[WARN] sortie non JSON de ce rc :\n{o}") for e,o in other)
+    if not objs: out=''
+    elif duidx is not None:
+        wr=[d for _e,d in objs if isinstance(d.get('rows'),list)]
+        errs='; '.join(f"{e.prefix} : {d['error']}" for e,d in objs if isinstance(d.get('error'),str))
+        if wr:
+            raw={'borghelper_version':wr[0].get('borghelper_version'),'pattern':duidx[0],'rows':[r for d in wr for r in d['rows']]}
+            res=_recompute_duidx(raw,None,duidx[0],duidx[1])
+            if errs: res['error']=errs
+        else: res={'error':errs} if errs else {}
+        out=json.dumps(res,ensure_ascii=False,indent=2) if res else '{}'
+    else: out=json.dumps(_merge_json(cmd,[(e.prefix,d) for e,d in objs]),ensure_ascii=False,indent=2)
+    return CommandResult(exitcode=code,stdout=out,stderr=err)
+
+def _opt_values(args,opts=('-f','-s','-b','-B','-N','-p')):
+    """Valeurs des options à argument d'une liste d'arguments CLI -> ({option: valeur}, positions des drapeaux seuls)."""
+    vals={}; flags=[]; i=0
+    while i<len(args):
+        if args[i] in opts and i+1<len(args): vals[args[i]]=args[i+1]; i+=2
+        else: flags.append(i); i+=1
+    return vals,flags
+
+# Décision 11 (revue 1) : commandes sans fusion sensée sur plusieurs rc — 400 plutôt qu'une réponse fausse
+_ONE_RC_CMDS=('repohistory','archivehistory','lstbkpfls','diffbkp')
+_ONE_RC_MSG="un seul fichier de conf par requête pour cette commande"
+
+def _exec_dir(cmd,nick,extra_args,passphrase=None):
+    """Mode dossier : un borgHelper par rc des nicks de la requête (-C de CE rc, nicks nus), séquentiels (TIMEOUT par rc) ; sortie
+    exposée et fusionnée (_merge_parts). DuIdx -j sur plusieurs rc : -R (lignes brutes) puis recalcul unique. Plusieurs rc pour
+    Report -l, RepoHistory, ArchiveHistory, LstBkpFls, DiffBkp, IdxTop/DiffTop -j : 400 (décision 11). Délai dépassé sur le k-ième
+    rc (k > 1) : sorties des rc faits gardées, marqueur [ERREUR] dans stderr, code 124 (row 14)."""
+    args=list(extra_args); duidx=None; skipped=[]
+    groups=_rc_groups(nick,cmd,args,skipped)
+    vals,flags=_opt_values(args)
+    fl={args[i] for i in flags}
+    if len(groups)>1 and (cmd in _ONE_RC_CMDS or (cmd=='report' and '-l' in fl) or (cmd in ('idxtop','difftop') and '-j' in fl)):
+        raise HTTPException(400,detail=_ONE_RC_MSG)
+    if len(groups)>1 and passphrase:   # revue 2 (row 27) : jamais la passphrase d'un hôte transmise aux borgHelper des autres rc
+        raise HTTPException(400,detail="X-Borg-Passphrase : un seul fichier de conf par requête (nicks de plusieurs rc)")
+    if not groups: return CommandResult(exitcode=0,stdout='',stderr=''.join(f"{m}\n" for m in skipped))
+    for e,_nv,_mp in groups: _rc_launch_check(e)   # revue 2 (row 24)
+    if cmd=='duidx' and len(groups)>1:
+        js=[i for i in flags if args[i]=='-j']
+        if js:
+            duidx=(vals.get('-f'),vals.get('-s','chemin'))
+            args=['-R' if i in js else a for i,a in enumerate(args)]
+    parts=[]
+    for k,(e,nv,mp) in enumerate(groups):
+        argv,env=_build_borghelper_argv_env(cmd,nv,args,passphrase,cfgfile=e.path)
+        try: proc=_run_group(argv,TIMEOUT,env)
+        except subprocess.TimeoutExpired:
+            if not parts: raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
+            rest=', '.join(g[0].prefix for g in groups[k+1:]) or 'aucun'
+            parts.append((e,mp,124,'',f"[ERREUR] Commande {cmd} : timeout après {TIMEOUT}s sur ce rc — arrêtée ; rc non lancés : {rest}\n"))
+            break
+        parts.append((e,mp,proc.returncode,_rc_scrub_out(proc.stdout or '',e),_rc_scrub(proc.stderr or '',e)))
+    r=_merge_parts(cmd,parts,duidx,json_req=bool(fl&{'-j','-R'}))
+    if skipped: r.stderr=''.join(f"{m}\n" for m in skipped)+(r.stderr or '')
+    return r
+
+def _argv_env_for(cmd,nick,extra_args,passphrase=None):
+    """argv/env de borgHelper pour UN nick exposé -> (argv, env, nick nu). Mode -C : _build_borghelper_argv_env(cmd, nick, …) comme
+    avant ; mode dossier : -C du rc du nick, nick nu ; non résolu : 404 « Nick inconnu »."""
+    if not DIR_MODE:
+        argv,env=_build_borghelper_argv_env(cmd,nick,extra_args,passphrase); return argv,env,nick
+    e,b=_rc_entry_of(nick)
+    if e is None: raise HTTPException(404,detail=f"Nick inconnu : {nick}")
+    _rc_launch_check(e)   # revue 2 (row 24)
+    argv,env=_build_borghelper_argv_env(cmd,b,extra_args,passphrase,cfgfile=e.path)
+    return argv,env,b
+
 def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None) -> CommandResult:
     """Sous-processus borgHelper brut, sans cache ni encapsulation JSONResponse — factorisé hors de
     `run_borghelper()` pour être réutilisé tel quel par `_run_scoped()` (Story 1.3), qui a besoin du
     `stdout` brut avant de le filtrer et ne doit jamais passer par `_RESPONSE_CACHE` (Boundaries du
-    spec 1.3 : le cache reste réservé au cas non restreint)."""
+    spec 1.3 : le cache reste réservé au cas non restreint). 1.32.0 (story 86) : mode dossier -> _exec_dir."""
+    if DIR_MODE: return _exec_dir(cmd,nick,extra_args,passphrase)
     argv,env=_build_borghelper_argv_env(cmd,nick,extra_args,passphrase)
     try:
         proc=_run_group(argv,TIMEOUT,env)   # 1.31.1 (A91) : au délai, borgHelper ET son borg arrêtés (groupe)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
     return CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
+
+class _PartialLaunch(Exception):
+    """Mode dossier (revue 1, row 9) : lancement détaché fait pour certains rc, refusé pour d'autres — `done` « préfixe pid, … »,
+    `failed` « préfixe : erreur ; … »."""
+    def __init__(self,done,failed): super().__init__(failed); self.done=done; self.failed=failed
+
+def _partial_launch_response(what,nick,x):
+    """Réponse d'un lancement partiel : 500, code 1, ce qui est lancé dans stdout (jamais perdu : ne pas relancer ces rc), les
+    refus dans stderr."""
+    return JSONResponse(status_code=500,content={'exitcode':1,'stdout':f"{what} lancé pour {nick} sur une partie des rc : {x.done}",
+                                                 'stderr':f"[ERREUR] lancement refusé : {x.failed}"})
 
 def _launch_bkp_detached(nick: str, extra_args, passphrase: Optional[str]=None, cmd: str='bkp') -> int:
     """Lance `borgHelper -c Bkp` (ou `cmd`, 'index' pour POST /index depuis 1.28.0 : aucun suivi de résultat, seul
@@ -2441,6 +3285,21 @@ def _launch_bkp_detached(nick: str, extra_args, passphrase: Optional[str]=None, 
     par le stdout/stderr/exitcode de ce sous-processus (jamais lus ici, `DEVNULL`).
     `start_new_session=True` : le sous-processus survit à un redémarrage de borgHelperWWW pendant la
     sauvegarde (AD-2) — sans ça, un redémarrage pendant un Bkp le tuerait avec le worker parent."""
+    if DIR_MODE:   # 1.32.0 (story 86) : un détaché par rc (-C de ce rc, nicks nus) ; pids joints
+        done=[]; failed=[]; groups=_rc_groups(nick,cmd,extra_args)
+        if len(groups)>1 and passphrase:   # revue 2 (row 27)
+            raise HTTPException(400,detail="X-Borg-Passphrase : un seul fichier de conf par requête (nicks de plusieurs rc)")
+        if not groups: return 'aucun nick'
+        for e,_nv,_mp in groups: _rc_launch_check(e)   # revue 2 (row 24)
+        for e,nv,_mp in groups:
+            argv,env=_build_borghelper_argv_env(cmd,nv,extra_args,passphrase,cfgfile=e.path)
+            if cmd=='index': env['BORGHELPER_VIA']='http'
+            try: done.append((e.prefix,subprocess.Popen(argv,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,
+                                                        env=env,start_new_session=True).pid))
+            except OSError as x: failed.append(f"{e.prefix} : {x}")   # revue 1 (row 9) : les rc suivants lancés quand même
+        if failed and not done: raise OSError('; '.join(failed))
+        if failed: raise _PartialLaunch(', '.join(f"{p} {pid}" for p,pid in done),'; '.join(failed))
+        return done[0][1] if len(groups)==1 else ', '.join(f"{p} {pid}" for p,pid in done)
     argv,env=_build_borghelper_argv_env(cmd,nick,extra_args,passphrase)   # cmd='index' : POST /index (1.28.0)
     if cmd=='index': env['BORGHELPER_VIA']='http'   # 1.28.2 : résultat marqué « lancé par HTTP » (index_last)
     proc=subprocess.Popen(argv,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,
@@ -2484,10 +3343,17 @@ def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase
 # `_RESPONSE_CACHE` : deux périmètres différents ne doivent jamais partager une réponse en cache
 # (voir ARCHITECTURE-SPINE.md AD-5 — le cache dédié par périmètre est Story 1.5, pas celui-ci).
 
+_SCOPED_CALL=contextvars.ContextVar('borghelperwww_scoped',default=False)   # 1.32.0 (row 25) : sortie pour un appelant à périmètre
+
+def _scoped_exec(cmd,nick,args,passphrase):
+    tok=_SCOPED_CALL.set(True)
+    try: return _exec_borghelper(cmd,nick,args,passphrase)
+    finally: _SCOPED_CALL.reset(tok)
+
 def _run_scoped(cmd: str, nick: str, extra_args, filter_fn, passphrase: Optional[str]=None) -> JSONResponse:
     args=list(extra_args)
     if '-j' not in args: args=args+['-j']
-    return _scoped_filter_result(_exec_borghelper(cmd,nick,args,passphrase),filter_fn)
+    return _scoped_filter_result(_scoped_exec(cmd,nick,args,passphrase),filter_fn)
 
 def _scoped_filter_result(result,filter_fn):
     """Sortie d'un appelant à périmètre restreint (commune à _run_scoped et _run_scoped_raw, 1.28.6). Filtrée QUEL QUE
@@ -2647,7 +3513,7 @@ def _run_scoped_raw(cmd,nick,extra_args,raw_flag,filter_fn,passphrase=None):
     Jamais mis en `_RESPONSE_CACHE` (même règle que `_run_scoped()`, AD-5)."""
     args=list(extra_args)
     if raw_flag not in args: args=args+[raw_flag]
-    return _scoped_filter_result(_exec_borghelper(cmd,nick,args,passphrase),filter_fn)   # 1.28.6 : même garde que _run_scoped
+    return _scoped_filter_result(_scoped_exec(cmd,nick,args,passphrase),filter_fn)   # 1.28.6 : même garde que _run_scoped
 
 # ── Enveloppes de cache par périmètre autour de _run_scoped/_run_scoped_raw (Story 1.5) ────────
 # Jamais à l'intérieur de _run_scoped()/_run_scoped_raw() elles-mêmes (Code Map du spec 1.5 : ces
@@ -2860,7 +3726,10 @@ _BORG_ENV_KEYS=('BORG_REPO','BORG_PASSPHRASE','BORG_REMOTE_PATH','BORG_RSH','BOR
 _FILENAME_UNSAFE=re.compile(r'[^A-Za-z0-9_.\-]+')
 
 def _borg_cfg(nick: str, passphrase: Optional[str]):
-    cfg=BorgRunner(cfgfile=CFGFILE,passphrase=passphrase).cfgread(nick)
+    if DIR_MODE:   # 1.32.0 (story 86) : rc du nick, nick nu ; non résolu : même 404 qu'un nick inconnu
+        e,b=_rc_entry_of(nick)
+        cfg=BorgRunner(cfgfile=e.path,passphrase=passphrase).cfgread(b) if e is not None else None
+    else: cfg=BorgRunner(cfgfile=CFGFILE,passphrase=passphrase).cfgread(nick)
     if cfg is None:
         raise HTTPException(404,detail=f"Nick inconnu : {nick}")
     return cfg
@@ -3248,6 +4117,7 @@ def _oos_swap(result_resp,decoy,path):
 
 def _download_tar_filename(nick,prefix):
     """Nom de fichier `.tar` — celui du préfixe DEMANDÉ, y compris hors périmètre (leurre invisible)."""
+    if not prefix and DIR_MODE: nick=_FILENAME_UNSAFE.sub('_',nick)   # 1.32.0 : « web:db » -> « web_db.tar »
     return (_safe_filename(prefix) if prefix else nick)+'.tar'
 
 @router.get("/download/file",tags=["téléchargement"],summary="Télécharge un fichier depuis une archive (borg extract --stdout)")
@@ -3404,6 +4274,19 @@ def healthz():
 # Un endpoint par commande CLI de borgHelper (voir README.md), sauf Mount/UMount et BorgCleanup (suppression en CLI seulement).
 
 _CLEANUP_CACHE={'t':None,'v':None}
+def _dir_cleanup_scan():
+    """1.32.0 (story 86) : cleanup_scan sur tous les rc servis — fichiers borgHelper : ceux de chaque rc (CACHE_DIR distincts) ;
+    entrées borg : celles qu'AUCUN rc ne reconnaît (intersection par id des scans des rc qui ont des nicks : un dépôt d'un autre rc
+    n'est jamais « disparu ») ; un rc qui ne propose rien (rc vide, doute) : rien proposé. Revue 1 (row 17) : rc listé indisponible,
+    ou dernière relecture de la liste en échec (dépôts d'un rc inconnus) : doute, aucune entrée borg."""
+    st=_rc_state()
+    scans=[e.bh.cleanup_scan() for e in st.entries.values() if _rc_bare_nicks(e)]
+    if not scans: return {'borg':[],'bh':[]}
+    bh=[x for sc in scans for x in sc['bh']]
+    if st.unavailable or _RC['failed']: return {'borg':[],'bh':bh}
+    ids=set.intersection(*[{x['id'] for x in sc['borg']} for sc in scans])
+    return {'borg':[x for x in scans[0]['borg'] if x['id'] in ids],'bh':bh}
+
 def _borg_cleanup_summary():
     """1.28.5 (story 23, A30) : restes de dépôts borg disparus et fichiers de nicks retirés (borgHelper cleanup_scan,
     lecture seule) — nombres et tailles seulement, jamais de chemin ; None s'il n'y a rien ou si la lecture échoue.
@@ -3412,7 +4295,7 @@ def _borg_cleanup_summary():
     now=time.monotonic()
     if _CLEANUP_CACHE['t'] is not None and now-_CLEANUP_CACHE['t']<300: return _CLEANUP_CACHE['v']
     try:
-        s=_bh_paths.cleanup_summary(_bh_paths.cleanup_scan())
+        s=_bh_paths.cleanup_summary(_dir_cleanup_scan() if DIR_MODE else _bh_paths.cleanup_scan())
         v=s if (s['borg_entries'] or s['keys'] or s['bh_files'] or s['history']) else None
     except (Exception,SystemExit): v=None
     _CLEANUP_CACHE.update(t=now,v=v)
@@ -3425,8 +4308,8 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     def _plain(n):
         # 1.27.1 : bases restées en clair alors qu'elles devraient être chiffrées (badge de l'UI, anomalies seulement)
         try:
-            return db_plain_anomalies(n,[('diff.db',_bh_paths.db.get_diff_db(n)),('cache.db',_bh_paths.db.get_cache_db(n))],
-                                      _bh_paths.borg.cfgread(n))
+            bh,b=_bhn(n)   # 1.32.0 (story 86) : bases et rc du nick
+            return db_plain_anomalies(b,[('diff.db',bh.db.get_diff_db(b)),('cache.db',bh.db.get_cache_db(b))],bh.borg.cfgread(b))
         except Exception:
             return []
     def _state(n):
@@ -3435,12 +4318,12 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         out={'external':False,'ops':None,'build':None,'rebuild':None,'bkp_running':None,'bkp_detail':None,'bkp_interrupted':None,
          'index_last':None,'bkp_last':None}
         try:
-            cfg=_bh_paths.borg.cfgread(n)
+            cfg=_cfgread(n)
             if cfg is not None: out.update(external=is_external(cfg),ops=allowed_ops(cfg,n))
         except SystemExit: out.update(external=None,ops=['read'])   # EXTERNAL invalide : les routes d'action refusent
         except Exception: pass
         try:
-            st=_bh_paths._status_one(n)
+            bh,b=_bhn(n); st=bh._status_one(b)
             out.update(build=st.get('build'),rebuild=st.get('rebuild'))
         except (Exception,SystemExit): pass
         # 1.28.1 (story 8 R3) : Bkp en cours depuis moins de BKP_STATUS_TIMEOUT (au-delà : bloqué, le watcher le traite
@@ -3450,26 +4333,33 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         # « en cours » jusqu'au délai (bkp_interrupted) ; en attente de l'Index et orphelin : en cours, avec bkp_detail.
         out.update(_bkp_state(n))
         # 1.28.2 (story 12 A4) : résultat du dernier Index du nick (CLI, cron ou POST /index) ; None si absent/illisible.
-        try: out['index_last']=_bh_paths.db.read_index_last(n)
+        try: bh,b=_bhn(n); out['index_last']=bh.db.read_index_last(b)
         except (Exception,SystemExit): out['index_last']=None
         # 1.28.3 (story 15) : dernier Bkp du nick (run_id, début, fin, résultat) — l'UI suit un ▶ Backup par run_id, sans
         # minutage ; None si aucune ligne ou lecture impossible (history.db jamais créée).
-        try: out['bkp_last']=_bh_paths.db.last_bkp_status(n)
+        try: bh,b=_bhn(n); out['bkp_last']=bh.db.last_bkp_status(b)
         except (Exception,SystemExit): out['bkp_last']=None
         return out
+    def _dir(resp):   # 1.32.0 (row 40) : suspension des préfixes visible (mode dossier seulement — réponse -C inchangée)
+        if DIR_MODE:
+            # revue 3 (row 52) : seulement pour les nicks que l'appelant peut lire (rien révélé d'un nick sans droit)
+            rd={n for n,v in resp['nicks'].items() if v.get('level')!='none'}
+            resp['suspended_prefixes']=sorted({n.partition(':')[0] for n in rd if _push_suspended(n)})
+            for n,v in resp['nicks'].items(): v['prefix_suspended']=n in rd and _push_suspended(n)
+        return resp
     if not GROUPS_HEADER:
         # Fonctionnalité désactivée : pas de restriction par nick ni de périmètre, seuls
         # allow_destructive/allow_downloads (globaux) s'appliquent — 'admin'/scope:null partout
         # reflète cette absence de restriction par groupes pour que l'UI n'ait qu'une seule forme
         # de réponse à traiter, sans cas particulier côté client.
-        return {'groups_auth_enabled':False,'borg_cleanup':_borg_cleanup_summary(),'restore_root':RESTORE_ROOT,
+        return _dir({'groups_auth_enabled':False,'borg_cleanup':_borg_cleanup_summary(),'restore_root':RESTORE_ROOT,
                 'http_version':request.scope.get('http_version'),   # 1.31.0 (A85) : vu sous API_PREFIX, comme /download/*
-                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n),**_state(n)} for n in nicks}}
+                'nicks':{n:{'level':'admin','read_scope':None,'restore_scope':None,'db_plain':_plain(n),**_state(n)} for n in nicks}})
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
     level_names={0:'none',1:'read',2:'write',3:'admin'}
     result={}
     for n in nicks:
-        cfg=_bh_paths.borg.cfgread(n)
+        cfg=_cfgread(n)
         eff=_effective_level(user_groups,cfg) if cfg is not None else 0
         # _resolve_path_scope (donc _parse_groups_paths) n'est JAMAIS catché ici — une config
         # GROUPS_PATHS(_RESTORE) ambiguë doit remonter en 500 non catché, pas être dégradée en
@@ -3484,8 +4374,8 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
     admin=any(v['level']=='admin' for v in result.values())
     # 1.29.0 (A68) : racine de restauration (UI : « sous-dossier de … ») — à qui peut restaurer sur au moins un nick
     can_restore=any(v['level'] in ('write','admin') and (v.get('ops') is None or 'restore' in v['ops']) for v in result.values())
-    return {'groups_auth_enabled':True,'borg_cleanup':_borg_cleanup_summary() if admin else None,
-            'restore_root':RESTORE_ROOT if can_restore else None,'http_version':request.scope.get('http_version'),'nicks':result}
+    return _dir({'groups_auth_enabled':True,'borg_cleanup':_borg_cleanup_summary() if admin else None,
+            'restore_root':RESTORE_ROOT if can_restore else None,'http_version':request.scope.get('http_version'),'nicks':result})
 
 @router.get("/stats",response_model=CommandResult,tags=["lecture"])
 def stats(nick: Optional[str]=None, x_api_key: Optional[str]=Header(default=None)):
@@ -3505,7 +4395,12 @@ def login(servername: str, nickname: Optional[str]=None, repo: str=Query(...),
     if keyfile is not None or mountpoint is not None:   # fournis, même vides (revue : « refusés s'ils sont fournis »)
         raise HTTPException(400,detail="keyfile et mountpoint ne sont pas acceptés via l'API (chemins du serveur) — "
                             "les configurer avec la CLI : borgHelper -c Login")
-    for what,v in (('servername',servername),('nickname',nickname)):   # revue story 38 (G2) : injection dans le rc par la section
+    if DIR_MODE:   # 1.32.0 (story 86) : nick neuf écrit dans le rc de SON préfixe — nickname préfixé obligatoire, préfixe servi
+        p,sep,b=(nickname or '').partition(':')
+        if not sep or p not in _rc_state().entries:
+            raise HTTPException(400,detail=f"nickname « préfixe:nick » requis en mode dossier, préfixe servi ({', '.join(_rc_state().entries)})"
+                                f" : {nickname!r}")
+    for what,v in (('servername',servername),('nickname',nickname.partition(':')[2] if DIR_MODE else nickname)):   # revue story 38 (G2)
         if v is not None and not _valid_nick_name(v):
             raise HTTPException(400,detail=f"{what} invalide : {v!r} — lettres, chiffres, « . », « _ », « - » (début : lettre ou chiffre), "
                                 "ni ALL ni DEFAULT")
@@ -3529,7 +4424,7 @@ def lstbkpfls(nick: str, request: Request, bid: Optional[str]=None, x_api_key: O
     require_api_key(x_api_key)
     fingerprints=_capture_fingerprints(nick)
     extra=['-b',bid] if bid else []
-    scope=_resolve_scopes_for_request(request,[nick]).get(nick)
+    scope=_single_nick_scope(request,nick)   # revue 3 (row 44) : nick réellement lancé
     if scope is not None:
         return _scoped_cached_mono('lstbkpfls',nick,scope,fingerprints.get(nick,''),{'bid':bid},
             lambda:_run_scoped('lstbkpfls',nick,extra,lambda data:_filter_str_list(data,scope,'files')))
@@ -3561,7 +4456,7 @@ def diffbkp(nick: str, request: Request, bid_old: Optional[str]=None, bid_new: O
     extra=[]
     if bid_old and bid_new: extra=['-b',f"{bid_old},{bid_new}"]
     elif bid_old: extra=['-b',bid_old]
-    scope=_resolve_scopes_for_request(request,[nick]).get(nick)
+    scope=_single_nick_scope(request,nick)   # revue 3 (row 44) : nick réellement lancé
     if scope is not None:
         return _scoped_cached_mono('diffbkp',nick,scope,fingerprints.get(nick,''),
             {'bid_old':bid_old,'bid_new':bid_new},
@@ -3615,7 +4510,7 @@ def bkp(nick: str, no_index: bool=False, x_api_key: Optional[str]=Header(default
     # Le sous-processus détaché ne fera remonter aucune erreur de lancement (cfgreaded()/EXCLUDE
     # manquant -> sys.exit avant store_bkp_status_start, invisible côté bkp_status/watcher) : valide
     # ici, de façon synchrone, ce que backup() validerait de toute façon avant le premier signal.
-    cfg=_bh_paths.borg.cfgread(nick)
+    cfg=_cfgread(nick)   # 1.32.0 : rc du nick (mode dossier : non résolu -> 404, même réponse)
     if cfg is None:
         raise HTTPException(404,detail=f"Nick inconnu : {nick}")
     if 'EXCLUDE' not in cfg.keys():
@@ -3623,6 +4518,7 @@ def bkp(nick: str, no_index: bool=False, x_api_key: Optional[str]=Header(default
     extra=['-I'] if no_index else []
     try:
         pid=_launch_bkp_detached(nick,extra,x_borg_passphrase)
+    except _PartialLaunch as e: return _partial_launch_response('Bkp',nick,e)
     except OSError as e:
         raise HTTPException(500,detail=f"Échec du lancement de Bkp pour {nick} : {e}")
     return CommandResult(exitcode=0,
@@ -3649,7 +4545,7 @@ def prune(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passp
 def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Optional[str]=None,
           x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
-    unknown=[n for n in ([] if nick=='ALL' else _nick_list(nick)) if _bh_paths.borg.cfgread(n) is None]
+    unknown=[n for n in ([] if nick=='ALL' else _nick_list(nick)) if _cfgread(n) is None]
     if unknown or not nick:
         raise HTTPException(404,detail=f"Nick inconnu : {', '.join(unknown) or nick}")   # ALL et listes : comme la CLI
     extra=[]
@@ -3658,6 +4554,7 @@ def index(nick: str, force: bool=False, snapshot_only: bool=False, archive: Opti
     if archive: extra+=['-A',archive]
     try:
         pid=_launch_bkp_detached(nick,extra,x_borg_passphrase,cmd='index')
+    except _PartialLaunch as e: return _partial_launch_response('Index',nick,e)
     except OSError as e:
         raise HTTPException(500,detail=f"Échec du lancement d'Index pour {nick} : {e}")
     return CommandResult(exitcode=0,stdout=f"Index lancé pour {nick} (pid {pid}) — asynchrone, avancement et résultat dans "
@@ -3937,6 +4834,14 @@ class PushPatchBody(BaseModel):
     notify_end: Optional[bool]=None
     expires_in_days: Optional[int]=None  # absent -> inchangé ; null explicite -> « à vie »
 
+def _push_suspended(n):
+    """Mode dossier : nick d'un préfixe suspendu (réattribué à un autre fichier, décision 10)."""
+    return DIR_MODE and str(n).partition(':')[0] in _RC['suspended']
+
+def _push_suspended_msg(bad):
+    return (f"Préfixe suspendu (réattribué à un autre fichier, notifications arrêtées) : {', '.join(bad)} — voir l'administrateur "
+            f"(mémoire des fichiers par préfixe)")
+
 def _prefs_or_500(fn):
     """Fichier de préférences corrompu/illisible -> 500 explicite (jamais un écrasement silencieux)."""
     try: return fn()
@@ -3972,6 +4877,9 @@ def _push_row(endpoint):
 def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     scope_nicks=_current_scope_nicks(request)
+    if DIR_MODE:   # 1.32.0 (row 40) / revue 3 (row 49) : hôtes d'un préfixe suspendu ignorés (jamais un 409 : l'UI envoie tous les
+        # hôtes affichés) ; ceux déjà dans l'entrée gardés avec leurs réglages (_set), jamais ajoutés
+        scope_nicks=[n for n in scope_nicks if not _push_suspended(n)]
     if 'expires_in_days' not in _mset(body):
         days=PUSH_DEFAULT_EXPIRY_DAYS  # absent de la requête -> défaut serveur (BORGHELPERWWW_PUSH_DEFAULT_EXPIRY_DAYS)
     else:
@@ -3998,6 +4906,11 @@ def push_subscribe(request: Request, body: PushSubscribeBody, x_api_key: Optiona
         # Réabonnement sans header d'identité : garde l'utilisateur déjà connu pour cet endpoint.
         if prefs['user'] is None and body.endpoint in subs:
             prefs['user']=_prefs_entry(subs[body.endpoint])['user']
+        if DIR_MODE and body.endpoint in subs:   # revue 3 (row 49) : hôtes suspendus de l'entrée gardés, réglages compris
+            old=_prefs_entry(subs[body.endpoint])
+            for n in old['scope_nicks']:
+                if _push_suspended(n) and n not in prefs['scope_nicks']:
+                    prefs['scope_nicks'].append(n); prefs['hosts'][n]=dict(old['hosts'].get(n,_PUSH_HOST_OFF))
         subs[body.endpoint]=prefs
     _prefs_or_500(lambda: _push_prefs_update(_set))
     row=_push_row(body.endpoint)
@@ -4014,9 +4927,11 @@ def push_subscribe_sync(request: Request, endpoint: str, x_api_key: Optional[str
     inaccessibles retirés (plus aucune notification), nouveaux hosts ajoutés TOUT DÉCOCHÉS. Entrée absente -> 404."""
     require_api_key(x_api_key)
     nicks=_current_scope_nicks(request)
+    if DIR_MODE: nicks=[n for n in nicks if not _push_suspended(n)]   # 1.32.0 (row 40) : préfixe suspendu jamais ajouté
     def _sync(subs):
         if endpoint not in subs: return None
-        subs[endpoint],added,removed=_push_realign_entry(subs[endpoint],nicks)
+        keep=[n for n in _prefs_entry(subs[endpoint])['scope_nicks'] if _push_suspended(n) and n not in nicks]   # revue 3 (row 49)
+        subs[endpoint],added,removed=_push_realign_entry(subs[endpoint],nicks+keep)
         if added or removed: subs[endpoint]['updated_at']=_utc_now_str()
         return {'added':added,'removed':removed}
     res=_prefs_or_500(lambda: _push_prefs_update(_sync))
@@ -4043,12 +4958,13 @@ def push_subscribe_patch(request: Request, body: PushPatchBody, x_api_key: Optio
             raise HTTPException(409,detail="Préférences absentes du fichier JSON pour cet endpoint "
                 "(fichier supprimé/édité ?) — se réabonner (POST /push/subscribe) pour les recréer")
         p=_prefs_entry(subs[body.endpoint])
-        if body.hosts:
-            outside=sorted(n for n in body.hosts if n not in p['scope_nicks'])
+        hosts_in={n:h for n,h in (body.hosts or {}).items() if not _push_suspended(n)}   # revue 3 (row 49) : suspendus ignorés
+        if hosts_in:
+            outside=sorted(n for n in hosts_in if n not in p['scope_nicks'])
             if outside:
                 raise HTTPException(422,detail=f"Host(s) hors du périmètre de cet abonnement : "
                     f"{', '.join(outside)} — périmètre figé à l'abonnement (se réabonner pour le rafraîchir)")
-            for n,h in body.hosts.items(): p['hosts'][n]=_mdump(h)
+            for n,h in hosts_in.items(): p['hosts'][n]=_mdump(h)
         for h in p['hosts'].values():
             if 'notify_start' in fields_set: h['start']=body.notify_start
             if 'notify_end' in fields_set: h['success']=h['error']=body.notify_end
@@ -7386,6 +8302,883 @@ def push_selftest():
             finally:
                 PUSH_PREFS_FILE=old
         check("notifications : utilisateur enregistré à l'abonnement, conservé sans header, mis à jour au PATCH",_prefs_user_ok)
+
+    # ── Mode dossier (1.32.0, story 86, D194) : plusieurs rc, nicks « préfixe:nick » ──
+    # Contrôles purs dans ce processus (liste du maître, sorties exposées et fusionnées, nettoyage, recalcul DuIdx) ; mode dossier
+    # RÉEL dans un processus enfant qui charge CE fichier avec --cfgdir/--master par l'environnement (démarrage, migration des
+    # abonnements, routes par TestClient, watcher, rechargement à chaud) ; démarrages refusés et précédence des modes dans des enfants
+    # dédiés. Dépôts réels : deux nicks du rc de ce selftest à dépôt local présent et BORG_EXE posé (enveloppe du bac à sable :
+    # jamais les dossiers borg de l'utilisateur) — exigés (FAIL sinon : le selftest tourne sur le bac à sable lk).
+    def _dm_child(env_over,script,timeout=300,argv=None):
+        env={k:v for k,v in os.environ.items() if not k.startswith('BORGHELPERWWW_') and k!='BORGHELPERC_RUNTIME_PASSPHRASE'}
+        env.update({k:v for k,v in env_over.items() if v is not None})
+        r=subprocess.run(argv or [sys.executable,'-c',script],env=env,capture_output=True,text=True,timeout=timeout,stdin=subprocess.DEVNULL)
+        data=None
+        for l in r.stdout.splitlines():
+            if l.startswith('S86JSON:'): data=json.loads(l[len('S86JSON:'):])
+        return r,data
+    _DM_LOAD=("import os,sys,json,importlib.util,importlib.machinery\n"
+              f"ld=importlib.machinery.SourceFileLoader('bhw86',{os.path.realpath(__file__)!r})\n"
+              "sp=importlib.util.spec_from_loader('bhw86',ld); w=importlib.util.module_from_spec(sp); sys.modules['bhw86']=w\n"
+              "ld.exec_module(w)\nprint('CHARGÉ',flush=True)\n")
+    dm_root=os.path.realpath(tempfile.mkdtemp(prefix='bhw-s86-'))
+    try:
+        def _dm_write(p,txt,mode=0o600):
+            os.makedirs(os.path.dirname(p),exist_ok=True)
+            with open(p,'w',encoding='utf-8') as f: f.write(txt)
+            os.chmod(p,mode)
+            return p
+        def _dm_parse_ok():
+            """Liste [_borgHelperWWW_rc] : lecture sans [DEFAULT] fusionné (une clé de [DEFAULT] n'est jamais un rc), sous-dossier
+            accepté, chemin du LIEN rendu (row 12) ; refus nommés : section absente, préfixe invalide (« : », ALL), préfixe en double,
+            chemin absolu, hors du dossier, fichier listé deux fois (lien vers un fichier déjà listé compris), maître absent de sa
+            liste. Attentes en dur."""
+            d=os.path.join(dm_root,'parse'); m=os.path.join(d,'m.rc')
+            _dm_write(m,"[DEFAULT]\nCACHE_DIR = /x\nautre.rc = z\n[_borgHelperWWW_rc]\nm.rc = web\nsous/b.rc = mail\nlien.rc = li\n")
+            _dm_write(os.path.join(d,'cible.rc'),"")
+            os.symlink('cible.rc',os.path.join(d,'lien.rc')); os.symlink('m.rc',os.path.join(d,'lienm.rc'))
+            lst,probs=_rc_parse_master(m,d)
+            good=(probs==[] and lst==[('web',m,'m.rc'),('mail',os.path.join(d,'sous','b.rc'),'sous/b.rc'),('li',os.path.join(d,'lien.rc'),'lien.rc')])
+            cases={'section absente':("[DEFAULT]\nx = 1\n",'absente'),
+                   'préfixe invalide':("[_borgHelperWWW_rc]\nm.rc = web\nb.rc = we:b\n",'préfixe invalide'),
+                   'préfixe ALL':("[_borgHelperWWW_rc]\nm.rc = web\nb.rc = ALL\n",'préfixe invalide'),
+                   'préfixe en double':("[_borgHelperWWW_rc]\nm.rc = web\nb.rc = web\n",'préfixe en double'),
+                   'chemin absolu':("[_borgHelperWWW_rc]\nm.rc = web\n/etc/b.rc = mail\n",'chemin relatif'),
+                   'hors du dossier':("[_borgHelperWWW_rc]\nm.rc = web\n../b.rc = mail\n",'hors du dossier'),
+                   'listé deux fois':("[_borgHelperWWW_rc]\nm.rc = web\n./m.rc = mail\n",'deux fois'),
+                   'lien vers un fichier listé':("[_borgHelperWWW_rc]\nm.rc = web\nlienm.rc = mail\n",'deux fois'),
+                   'maître absent':("[_borgHelperWWW_rc]\nb.rc = mail\n",'propre liste')}
+            got={}
+            for k,(txt,frag) in cases.items():
+                _dm_write(m,txt); _l,p=_rc_parse_master(m,d)
+                got[k]=bool(p) and any(frag in x for x in p)
+            if not (good and all(got.values())): print(f"  liste correcte {good} {lst} {probs} ; refus {got}")
+            return good and all(got.values())
+        check("mode dossier : liste du maître lue sans [DEFAULT], chemin du lien gardé ; préfixe invalide/en double, chemin absolu ou "
+              "hors du dossier, fichier en double (lien compris), maître absent de sa liste refusés (1.32.0)",_dm_parse_ok)
+        def _dm_merge_ok():
+            """Sorties exposées et fusionnées (plusieurs rc) : Report — clés summary/backups au nom exposé, « *** » gardé,
+            bkp_voisin.nick, champ au nom du nick d'une ligne d'archive, Totaux additionnés en dernier, code le plus grand, stderr sous
+            « ── préfixe ── » ; Search — même nick nu dans deux rc, deux clés distinctes ; texte concaténé par rc ; un rc : champ `nick`
+            exposé, chemins jamais touchés ; JSON demandé : sortie texte d'un rc passée dans stderr, stdout JSON ; même clé, valeurs
+            différentes : gardée sous « préfixe:clé » ; DuIdx : erreur de chaque rc gardée, aucune ligne -> {} ; stderr : chemin du rc
+            -> « <rc préfixe> », conseils « borgHelper -c » visant le rc ; stdout : seuls les messages connus nettoyés, jamais un
+            chemin d'archive (row 15). Attentes en dur."""
+            eW=_RcEntry('web','/srv/rc/web.rc','web.rc','/c/w',None); eM=_RcEntry('mail','/srv/rc/mail.rc','mail.rc','/c/m',None)
+            def rep(n,arch,tot,dur): return json.dumps({'borghelper_version':'v','summary':{n:{'nom':'***'+n,'taille':'1.00 KB',
+                'bkp_voisin':{'nick':'db2','depuis':'1 h'}},
+                'Totaux':{'duree':dur,'derniere':'1.00 KB','taille':tot,'recuperable':'0.00 B','nom':'Totaux'}},
+                'backups':{n:{'Prunable':{'x':1},arch:{n:arch,'original_size':'1 B'},'Totaux':{n:'Totaux'}}}})
+            r=_merge_parts('report',[(eW,{'db':'web:db','db2':'web:db2'},0,rep('db','a1','2.00 KB','1.50 min'),''),
+                                     (eM,{'db':'mail:db'},1,rep('db','b1','3.50 KB','0.25 min'),'[WARN] x\n')],json_req=True)
+            j=json.loads(r.stdout)
+            rep_ok=(list(j['summary'])==['web:db','mail:db','Totaux'] and j['summary']['web:db']['nom']=='***web:db'
+                    and j['summary']['web:db']['bkp_voisin']=={'nick':'web:db2','depuis':'1 h'}
+                    and j['summary']['mail:db']['bkp_voisin']=={'nick':'db2','depuis':'1 h'}
+                    and j['summary']['Totaux']=={'duree':'1.75 min','derniere':'2.00 KB','taille':'5.50 KB','recuperable':'0.00 B','nom':'Totaux'}
+                    and j['backups']['mail:db']['b1']=={'mail:db':'b1','original_size':'1 B'} and j['backups']['web:db']['Prunable']=={'x':1}
+                    and j['backups']['web:db']['Totaux']=={'web:db':'Totaux'} and r.exitcode==1 and r.stderr=='── mail ──\n[WARN] x\n')
+            s=json.loads(_merge_parts('search',[(eW,{'db':'web:db','a':'web:a'},0,'{"db": [1], "a": {"error": "e"}}',''),
+                                                (eM,{'db':'mail:db'},0,'{"db": [2]}','')]).stdout)
+            t=_merge_parts('stats',[(eW,{},0,'t1\n',''),(eM,{},2,'t2','e2')])
+            one=_merge_parts('lstbkpfls',[(eW,{'db':'web:db'},0,'{"nick": "db", "files": ["db", "db/x"]}','')])
+            raw='{"error": "x"}'; same=_merge_parts('diffbkp',[(eW,{'db':'web:db'},1,raw,'')])
+            jt=_merge_parts('treehist',[(eW,{'db':'web:db'},0,'{"db": {"entries": []}}',''),(eM,{'db':'mail:db'},3,'Ce serveur est inconnu\n','')],json_req=True)
+            dup=json.loads(_merge_parts('x',[(eW,{},0,'{"v": 1, "o": {"a": 1}}',''),(eM,{},0,'{"v": 2, "o": {"a": 3, "b": 4}}','')],json_req=True).stdout)
+            du=_merge_parts('duidx',[(eW,{},0,'{"borghelper_version": "v", "pattern": null, "rows": [{"chemin": "x", "type": "présent", "taille": 2}]}',''),
+                                      (eM,{},1,'{"error": "Index vide pour db"}','')],(None,'chemin'),json_req=True)
+            dj=json.loads(du.stdout)
+            du0=_merge_parts('duidx',[(eW,{},0,'{}',''),(eM,{},0,'{}','')],(None,'chemin'),json_req=True)
+            arch="restore : etc/srv/rc/web.rc\n/srv/rc/web.rc\nx pas trouvé dans /srv/rc/web.rc\nFichier /srv/rc/web.rc absent\n"
+            tok=_SCOPED_CALL.set(True)   # row 25 : appelant à périmètre — sortie non JSON jamais recopiée
+            try: sc=_merge_parts('treehist',[(eW,{'db':'web:db'},0,'{"db": {"entries": []}}',''),(eM,{'db':'mail:db'},0,'hors/portée\n','')],json_req=True)
+            finally: _SCOPED_CALL.reset(tok)
+            col=_expose_json('report',{'backups':{'borg':{'a1':{'borg':'a1','x':1},'a2':{'borg':'1.2.6','x':2}}}},{'borg':'web:borg'})   # row 35
+            ok=(rep_ok and s=={'web:db':[1],'web:a':{'error':'e'},'mail:db':[2]}
+                and (t.stdout,t.exitcode,t.stderr)==('── web ──\nt1\n── mail ──\nt2\n',2,'── mail ──\ne2\n')
+                and json.loads(one.stdout)=={'nick':'web:db','files':['db','db/x']} and same.stdout==raw
+                and json.loads(jt.stdout)=={'web:db':{'entries':[]}} and jt.exitcode==3
+                and jt.stderr=='── mail ──\n[WARN] sortie non JSON de ce rc :\nCe serveur est inconnu\n'
+                and dup=={'v':1,'o':{'a':1,'b':4,'mail:a':3},'mail:v':2}
+                and dj['rows']==[{'type':'présent','nb':1,'taille':2}] and dj['error']=='mail : Index vide pour db' and du0.stdout=='{}'
+                and _rc_scrub('pas trouvé dans /srv/rc/web.rc ; "/srv/rc/web.rc" ; lancer \'borgHelper -c DbEncrypt -n db -y\'',eW)
+                    =='pas trouvé dans <rc web> ; "<rc web>" ; lancer \'borgHelper -C <rc web> -c DbEncrypt -n db -y\''
+                and _rc_scrub_out(arch,eW)=="restore : etc/srv/rc/web.rc\n/srv/rc/web.rc\nx pas trouvé dans <rc web>\nFichier <rc web> absent\n"
+                and _expose_nom('*** db','db','web:db')=='*** web:db' and _expose_nom('dbx','db','web:db')=='dbx'
+                and json.loads(sc.stdout)=={'web:db':{'entries':[]}} and 'hors/portée' not in sc.stderr and 'non relayée' in sc.stderr
+                and sc.exitcode==1
+                and col=={'backups':{'web:borg':{'a1':{'web:borg':'a1','x':1},'a2':{'borg':'1.2.6','x':2}}}})
+            if not ok: print(f"  report {rep_ok} {j} ; search {s} ; texte {t} ; un rc {one.stdout} {same.stdout} ; json+texte {jt} ; "
+                             f"doublons {dup} ; duidx {du} / {du0.stdout} ; sortie {_rc_scrub_out(arch,eW)!r} ; périmètre {sc} ; colonne {col}")
+            return ok
+        check("mode dossier : sorties exposées et fusionnées entre rc (Report, lecteurs multi-nicks, texte par rc, JSON jamais en texte, "
+              "doublons et erreurs gardés, DuIdx vide = {}) ; chemin du rc retiré de stderr, données de stdout intactes (1.32.0)",_dm_merge_ok)
+        def _dm_cleanup_ok():
+            """_dir_cleanup_scan (/access borg_cleanup, mode dossier) : fichiers borgHelper = réunion des rc ; entrées borg = celles
+            qu'AUCUN rc ne reconnaît (intersection par id), dans le scan du 1er rc ; rc sans nick ignoré ; rc listé indisponible ou
+            dernière relecture en échec : aucune entrée borg (doute, row 17). Rc simulés (scans en dur)."""
+            class _B:
+                def __init__(s_,nicks,scan): s_.borg=type('b',(),{'cfgreadnicks':lambda _s,*a: nicks})(); s_._scan=scan
+                def cleanup_scan(s_,home=None): return s_._scan
+            e1=_RcEntry('a','/r/a.rc','a.rc','/c/a',_B('x',{'borg':[{'id':'1'},{'id':'2'},{'id':'3'}],'bh':[{'path':'/c/a/f1'}]}))
+            e2=_RcEntry('b','/r/b.rc','b.rc','/c/b',_B('y',{'borg':[{'id':'2'},{'id':'3'},{'id':'4'}],'bh':[{'path':'/c/b/f2'}]}))
+            e3=_RcEntry('c','/r/c.rc','c.rc','/c/c',_B('',{'borg':[],'bh':[{'path':'/c/c/jamais'}]}))
+            def run(unav=(),failed=False):
+                st=_RcState({'a':e1,'b':e2,'c':e3},set(unav),e1); old=_RC['failed']; _RC['failed']=failed
+                try:
+                    with mock.patch(f"{__name__}._rc_state",lambda: st): return _dir_cleanup_scan()
+                finally: _RC['failed']=old
+            a=run(); b=run(unav=('z',)); c=run(failed=True)
+            bh=[{'path':'/c/a/f1'},{'path':'/c/b/f2'}]
+            ok=a=={'borg':[{'id':'2'},{'id':'3'}],'bh':bh} and b=={'borg':[],'bh':bh} and c=={'borg':[],'bh':bh}
+            if not ok: print(f"  {a} ; indisponible {b} ; relecture en échec {c}")
+            return ok
+        check("mode dossier : nettoyage /access — entrées borg qu'aucun rc ne reconnaît, fichiers de chaque rc ; rc indisponible : aucune "
+              "entrée borg (1.32.0)",_dm_cleanup_ok)
+        def _dm_nick_default():
+            """Correctif de sécurité (revue 2, row 23, mode -C — mesuré sur 1.31.19 : 200 et les données de tous les nicks) : route
+            dont `nick` a une valeur par défaut, appelée SANS `nick`, groupes actifs — groupe sans droit : 403 ; groupe admin : réponse
+            comme avant. borgHelper jamais lancé (doublure)."""
+            from fastapi.testclient import TestClient as _T
+            c=_T(app,raise_server_exceptions=False); okr=CommandResult(exitcode=0,stdout='ok',stderr='')
+            got={}
+            with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), mock.patch(f"{__name__}._effective_level",lambda g,cf: 3 if 'adm' in g else 0), \
+                 mock.patch(f"{__name__}._exec_borghelper",return_value=okr) as ex, contextlib.redirect_stderr(io.StringIO()):
+                for m,r in (('GET','/stats'),('GET','/report'),('GET','/cacheinfo'),('POST','/cacheclean'),('GET','/idxtop'),
+                            ('GET','/difftop'),('POST','/idxpurge')):
+                    n0=ex.call_count
+                    a=c.request(m,API_PREFIX+r,headers={'X-API-Key':API_KEY,'X-Groups':'rien'}).status_code; na=ex.call_count-n0
+                    b=c.request(m,API_PREFIX+r,headers={'X-API-Key':API_KEY,'X-Groups':'adm'}).status_code
+                    got[r]=(a,na,b)
+            bad={k:v for k,v in got.items() if v!=(403,0,200)}
+            if bad: print(f"  {bad}")
+            return not bad and set(got)==set(_ROUTE_NICK_DEFAULT)
+        check("correctif de sécurité (modes -C et dossier) : route à nick par défaut sans `nick`, groupe sans droit -> 403 sans rien lancer ; "
+              "avec droit : inchangé (1.32.0)",_dm_nick_default)
+        def _dm_single_scope():
+            """Correctif de sécurité (revue 3, row 44, mode -C) : routes à un nick (LstBkpFls, DiffBkp, Restore -L, Restore) — appelant
+            à périmètre restreint : ALL, vide, espaces, liste, doublon -> 400, borgHelper jamais lancé (avant : périmètre lu sur la
+            chaîne brute, cfgread -> None = illimité, lancé) ; témoin : nick exact, chemin dans le périmètre -> lancé. Doublures."""
+            from fastapi.testclient import TestClient as _T
+            c=_T(app,raise_server_exceptions=False); n1=_nick_list('ALL')[0]
+            okr=CommandResult(exitcode=0,stdout='{}',stderr=''); got={}; hd={'X-API-Key':API_KEY,'X-Groups':'g'}
+            with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), mock.patch(f"{__name__}._effective_level",lambda g,cf: 3), \
+                 mock.patch(f"{__name__}._resolve_path_scope",lambda g,cf,for_restore=False: ['/x']), \
+                 mock.patch(f"{__name__}._restore_where",lambda w_: '/inexistant-s86/r'), mock.patch(f"{__name__}.op_allowed",lambda *a: True), \
+                 mock.patch(f"{__name__}._exec_borghelper",return_value=okr) as ex, contextlib.redirect_stderr(io.StringIO()):
+                for m,r,extra in (('GET','/lstbkpfls',{}),('GET','/diffbkp',{}),('GET','/restore/perms',{'ftor':'x/a'}),
+                                  ('POST','/restore',{'ftor':'x/a','where':'r'})):
+                    for nv in ('ALL','',' '+n1,f"{n1},",f"{n1},{n1}"):
+                        n0=ex.call_count
+                        st=c.request(m,API_PREFIX+r,headers=hd,params={'nick':nv,**extra}).status_code
+                        got[(r,nv)]=(st,ex.call_count-n0)
+                n0=ex.call_count
+                wit=(c.request('GET',API_PREFIX+'/restore/perms',headers=hd,params={'nick':n1,'ftor':'x/a'}).status_code,ex.call_count-n0)
+            bad={k:v for k,v in got.items() if v!=(400,0)}
+            if bad or wit!=(200,1): print(f"  {bad} ; témoin {wit}")
+            return not bad and len(got)==20 and wit==(200,1)
+        check("correctif de sécurité (mode -C) : route à un nick, appelant à périmètre — ALL, vide, espaces, liste, doublon : 400 sans rien "
+              "lancer ; nick exact : lancé (1.32.0)",_dm_single_scope)
+        def _dm_stats_sections():
+            """Revue 3 (row 47, mode -C) : /stats sans nick lance stats(None), qui affiche TOUTE section sauf DEFAULT et `_*` — une
+            section à clé ALL comprise (cfgreadnicks l'écarte) : chacune contrôlée. Groupe qui lit `a` mais pas `b` (clé ALL) : 403,
+            rien lancé ; qui lit les deux : 200."""
+            from fastapi.testclient import TestClient as _T
+            rc=_dm_write(os.path.join(dm_root,'stats','rc'),"[DEFAULT]\n[a]\nGROUPS_READ = g\n[b]\nALL = 1\nGROUPS_READ = h\n[_borgHelperWWW]\nx = 1\n")
+            class _B: borg=BorgRunner(cfgfile=rc)
+            c=_T(app,raise_server_exceptions=False); okr=CommandResult(exitcode=0,stdout='ok',stderr='')
+            with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), mock.patch(f"{__name__}.CFGFILE",rc), mock.patch(f"{__name__}._bh_paths",_B), \
+                 mock.patch(f"{__name__}._exec_borghelper",return_value=okr) as ex, contextlib.redirect_stderr(io.StringIO()):
+                a=c.get(API_PREFIX+'/stats',headers={'X-API-Key':API_KEY,'X-Groups':'g'}).status_code; na=ex.call_count
+                b=c.get(API_PREFIX+'/stats',headers={'X-API-Key':API_KEY,'X-Groups':'g,h'}).status_code
+            got=[a,na,b,_rc_sections(rc)]
+            if got!=[403,0,200,['a','b']]: print(f"  {got}")
+            return got==[403,0,200,['a','b']]
+        check("correctif de sécurité (mode -C) : /stats sans nick — chaque section que Stats affiche contrôlée (clé ALL comprise) (1.32.0)",
+              _dm_stats_sections)
+        def _dm_keep_c():
+            """Mode -C (row 10) : le nettoyage horaire ne retire jamais un nom « préfixe:nick » (venu du mode dossier)."""
+            k=_push_prune_keep({'la'})
+            return k('la') and k('web:db') and not k('disparu')
+        check("mode -C : nettoyage des abonnements — noms préfixés (mode dossier) jamais retirés (1.32.0)",_dm_keep_c)
+        def _dm_duidx_mirror():
+            """DuIdx -j sur plusieurs rc = lignes brutes -R réunies puis _recompute_duidx : sur le rc de ce selftest, -j (vrai
+            borgHelper) == _recompute_duidx(-R) en mode global et groupé trié. Lignes exigées (bac à sable lk)."""
+            env=dict(os.environ); env['BORGHELPERC_NO_CLEANUP_NOTICE']='1'
+            def run(*a):
+                p=subprocess.run([sys.executable,str(BORGHELPER_BIN),'-C',CFGFILE,'-c','DuIdx','-n','ALL',*a],env=env,capture_output=True,
+                                 text=True,timeout=300,stdin=subprocess.DEVNULL)
+                try: return json.loads(p.stdout)
+                except ValueError: return None
+            res=[]
+            for pat,srt in ((None,'chemin'),('*','added:desc')):
+                fa=['-f',pat] if pat else []
+                j=run(*fa,'-s',srt,'-j'); r=run(*fa,'-s',srt,'-R')
+                if not isinstance(j,dict) or not isinstance(r,dict) or not j.get('rows'):
+                    print(f"  DuIdx sans lignes dans {CFGFILE} (bac à sable lk exigé) : {j!r}"); return False
+                res.append(_recompute_duidx(r,None,pat,srt)==j)
+            if not all(res): print(f"  {res}")
+            return all(res)
+        check("mode dossier : DuIdx -j de plusieurs rc = recalcul des lignes brutes -R, identique à DuIdx sur un rc (1.32.0)",_dm_duidx_mirror)
+        def _dm_source_guard():
+            """Garde AST : _bh_paths (BorgHelper du rc en mode -C, du MAÎTRE en mode dossier) et CFGFILE (le maître en mode dossier)
+            ne sont lus, hors push_selftest, que par ces fonctions (liste exacte) — tout autre site lirait le maître au lieu du rc du
+            nick. Témoin : un site ajouté dans une fonction hors liste est vu."""
+            import ast as _ast
+            with open(os.path.realpath(__file__),encoding='utf-8') as f: src=f.read()
+            def uses(text):
+                seen={'_bh_paths':set(),'CFGFILE':set()}
+                for top in _ast.parse(text).body:
+                    if isinstance(top,_ast.FunctionDef) and top.name=='push_selftest': continue
+                    name=top.name if isinstance(top,(_ast.FunctionDef,_ast.ClassDef)) else '<module>'
+                    for nd in _ast.walk(top):
+                        if isinstance(nd,_ast.Name) and nd.id in seen and isinstance(nd.ctx,_ast.Load): seen[nd.id].add(name)
+                return seen
+            got=uses(src)
+            want={'_bh_paths':{'_bhn','_cfgread','_nick_list','_cache_db_paths','_bkp_markers_state','ensure_scope_cache_db',
+                               'ensure_push_db','_borg_cleanup_summary','<module>'},
+                  'CFGFILE':{'_default_section_groups','_capture_fingerprints','_build_borghelper_argv_env','_borg_cfg','_stats_sections','<module>'}}
+            wit=uses("def ailleurs(n):\n    return _bh_paths.db.get_diff_db(n)\n")['_bh_paths']=={'ailleurs'}
+            if got!=want or not wit: print(f"  en trop {({k:sorted(got[k]-want[k]) for k in want})} ; manquants {({k:sorted(want[k]-got[k]) for k in want})} ; témoin {wit}")
+            return got==want and wit
+        check("mode dossier : _bh_paths et CFGFILE (maître) lus seulement par la liste blanche de fonctions — garde AST (1.32.0)",_dm_source_guard)
+
+        # ── démarrages refusés, précédence des modes ──
+        def _dm_rc(d,name,cache,body='',extra_default=''):
+            return _dm_write(os.path.join(d,name),f"[DEFAULT]\nCACHE_DIR = {os.path.join(dm_root,'caches',cache)}\n{extra_default}{body}")
+        def _dm_refused():
+            """Démarrage du mode dossier refusé ([ERREUR], code ≠ 0, module jamais chargé) : rc listé absent, rc illisible (contenu
+            invalide), préfixe en double, préfixe invalide, maître absent de sa liste, deux rc au même CACHE_DIR, CACHE_DIR
+            inutilisable (un fichier : BorgHelper impossible, row 4), section de liste absente, -C avec --cfgdir, --cfgdir sans
+            --master, dossier introuvable, maître hors du dossier, maître introuvable. Témoin : la configuration valide se charge."""
+            plain=_dm_write(os.path.join(dm_root,'caches','fichier'),"x")
+            cases={'rc listé absent':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nabsent.rc = gone\n"},'absent ou illisible'),
+                   'rc illisible':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nbad.rc = bad\n",'bad.rc':None},'absent ou illisible'),
+                   'préfixe en double':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nb.rc = web\n",'b.rc':'cb'},'préfixe en double'),
+                   'préfixe invalide':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nb.rc = a:b\n",'b.rc':'cb'},'préfixe invalide'),
+                   'maître absent':({'m.rc':"[_borgHelperWWW_rc]\nb.rc = mail\n",'b.rc':'cb'},'propre liste'),
+                   'CACHE_DIR partagé':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nb.rc = mail\n",'b.rc':'cm'},'partagent CACHE_DIR'),
+                   'CACHE_DIR inutilisable':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nb.rc = mail\n",'b.rc':'fichier'},'inutilisable'),
+                   'section absente':({'m.rc':""},'absente'),
+                   'valide':({'m.rc':"[_borgHelperWWW_rc]\nm.rc = web\nb.rc = mail\n",'b.rc':'cb'},None)}
+            got={}; d_ok=None
+            for k,(files,frag) in cases.items():
+                d=os.path.join(dm_root,'refus',re.sub(r'\W','_',k))
+                for fn,body in files.items():
+                    if fn=='m.rc': _dm_rc(d,fn,'cm',body)
+                    elif body is None: _dm_write(os.path.join(d,fn),"pas une section\n")
+                    else: _dm_rc(d,fn,body,"[x]\nBORG_REPO = /inexistant-s86\n")
+                env={'BORGHELPERWWW_CFGDIR':d,'BORGHELPERWWW_MASTER':'m.rc','BORGHELPERWWW_API_KEY':'k',
+                     'BORGHELPERWWW_SCOPE_CACHE_DB':os.path.join(d,'s.db'),'BORGHELPERWWW_PUSH_DB':os.path.join(d,'p.db'),
+                     'BORGHELPERWWW_PUSH_PREFS':os.path.join(d,'p.json')}
+                r,_x=_dm_child(env,_DM_LOAD)
+                got[k]=(r.returncode==0 and 'CHARGÉ' in r.stdout) if frag is None else \
+                       (r.returncode!=0 and '[ERREUR]' in r.stderr and frag in r.stderr and 'CHARGÉ' not in r.stdout)
+                if k=='valide': d_ok,env_ok=d,env
+            _dm_write(os.path.join(dm_root,'refus','dehors.rc'),"")
+            for kk,ev,frag in (('-C avec --cfgdir',{'BORGHELPERWWW_CFGFILE':os.path.join(d_ok,'m.rc')},'exclusifs'),
+                               ('--cfgdir sans --master',{'BORGHELPERWWW_MASTER':None},'vont ensemble'),
+                               ('dossier introuvable',{'BORGHELPERWWW_CFGDIR':d_ok+'-absent'},'introuvable'),
+                               ('maître hors du dossier',{'BORGHELPERWWW_MASTER':'../dehors.rc'},"n'est pas dans le dossier"),
+                               ('maître introuvable',{'BORGHELPERWWW_MASTER':'absent.rc'},'maître introuvable')):
+                e2={**env_ok,**ev}
+                r2,_x=_dm_child(e2,_DM_LOAD)
+                got[kk]=r2.returncode!=0 and '[ERREUR]' in r2.stderr and frag in r2.stderr and 'CHARGÉ' not in r2.stdout
+            bad={k:v for k,v in got.items() if not v}
+            if bad: print(f"  {bad}")
+            return not bad and len(got)==14,d_ok,env_ok
+        _ref=_dm_refused()
+        check("mode dossier : démarrage refusé en [ERREUR] (rc absent ou illisible, préfixe en double/invalide, maître non listé, "
+              "CACHE_DIR partagé ou inutilisable, section absente, -C avec --cfgdir, --cfgdir seul, dossier ou maître introuvable, maître "
+              "hors du dossier) ; configuration valide chargée (1.32.0)",lambda: _ref[0])
+        def _dm_precedence():
+            """Précédence des modes (row 21) : en CLI, -C écarte un mode dossier hérité de l'environnement (le démarrage va jusqu'au
+            refus de RESTORE_ROOT « / », jamais « exclusifs ») et --cfgdir/--master écartent BORGHELPERWWW_CFGFILE ; un fichier de
+            conf (cfgdir/master) ne donne jamais un mode quand l'environnement en a choisi un ; variable de mode vide = absente (cfgfile
+            du fichier de conf pris, row 18) ; --selftest avec --cfgdir refusé (row 19)."""
+            d,env=_ref[1],_ref[2]; me=os.path.realpath(__file__); m=os.path.join(d,'m.rc'); root={'BORGHELPERWWW_RESTORE_ROOT':' / '}
+            r1,_x=_dm_child({**env,**root},None,argv=[sys.executable,me,'-C',m,'-K','x'])
+            r2,_x=_dm_child({**env,**root,'BORGHELPERWWW_CFGFILE':m,'BORGHELPERWWW_CFGDIR':None,'BORGHELPERWWW_MASTER':None},None,
+                            argv=[sys.executable,me,'--cfgdir',d,'--master','m.rc','-K','x'])
+            conf=_dm_write(os.path.join(d,'www.conf'),f"[borgHelperWWW]\ncfgdir = {d}\nmaster = m.rc\ncfgfile = {m}\n")
+            show="print('S86JSON:'+json.dumps([w.DIR_MODE,w.CFGFILE]))\n"
+            base={k:v for k,v in env.items() if k not in ('BORGHELPERWWW_CFGDIR','BORGHELPERWWW_MASTER')}
+            _r3,c3=_dm_child({**base,'BORGHELPERWWW_CFGFILE':m,'BORGHELPERWWW_CONF':conf},_DM_LOAD+show)
+            conf2=_dm_write(os.path.join(d,'www2.conf'),f"[borgHelperWWW]\ncfgfile = {m}\n")
+            _r4,c4=_dm_child({**base,'BORGHELPERWWW_CFGDIR':'','BORGHELPERWWW_MASTER':'','BORGHELPERWWW_CONF':conf2},_DM_LOAD+show)
+            e5={**env,'BORGHELPERWWW_PUSH_DB':os.path.join(d,'p5.db'),'BORGHELPERWWW_PUSH_PREFS':os.path.join(d,'p5.json'),
+                'BORGHELPERWWW_SCOPE_CACHE_DB':os.path.join(d,'s5.db')}
+            r5,_x=_dm_child(e5,None,argv=[sys.executable,me,'--cfgdir',d,'--master','m.rc','-K','x','--selftest'])
+            r5_clean=not any(os.path.exists(os.path.join(d,f)) for f in ('p5.db','p5.json','s5.db','p5-rc-files.json'))   # row 37
+            got={'-C sur env dossier':r1.returncode!=0 and 'BORGHELPERWWW_RESTORE_ROOT' in r1.stderr and 'exclusifs' not in r1.stderr,
+                 '--cfgdir sur env -C':r2.returncode!=0 and 'BORGHELPERWWW_RESTORE_ROOT' in r2.stderr and 'exclusifs' not in r2.stderr,
+                 'conf sans mode':c3==[False,m],'variables vides':c4==[False,m],
+                 '--selftest en dossier':r5.returncode!=0 and '--selftest exige -C' in r5.stderr and 'push selftest' not in r5.stdout and r5_clean}
+            bad={k:v for k,v in got.items() if not v}
+            if bad: print(f"  {bad} ; {r1.stderr[-300:]!r} {r2.stderr[-300:]!r} {c3} {c4} {r5.stderr[-200:]!r}")
+            return not bad
+        check("mode dossier : précédence des modes — CLI sur l'environnement, fichier de conf jamais un 2e mode, variable vide = absente, "
+              "--selftest exige -C (1.32.0)",_dm_precedence)
+
+        def _dm_runtime_pp():
+            """Revue 3 (row 46) : mode dossier avec BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement -> [ERREUR], refus (elle serait
+            remise au borgHelper de chaque rc) ; témoin : même configuration sans elle, chargée."""
+            r,_x=_dm_child({**_ref[2],'BORGHELPERC_RUNTIME_PASSPHRASE':'pp-s86'},_DM_LOAD); r0,_x=_dm_child(_ref[2],_DM_LOAD)
+            ok=(r.returncode!=0 and '[ERREUR]' in r.stderr and 'BORGHELPERC_RUNTIME_PASSPHRASE' in r.stderr and 'CHARGÉ' not in r.stdout
+                and 'pp-s86' not in r.stderr and r0.returncode==0 and 'CHARGÉ' in r0.stdout)
+            if not ok: print(f"  {r.returncode} {r.stderr[-300:]!r} ; témoin {r0.returncode}")
+            return ok
+        check("mode dossier : BORGHELPERC_RUNTIME_PASSPHRASE dans l'environnement -> démarrage refusé en [ERREUR] (1.32.0)",_dm_runtime_pp)
+        def _dm_cfgfile_empty():
+            """Revue 3 (row 53, mode -C) : BORGHELPERWWW_CFGFILE présent mais vide, cfgfile dans le fichier de conf (sans cfgdir/master) :
+            jamais comblé, comme 1.31.19 (« Fichier de conf manquant ») ; témoin : variable absente -> cfgfile du fichier de conf pris."""
+            d=_ref[1]; m=os.path.join(d,'m.rc')
+            conf=_dm_write(os.path.join(d,'www3.conf'),f"[borgHelperWWW]\ncfgfile = {m}\n")
+            base={k:v for k,v in _ref[2].items() if k not in ('BORGHELPERWWW_CFGDIR','BORGHELPERWWW_MASTER')}
+            show="print('S86JSON:'+json.dumps([w.DIR_MODE,w.CFGFILE]))\n"
+            r,_x=_dm_child({**base,'BORGHELPERWWW_CFGFILE':'','BORGHELPERWWW_CONF':conf},_DM_LOAD+show)
+            _r0,c0=_dm_child({**base,'BORGHELPERWWW_CONF':conf},_DM_LOAD+show)
+            ok=r.returncode!=0 and 'Fichier de conf manquant' in r.stderr and 'CHARGÉ' not in r.stdout and c0==[False,m]
+            if not ok: print(f"  {r.returncode} {r.stderr[-300:]!r} ; témoin {c0}")
+            return ok
+        check("mode -C : BORGHELPERWWW_CFGFILE vide jamais comblé par le fichier de conf (comme 1.31.19) (1.32.0)",_dm_cfgfile_empty)
+        def _dm_mig_unreadable():
+            """Revue 3 (row 50) : préférences illisibles au 1er démarrage en mode dossier -> marqueur de migration NON posé ; fichier
+            réparé, 2e démarrage : nick nu du maître rattaché (préfixe:nick), marqueur posé."""
+            d=os.path.join(dm_root,'mig50'); m=_dm_rc(d,'m.rc','c50',"[_borgHelperWWW_rc]\nm.rc = web\n\n[front]\nBORG_REPO = /inexistant-s86/f\n")
+            ev={'BORGHELPERWWW_CFGDIR':d,'BORGHELPERWWW_MASTER':'m.rc','BORGHELPERWWW_API_KEY':'k',
+                'BORGHELPERWWW_SCOPE_CACHE_DB':os.path.join(d,'s.db'),'BORGHELPERWWW_PUSH_DB':os.path.join(d,'p.db'),
+                'BORGHELPERWWW_PUSH_PREFS':os.path.join(d,'p.json')}
+            _dm_write(ev['BORGHELPERWWW_PUSH_PREFS'],"pas du json")
+            r1,_x=_dm_child(ev,_DM_LOAD)
+            with contextlib.closing(sqlite3.connect(ev['BORGHELPERWWW_PUSH_DB'])) as k:
+                mk1=k.execute("SELECT COUNT(*) FROM db_meta WHERE key='dirmode_migrated'").fetchone()[0]
+            _dm_write(ev['BORGHELPERWWW_PUSH_PREFS'],json.dumps({'version':2,'subscriptions':{'e':{'scope_nicks':['front'],
+                      'hosts':{'front':{'start':True,'success':True,'error':True}},'expires_at':None}}}))
+            r2,_x=_dm_child(ev,_DM_LOAD)
+            with open(ev['BORGHELPERWWW_PUSH_PREFS'],encoding='utf-8') as f: sn=json.load(f)['subscriptions']['e']['scope_nicks']
+            with contextlib.closing(sqlite3.connect(ev['BORGHELPERWWW_PUSH_DB'])) as k:
+                mk2=k.execute("SELECT COUNT(*) FROM db_meta WHERE key='dirmode_migrated'").fetchone()[0]
+            got=[r1.returncode,mk1,r2.returncode,sn,mk2]
+            if got!=[0,0,0,['web:front'],1]: print(f"  {got} {r1.stderr[-300:]!r} {r2.stderr[-300:]!r}")
+            return got==[0,0,0,['web:front'],1]
+        check("mode dossier : préférences push illisibles au passage -> migration réessayée au démarrage suivant (marqueur seulement si "
+              "faite) (1.32.0)",_dm_mig_unreadable)
+
+        # ── mode dossier réel : un enfant démarré en --cfgdir/--master ──
+        rd=os.path.join(dm_root,'rc')
+        src_cp=configparser.ConfigParser(interpolation=None); src_cp.optionxform=str; src_cp.read(CFGFILE)
+        real=[n for n in _nick_list('ALL') if src_cp.has_section(n) and src_cp[n].get('BORG_EXE','').strip()
+              and os.path.isdir(os.path.expanduser(src_cp[n].get('BORG_REPO','') or '/inexistant-s86')) and not is_external(src_cp[n])][:2]
+        def sect(n):
+            if n is None: return "BORG_REPO = /inexistant-s86/r\nBORG_ARCHNAME = x\n"
+            return ''.join(f"{k} = {v}\n" for k,v in src_cp.items(n) if k.upper()!='CACHE_DIR')
+        def afile(n):   # (chemin dans l'archive, contenu) d'un fichier sauvegardé du nick (BORG_ROOTBKP)
+            if n is None: return None,None
+            for r_,_ds,fs in os.walk(os.path.expanduser(src_cp[n].get('BORG_ROOTBKP',''))):
+                for f in sorted(fs):
+                    p=os.path.join(r_,f)
+                    with open(p,'rb') as fh: return os.path.abspath(p).lstrip('/'),fh.read().decode('latin-1')
+            return None,None
+        rA,rB=(real[0],real[1]) if len(real)==2 else (None,None)
+        _dm_rc(rd,'web.rc','cw',"[_borgHelperWWW]\napi_prefix = /api\nuser_header = X-Web\n\n[_borgHelperWWW_rc]\nweb.rc = web\nmail.rc = mail\n\n"
+               f"[db]\n{sect(rA)}GROUPS_READ = g-web\n\n[front]\nBORG_REPO = /inexistant-s86/f\nBORG_ARCHNAME = f\nGROUPS_READ = g-web\n",
+               "GROUPS_ADMIN = g-admin\nEXCLUDE = --exclude-caches\n")
+        _dm_rc(rd,'mail.rc','cm',"[_borgHelperWWW]\napi_prefix = /mailapi\nuser_header = X-Mail\nrequire_user = true\n\n"
+               f"[db]\n{sect(rB)}GROUPS_READ = g-mail\nGROUPS_PATHS = g-mail:/home\n\n[m2]\nBORG_REPO = /inexistant-s86/m\nBORG_ARCHNAME = m\n",
+               "GROUPS_ADMIN = g-madmin\nEXCLUDE = --exclude-caches\n")
+        os.chmod(os.path.join(rd,'mail.rc'),0o640)   # borgHelper cite alors le chemin du rc (droits) : retiré des réponses
+        cw=os.path.join(dm_root,'caches','cw'); cm=os.path.join(dm_root,'caches','cm')
+        arch={}; rawdu={}; ilast={}; RID=('9'*31)+'1'
+        envc=dict(os.environ); envc['BORGHELPERC_NO_CLEANUP_NOTICE']='1'
+        def cli(f,*a,timeout=600):
+            return subprocess.run([sys.executable,str(BORGHELPER_BIN),'-C',os.path.join(rd,f),*a],env=envc,capture_output=True,text=True,
+                                  timeout=timeout,stdin=subprocess.DEVNULL)
+        if rA:
+            for f in ('web.rc','mail.rc'):
+                cli(f,'-c','Index','-n','db'); cli(f,'-c','Index','-S','-n','db'); p=cli(f,'-c','LstBkp','-n','db')
+                arch[f]=[l.split()[0] for l in p.stdout.splitlines() if l.strip()]
+                for pat,srt in ((None,'chemin'),('*','added:desc')):
+                    q=cli(f,'-c','DuIdx','-n','ALL',*(['-f',pat] if pat else []),'-s',srt,'-R')
+                    try: rawdu[(f,pat)]=json.loads(q.stdout)
+                    except ValueError: rawdu[(f,pat)]={}
+            bhm=BorgHelper(cfgfile=os.path.join(rd,'mail.rc'))   # rangée bkp_status de mail:db (watcher), dans SON history.db
+            bhm.db.store_bkp_status_start('db',RID); bhm.db.store_bkp_status_finish('db',RID,'success')
+            ilast={f:BorgHelper(cfgfile=os.path.join(rd,f)).db.read_index_last('db') for f in ('web.rc','mail.rc')}
+        fake=_dm_write(os.path.join(dm_root,'faux-borghelper'),
+            "import sys,os,json\na=sys.argv\nC=a[a.index('-C')+1]\n"
+            "print(json.dumps({os.path.basename(C):{'c':a[a.index('-c')+1],'n':a[a.index('-n')+1] if '-n' in a else None}}))\n")
+        H3={'start':True,'success':True,'error':True}
+        prefs={'version':2,'subscriptions':{
+            'ep1':{'scope_nicks':['front','db','zzz','mail:db','m2'],'hosts':{'front':H3,'db':H3,'zzz':H3,'mail:db':dict(H3,start=False),'m2':H3},
+                   'expires_at':None},
+            'ep2':{'scope_nicks':['front','web:front'],'hosts':{'web:front':{'start':True,'success':False,'error':False},'front':H3},'expires_at':None},
+            'ep3':{'scope_nicks':['mail:db'],'notify_start':True,'notify_end':True,'expires_at':None},
+            'ep4':{'scope_nicks':['web:db'],'hosts':{'web:db':H3},'expires_at':None}}}
+        spec={'prefs':os.path.join(cw,'web_rc-push-prefs.json'),'pushdb':os.path.join(cw,'web_rc-push.db'),'fake':fake,'real':bool(rA),
+              'rd':rd,'cneu':os.path.join(dm_root,'caches','cneu'),'cmail':cm,'rid':RID,'plain':os.path.join(dm_root,'caches','fichier'),
+              'fA':afile(rA),'fB':afile(rB),'calias':os.path.join(dm_root,'caches','calias'),
+              'cneu3':os.path.join(dm_root,'caches','cneu3')}
+        _dm_write(spec['prefs'],json.dumps(prefs))
+        with contextlib.closing(sqlite3.connect(spec['pushdb'])) as k:
+            k.executescript(_PUSH_DB_SCHEMA_SCRIPT)
+            k.executemany("INSERT INTO overdue_alerts (nick,last_archive,level) VALUES (?,?,?)",
+                          [('front','A',1),('front#sentry','A',1),('db','A',1),('web:front','B',2),('m2','A',1)])
+            k.execute("INSERT INTO push_subscriptions (endpoint,p256dh,auth,scope_nicks) VALUES ('ep4','p','a','[]')")
+            k.commit()
+        child=_DM_LOAD+r'''
+import io,contextlib,sqlite3,subprocess as _sp
+from unittest import mock
+from fastapi.testclient import TestClient
+spec=json.loads(os.environ['S86_SPEC']); out={}
+c=TestClient(w.app,raise_server_exceptions=False); P=w.API_PREFIX
+H={'X-API-Key':'k','X-Groups':'g-web,g-mail,g-admin,g-madmin'}
+def call(m,route,hdr=None,raw=False,**params):
+    r=c.request(m,P+route,headers=hdr or H,params=params)
+    if raw: return [r.status_code,r.content.decode('latin-1'),r.headers.get('content-disposition')]
+    try: b=r.json()
+    except ValueError: b=None
+    return [r.status_code,b]
+out['nicks']=w._nick_list('ALL'); out['www']=[w.API_PREFIX,w.USER_HEADER,w.REQUIRE_USER]
+out['bases']=[w.PUSH_DB,w.SCOPE_CACHE_DB,w.PUSH_PREFS_FILE]
+with open(spec['prefs'],encoding='utf-8') as f: out['prefs']=json.load(f)['subscriptions']
+with contextlib.closing(sqlite3.connect(spec['pushdb'])) as k:
+    out['overdue']=sorted(list(r) for r in k.execute("SELECT nick,last_archive FROM overdue_alerts"))
+with open(w.PUSH_RC_FILES,encoding='utf-8') as f: out['rcfiles']=json.load(f)['rc_files']
+out['rcfiles_name']=os.path.basename(w.PUSH_RC_FILES)
+# row 42 : instantané du middleware — UNE relecture par requête, hors de la boucle d'événements (row 32)
+import asyncio as _aio
+nl=[0]; offloop=[]; real_live=w._rc_live; real_new=w._rc_req_new
+def live_c(): nl[0]+=1; return real_live()
+def new_c():
+    try: _aio.get_running_loop(); offloop.append(False)
+    except RuntimeError: offloop.append(True)
+    return real_new()
+with mock.patch.object(w,'_rc_live',live_c), mock.patch.object(w,'_rc_req_new',new_c):
+    call('GET','/access'); out['mw']=[nl[0],offloop]
+    ev0=[]   # watcher : la rangée de mail:db (history.db de SON rc) réclamée, notifiée sous le nom exposé
+    with mock.patch.object(w,'_send_bkp_push',lambda n,e,*a,**k: ev0.append([n,e])):
+        nl[0]=0; w._bkp_status_watcher_pass(); n_w=nl[0]
+    out['watch']=sorted(x for x in ev0 if x[1] in ('start','end'))
+    nl[0]=0; w._push_prune_unknown_nicks(); out['passes']=[n_w,nl[0]]   # row 33
+out['repo']={n:(w._cfgread(n) or {}).get('BORG_REPO') for n in out['nicks']}
+calls=[]; real_run=w._run_group
+def spy(argv,timeout,env): calls.append(list(argv)); return real_run(argv,timeout,env)
+class _P:
+    def __init__(self,argv,**k):
+        calls.append(list(argv))
+        if os.environ.get('S86_POPEN_FAIL') and os.path.basename(argv[argv.index('-C')+1])==os.environ['S86_POPEN_FAIL']: raise OSError('refus simulé')
+        self.pid=4242
+with mock.patch.object(w,'BORGHELPER_BIN',w.Path(spec['fake'])):
+    with mock.patch.object(w,'_run_group',spy):
+        out['f_lst']=call('GET','/lstbkp',nick='mail:db')
+        out['f_rep']=call('GET','/report',nick='ALL',offline='true',json='true')
+        out['f_search']=call('GET','/search',nick='mail:db,web:front,web:db',pattern='x')
+        n_p=len(calls)
+        out['pass']=[call('GET','/report',hdr={**H,'X-Borg-Passphrase':'x'},nick='ALL',offline='true')[0],
+                     call('GET','/report',hdr={**H,'X-Borg-Passphrase':'x'},nick='web:db,mail:db',offline='true')[0],len(calls)-n_p]
+        out['pass1']=call('GET','/report',hdr={**H,'X-Borg-Passphrase':'x'},nick='web:db',offline='true')[0]
+        del calls[n_p:]
+        n_s=len(calls); out['f_stats']=call('GET','/stats')[0]   # revue 3 (row 47) : chaque rc sans -n (stats(None))
+        out['stats_argv']=[[os.path.basename(a[a.index('-C')+1]),a[a.index('-c')+1],a[a.index('-n')+1] if '-n' in a else None] for a in calls[n_s:]]
+        del calls[n_s:]
+        sk=[]
+        with mock.patch.object(w,'op_allowed',lambda c_,op,n: n!='mail:m2'):
+            out['opfilter']=[[g[0].prefix,g[1]] for g in w._rc_groups('ALL','prune',[],sk)]+[sk]
+        with mock.patch.object(w,'op_allowed',lambda c_,op,n: not (n=='mail:m2' and op=='restore')):   # revue 3 (row 48)
+            out['opL']=[[g[1] for g in w._rc_groups('ALL','restore',a_,[])] for a_ in (['-f','-L','-w','/x'],['-f','x','-L'])]
+    with mock.patch.object(w.subprocess,'Popen',_P):   # détachés : jamais lancés
+        out['f_bkp']=call('POST','/bkp',nick='web:db')
+        out['f_index']=call('POST','/index',nick='ALL')
+    with mock.patch.object(w,'_run_group',spy):
+        out['f_login']=[call('POST','/login',hdr={'X-API-Key':'k','X-Groups':g},servername='s',nickname=nn,repo='u@h:/r',repo_passphrase='p')[0]
+                        for nn,g in (('mail:neu','g-madmin'),('mail:neu','g-admin'),('web:neu','g-madmin'))]
+        with mock.patch.object(w,'GROUPS_HEADER',None):
+            out['f_login0']=[call('POST','/login',servername='s',nickname=nn,repo='u@h:/r',repo_passphrase='p')[0] for nn in ('neu','zz:neu')]
+    calls_ok=list(calls)
+    # décision 11 : pas de fusion sensée -> 400 ; jamais un borgHelper lancé
+    n0=len(calls)
+    with mock.patch.object(w,'_run_group',spy):
+        out['one_rc']=[call('GET','/repohistory',nick='web:db,mail:db')[0],call('GET','/archivehistory',nick='web:db,mail:db')[0],
+                       call('GET','/lstbkpfls',nick='web:db,mail:db')[0],call('GET','/diffbkp',nick='web:db,mail:db')[0],
+                       call('GET','/report',nick='ALL',html='true',offline='true')[0],call('GET','/report',nick='web:db',html='true',offline='true')[0]]
+        for cmd_ in ('idxtop','difftop'):
+            try: w._exec_dir(cmd_,'web:db,mail:db',['-j']); out['one_rc'].append('lancé')
+            except w.HTTPException as e: out['one_rc'].append(e.status_code)
+    out['one_rc_spawn']=len(calls)-n0-1   # le seul lancé : Report -l d'UN rc
+    # row 9 : lancement détaché refusé sur un rc, fait sur l'autre
+    os.environ['S86_POPEN_FAIL']='mail.rc'
+    with mock.patch.object(w.subprocess,'Popen',_P): out['partial']=call('POST','/index',nick='ALL')
+    os.environ.pop('S86_POPEN_FAIL')
+    # row 14 : délai dépassé sur le 2e rc
+    def slow(argv,timeout,env):
+        if os.path.basename(argv[argv.index('-C')+1])=='mail.rc': raise _sp.TimeoutExpired(argv,timeout)
+        return real_run(argv,timeout,env)
+    with mock.patch.object(w,'_run_group',slow): out['timeout']=call('GET','/stats')
+out['argv']=[[os.path.basename(a[a.index('-C')+1]),a[a.index('-c')+1],a[a.index('-n')+1] if '-n' in a else None] for a in calls_ok]
+w._RESPONSE_CACHE.clear()
+with mock.patch.object(w,'GROUPS_HEADER',None):
+    out['u404']=[call('GET','/lstbkp',nick=n)[0] for n in ('db','xx:db','web:ALL',',')]+[call('GET','/download/file',nick='xx:db',path='x')[0],
+                 call('POST','/index',nick=',')[0]]
+    out['zzz']=call('GET','/lstbkp',nick='mail:zzz')
+out['u403']=[call('GET','/lstbkp',nick='db')[0],call('GET','/lstbkp',nick='xx:db')[0]]   # groupes actifs : comme un nick inconnu en -C
+out['g_mail']=call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'g-mail'})
+out['g_mail_web']=call('GET','/lstbkp',hdr={'X-API-Key':'k','X-Groups':'g-mail'},nick='web:db')[0]
+# revue 3 (row 44) : g-mail à périmètre (/home) sur mail:db — nom à espaces, liste, doublon : 400, rien lancé (avant : périmètre lu sur
+# la chaîne brute -> illimité, nom nettoyé au lancement) ; (row 45) `nick=` vide : 404, rien lancé (avant : tous les nicks des rc)
+calls.clear()
+with mock.patch.object(w,'BORGHELPER_BIN',w.Path(spec['fake'])), mock.patch.object(w,'_run_group',spy):
+    G={'X-API-Key':'k','X-Groups':'g-mail'}
+    out['scope1']=[call('GET','/lstbkpfls',hdr=G,nick=n)[0] for n in (' mail:db','mail:db,','mail:db,mail:db')]
+    out['scope1']+=[call('GET','/restore/perms',hdr=G,nick=' mail:db',ftor='home/x')[0],len(calls)]
+    with mock.patch.object(w,'GROUPS_HEADER',None), mock.patch.object(w,'ALLOW_DESTRUCTIVE',True):
+        out['empty']=[call('POST','/prune',nick='')[0],call('DELETE','/delbkp',nick='',bid='x')[0],len(calls)]
+calls.clear()
+# décision 8 : le nom d'un hôte dans une notification = celui de la page (préfixé)
+sent=[]
+def fake_wp(subscription_info,data=None,**k): sent.append((subscription_info['endpoint'],json.loads(data)))
+with mock.patch.object(w,'_PYWEBPUSH_AVAILABLE',True), mock.patch.object(w,'PUSH_VAPID_PRIVATE_KEY','x'), mock.patch.object(w,'webpush',fake_wp):
+    w._send_bkp_push('web:db','end','success')
+out['push_sent']=[[e,d.get('nick'),d.get('event')] for e,d in sent]
+if spec['real']:
+    calls.clear()
+    with mock.patch.object(w,'_run_group',spy):
+        out['lst']=[call('GET','/lstbkp',nick='web:db'),call('GET','/lstbkp',nick='mail:db')]
+        n1=len(calls); out['lst2']=call('GET','/lstbkp',nick='web:db'); out['spawn2']=len(calls)-n1
+        # invalidation par rc : bases de mail touchées -> mail:db relancé, web:db servi du cache
+        dbm=[os.path.join(spec['cmail'],f) for f in os.listdir(spec['cmail']) if f.endswith('-diff.db')][0]
+        st_=os.stat(dbm); os.utime(dbm,ns=(st_.st_atime_ns,st_.st_mtime_ns+2*10**9))
+        n2=len(calls); call('GET','/lstbkp',nick='mail:db'); out['spawn_mail']=len(calls)-n2
+        n3=len(calls); call('GET','/lstbkp',nick='web:db'); out['spawn_web']=len(calls)-n3
+        # empreinte du cache par périmètre : partie « cfgfile: » = mtime du rc de CHAQUE nick — mail.rc modifié : celle de mail:db
+        # change, celle de web:db non (les lignes de mail:db sont alors périmées, jamais celles de web:db)
+        cf=lambda n: [x for x in w._capture_fingerprints(n)[n].split('|') if x.startswith('cfgfile:')]
+        f0=[cf('mail:db'),cf('web:db')]
+        mr_=os.path.join(spec['rd'],'mail.rc'); st_=os.stat(mr_)
+        with open(mr_,'a',encoding='utf-8') as f: f.write("\n; modifié\n")
+        os.utime(mr_,ns=(st_.st_atime_ns,st_.st_mtime_ns+3*10**9))
+        f1=[cf('mail:db'),cf('web:db')]
+        out['scoped_fp']=[f0[0]!=f1[0],f0[1]==f1[1],bool(f0[0]) and bool(f0[1])]
+        n6=len(calls)
+        out['duidx']=[call('GET','/duidx',nick='ALL',json='true'),call('GET','/duidx',nick='ALL',json='true',pattern='*',sort='added:desc')]
+        out['duidx_argv']=[('-R' in a and '-j' not in a) for a in calls[n6:]]
+    out['ckeys']=sorted(repr(k) for k in w._RESPONSE_CACHE)
+    out['rep']=call('GET','/report',nick='ALL',offline='true',json='true')
+    out['tree']=call('GET','/treehist',nick='ALL',json='true')
+    out['dl']=[call('GET','/download/file',raw=True,nick='web:db',path=spec['fA'][0]),call('GET','/download/file',raw=True,nick='mail:db',path=spec['fB'][0])]
+    t_=call('GET','/download/tar',raw=True,nick='mail:db'); out['tar']=[t_[0],t_[2]]
+    acc=call('GET','/access')[1]['nicks']; out['acc']={n:[acc[n].get('index_last'),acc[n].get('bkp_last') is not None] for n in ('web:db','mail:db')}
+    # rapprochement : compte rendu lu au nick NU, fin réclamée sous le nom exposé, -C du rc
+    rid2='8'*32; seen=[]; claimed=[]
+    def recon(argv,timeout,env):
+        seen.append(list(argv)); return _sp.CompletedProcess(argv,0,stdout=json.dumps([{'nick':'db','verified':True,'runs':{rid2:w.RK_ABSENT}}]),stderr='')
+    with mock.patch.object(w,'_run_group',recon), mock.patch.object(w,'_reconcile_claim_error',lambda n,r: claimed.append([n,r])):
+        w._reconcile_run('mail:db',rid2)
+    out['recon']=[claimed,[[os.path.basename(a[a.index('-C')+1]),a[a.index('-n')+1]] for a in seen]]
+out['prune']=w._push_prune_unknown_nicks()
+with open(spec['prefs'],encoding='utf-8') as f: out['prefs2']=json.load(f)['subscriptions']['ep1']['scope_nicks']
+# rechargement à chaud
+rd=spec['rd']; m=os.path.join(rd,'web.rc')
+with open(m,encoding='utf-8') as f: m0=f.read()
+def put(p,t):
+    with open(p,'w',encoding='utf-8') as f: f.write(t)
+def phase(name):
+    e=io.StringIO()
+    with contextlib.redirect_stderr(e): a=w._nick_list('ALL'); b=w._nick_list('ALL')
+    out['hot_'+name]=[a==b and a,e.getvalue().count('[WARN] mode dossier'),sorted(w._rc_state().unavailable)]
+with open(os.path.join(rd,'mail.rc'),encoding='utf-8') as f: mail0=f.read()
+put(os.path.join(rd,'neu.rc'),"[DEFAULT]\nCACHE_DIR = %s\n[_borgHelperWWW]\napi_prefix = /neu\n[x]\nBORG_REPO = /inexistant-s86/x\nGROUPS_READ = g-mail\n" % spec['cneu'])
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = neu\n")); phase('ajout')
+with open(os.path.join(rd,'mail.rc'),'a',encoding='utf-8') as f: f.write("\n[db2]\nBORG_REPO = /inexistant-s86/y\n")
+phase('modif')
+put(m,m0.replace("mail.rc = mail\n","")); phase('retrait')
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = web\n")); phase('double')
+out['keep_failed']=w._push_prune_keep(set(w._nick_list('ALL')))('mail:zz')
+put(m,m0); phase('retour')
+# row 11 : liste invalide (ancienne gardée, mail dedans) puis mail.rc illisible -> jamais une erreur, aucun nettoyage
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = web\n")); w._nick_list('ALL')
+put(m,m0.replace("mail.rc = mail\n","neu.rc = web\n")); w._nick_list('ALL')   # liste refusée qui ne cite plus mail.rc
+put(os.path.join(rd,'mail.rc'),"pas une section\n")
+try:
+    e_=io.StringIO()
+    with contextlib.redirect_stderr(e_):
+        try: w._cfgread('mail:db'); cf='None'
+        except Exception as x_: cf=type(x_).__name__
+        with mock.patch.object(w,'GROUPS_HEADER',None): b_=call('POST','/bkp',nick='mail:db')
+        out['illisible']=[w._nick_list('ALL'),cf,call('GET','/access')[0],b_[0],(b_[1] or {}).get('detail','')]
+except Exception as x: out['illisible']=repr(x)
+out['watched']=os.path.join(rd,'mail.rc') in w._RC['files']   # row 34 : rc servi toujours surveillé
+put(os.path.join(rd,'mail.rc'),mail0); put(m,m0); w._nick_list('ALL')
+os.rename(os.path.join(rd,'mail.rc'),os.path.join(rd,'mail.rc.bak')); phase('absent')
+out['keep_absent']=[w._push_prune_keep(set(w._nick_list('ALL')))(n) for n in ('mail:db','db','web:zz','gone:x')]
+os.rename(os.path.join(rd,'mail.rc.bak'),os.path.join(rd,'mail.rc')); phase('revenu')
+HS={'start':True,'success':True,'error':False}
+out['sub9']=c.post(P+'/push/subscribe',headers=H,json={'endpoint':'e9','keys':{'p256dh':'p','auth':'a'},'hosts':{'mail:db':HS}}).status_code
+# décision 10 : préfixe « mail » réattribué à neu.rc -> suspendu (rien envoyé), [WARN] une fois ; remis -> repris
+put(m,m0.replace("mail.rc = mail\n","neu.rc = mail\n")); phase('reattrib')
+out['susp']=[w._push_muted('mail:x'),w._push_prune_keep(set(w._nick_list('ALL')))('mail:zz'),sorted(w._RC['suspended'])]
+with mock.patch.object(w,'_bhn',side_effect=AssertionError('lu')):   # row 42 : alerte de retard d'un préfixe suspendu : rien lu
+    try: w._check_overdue('mail:x','/inexistant-s86'); out['overdue_susp']=True
+    except AssertionError: out['overdue_susp']=False
+acc_=call('GET','/access')[1]
+out['susp_access']=[acc_.get('suspended_prefixes'),acc_['nicks'].get('mail:x',{}).get('prefix_suspended'),
+                    acc_['nicks'].get('web:db',{}).get('prefix_suspended')]
+acc_w=call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'g-web'})[1]   # revue 3 (row 52) : rien d'un nick sans droit
+out['susp_access_w']=[acc_w.get('suspended_prefixes'),acc_w['nicks'].get('mail:x',{}).get('prefix_suspended'),
+                      acc_w['nicks'].get('web:db',{}).get('prefix_suspended')]
+# revue 3 (row 49) : hôtes suspendus gardés dans l'entrée (synchro, réabonnement, PATCH : réglages intacts), jamais un 409
+s1=c.post(P+'/push/subscribe/sync',headers=H,params={'endpoint':'e9'}).status_code
+s2=c.post(P+'/push/subscribe',headers=H,json={'endpoint':'e9','keys':{'p256dh':'p','auth':'a'},'hosts':{'mail:x':{},'web:db':{}}}).status_code
+s3=c.patch(P+'/push/subscribe',headers=H,json={'endpoint':'e9','hosts':{'mail:db':{'start':False,'success':False,'error':False},'web:db':HS}}).status_code
+with open(w.PUSH_PREFS_FILE,encoding='utf-8') as f: e9=json.load(f)['subscriptions']['e9']
+out['susp_sub']=[out['sub9'],s1,s2,s3,'mail:db' in e9['scope_nicks'],e9['hosts'].get('mail:db'),'mail:x' in e9['scope_nicks'],e9['hosts'].get('web:db')]
+# row 36 : levée par la mémoire (ligne du préfixe retirée) vue sans toucher aux rc
+with open(w.PUSH_RC_FILES,encoding='utf-8') as f: mem0=json.load(f)
+mem1=json.loads(json.dumps(mem0)); del mem1['rc_files']['mail']; put(w.PUSH_RC_FILES,json.dumps(mem1)); w._nick_list('ALL')
+out['lift']=[w._push_muted('mail:x'),sorted(w._RC['suspended'])]
+put(w.PUSH_RC_FILES,json.dumps(mem0)); put(m,m0); phase('reattrib_fin'); out['susp_fin']=[w._push_muted('mail:db'),sorted(w._RC['suspended'])]
+# row 30 : mémoire illisible -> doute : préfixe non prouvé inchangé (mail réattribué) suspendu, web non ; jamais une erreur
+put(w.PUSH_RC_FILES,"pas du json"); put(m,m0.replace("mail.rc = mail\n","neu.rc = mail\n"))
+try: w._nick_list('ALL'); out['doubt']=sorted(w._RC['suspended'])
+except Exception as x: out['doubt']=repr(x)
+put(w.PUSH_RC_FILES,json.dumps(mem0)); put(m,m0); w._nick_list('ALL')
+def boom(st_): raise OSError('disque plein (simulé)')
+old_ob=w._RC['on_build']; w._RC['on_build']=boom
+try:
+    put(m,m0+"\n"); w._nick_list('ALL'); out['mem_write']='ok'
+except Exception as x: out['mem_write']=repr(x)
+finally: w._RC['on_build']=old_ob
+put(m,m0); w._nick_list('ALL'); out['susp_after']=sorted(w._RC['suspended'])
+# revue 3 (row 51) : écriture de la mémoire en échec (préfixe nouveau « nouv ») -> réessayée à l'échéance sans changement de fichier
+def memhas(p_):
+    with open(w.PUSH_RC_FILES,encoding='utf-8') as f: return p_ in json.load(f)['rc_files']
+w._RC['on_build']=boom; e_=io.StringIO()
+try:
+    with contextlib.redirect_stderr(e_):
+        put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = nouv\n")); w._nick_list('ALL'); w._nick_list('ALL'); a1=memhas('nouv')
+        w._RC['on_build']=old_ob; w._nick_list('ALL'); a2=memhas('nouv')
+        w._RC['mem_retry_at']=0; w._nick_list('ALL'); a3=memhas('nouv')
+    out['mem_retry']=[a1,a2,a3,e_.getvalue().count('non écrite')]
+except Exception as x: out['mem_retry']=repr(x)
+finally: w._RC['on_build']=old_ob
+put(m,m0); w._nick_list('ALL')
+# row 4 : CACHE_DIR inutilisable à chaud -> ancienne liste gardée, [WARN]
+put(os.path.join(rd,'mauvais.rc'),"[DEFAULT]\nCACHE_DIR = %s\n[z]\nBORG_REPO = /inexistant-s86/z\n" % spec['plain'])
+put(os.path.join(rd,'neu3.rc'),"[DEFAULT]\nCACHE_DIR = %s\n[w3]\nBORG_REPO = /inexistant-s86/w\n" % spec['cneu3'])
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu3.rc = n3\nmauvais.rc = mv\n")); phase('cache_inutilisable')
+rdrs=sys.modules['borgHelper']._DB_CFG_READERS
+out['refus_readers']=[os.path.realpath(spec['cneu3']) in rdrs,os.path.exists(spec['cneu3'])]   # row 28 : rien enregistré ni créé
+os.unlink(spec['plain'])   # row 34 : CACHE_DIR corrigé, aucun rc touché -> nouvel essai
+with mock.patch.object(w,'_RC_RETRY',0.0): w._nick_list('ALL')
+w._RC['retry_at']=0; out['retry']=w._nick_list('ALL')
+put(m,m0); w._nick_list('ALL')
+# row 24 : liste refusée (mail.rc prend le CACHE_DIR de web), ancienne gardée -> lancement pour mail:db refusé (503)
+with open(os.path.join(rd,'mail.rc'),encoding='utf-8') as f: mailc=f.read()
+put(os.path.join(rd,'mail.rc'),mailc.replace(spec['cmail'],os.path.dirname(w.PUSH_DB))); w._nick_list('ALL'); w._RESPONSE_CACHE.clear()
+e_=io.StringIO()
+with contextlib.redirect_stderr(e_): out['launch_guard']=[call('GET','/lstbkp',nick='mail:db')[0],call('GET','/lstbkp',nick='web:db')[0],
+                                                           'CACHE_DIR changé' in e_.getvalue()]
+put(os.path.join(rd,'mail.rc'),mailc); w._nick_list('ALL')
+# row 24 : rc indisponible — son CACHE_DIR reste réservé
+os.rename(os.path.join(rd,'mail.rc'),os.path.join(rd,'mail.rc.bak')); w._nick_list('ALL')
+put(os.path.join(rd,'neu4.rc'),"[DEFAULT]\nCACHE_DIR = %s\n[w4]\nBORG_REPO = /inexistant-s86/w\n" % spec['cmail'])
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu4.rc = n4\n")); e_=io.StringIO()
+with contextlib.redirect_stderr(e_): out['unav_cache']=['n4' not in w._rc_state().entries,'partagent CACHE_DIR' in e_.getvalue()]
+os.rename(os.path.join(rd,'mail.rc.bak'),os.path.join(rd,'mail.rc')); put(m,m0); w._nick_list('ALL')
+# row 12 : rc listé par un lien -> -C et préfixe des bases tirés du nom du lien
+put(os.path.join(rd,'cible.rc'),"[DEFAULT]\nCACHE_DIR = %s\n[y]\nBORG_REPO = /inexistant-s86/y\n" % spec['calias'])
+os.symlink('cible.rc',os.path.join(rd,'alias.rc'))
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nalias.rc = al\n")); w._nick_list('ALL')
+e_=w._rc_state().entries.get('al')
+out['lien']=[e_ and os.path.basename(e_.path),e_ and e_.bh.db.db_prefix,e_ and os.path.basename(w._rc_groups('al:y')[0][0].path)]
+put(m,m0); w._nick_list('ALL')
+# row 3 : écriture pendant la relecture -> revue à l'appel suivant
+orig=w._rc_build
+def racy(old=None):
+    r=orig(old); put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = neu\n")); return r
+put(m,m0+"\n")
+with mock.patch.object(w,'_rc_build',racy): a_=w._nick_list('ALL')
+out['course']=[a_,w._nick_list('ALL')]
+put(m,m0); w._nick_list('ALL')
+# row 7 : instantané d'une requête — liste figée pendant la requête
+tok=w._RC_REQ.set(w._rc_req_new()); a_=w._nick_list('ALL')
+put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = neu\n")); b_=w._nick_list('ALL'); w._RC_REQ.reset(tok)
+out['instantane']=[a_==b_,w._nick_list('ALL')]
+put(m,m0)
+try: w._build_borghelper_argv_env('lstbkp','db',[]); out['argv_sans_rc']='lancé'
+except RuntimeError: out['argv_sans_rc']='refusé'
+print('S86JSON:'+json.dumps(out,ensure_ascii=False))
+'''
+        env={'BORGHELPERWWW_CFGDIR':rd,'BORGHELPERWWW_MASTER':'web.rc','BORGHELPERWWW_API_KEY':'k',
+             'BORGHELPERWWW_GROUPS_HEADER':'X-Groups','BORGHELPERWWW_BORGHELPER_BIN':str(BORGHELPER_BIN),
+             'BORGHELPERC_CLEANUP_HOME':os.path.join(dm_root,'home-vide'),'S86_SPEC':json.dumps(spec)}
+        os.makedirs(env['BORGHELPERC_CLEANUP_HOME'])
+        r,dm=_dm_child(env,child,timeout=900)
+        if dm is None:
+            print(f"  enfant en mode dossier sans résultat (code {r.returncode}) : {r.stderr[-2500:]}")
+            check("mode dossier : enfant démarré en --cfgdir/--master",lambda: False)
+        else:
+            N0=['web:db','web:front','mail:db','mail:m2']
+            check("mode dossier : nicks exposés préfixe:nick de tous les rc (même nick dans deux rc), [_borgHelperWWW] du maître seul, "
+                  "bases de WWW dans le dossier du maître, fichier de chaque préfixe mémorisé (relatif au dossier) ; une relecture par "
+                  "requête (hors boucle) et par passe du watcher et du nettoyage (1.32.0)",
+                  lambda: dm['nicks']==N0 and dm['www']==['/api','X-Web',False]
+                          and dm['bases']==[spec['pushdb'],os.path.join(cw,'web_rc-scopecache.db'),spec['prefs']]
+                          and dm['repo']['web:db']!=dm['repo']['mail:db']
+                          and dm['rcfiles']=={'web':'web.rc','mail':'mail.rc'} and dm['rcfiles_name']=='web_rc-push-prefs-rc-files.json'
+                          and dm['mw']==[1,[True,True,True]] and dm['passes']==[1,1])
+            def _argv_ok():
+                want=[['mail.rc','lstbkp','db'],['web.rc','report','db,front'],['mail.rc','report','db,m2'],['mail.rc','search','db'],
+                      ['web.rc','search','front,db'],['web.rc','bkp','db'],['web.rc','index','db,front'],
+                      ['mail.rc','index','db,m2'],['mail.rc','login','neu']]
+                rep=json.loads(dm['f_rep'][1]['stdout']); srch=json.loads(dm['f_search'][1]['stdout'])
+                ok=(dm['argv']==want and rep=={'web.rc':{'c':'report','n':'db,front'},'mail.rc':{'c':'report','n':'db,m2'}}
+                    and dm['pass']==[400,400,0] and dm['pass1']==200
+                    and dm['opfilter']==[['web','db,front'],['mail','db'],['mail:m2: dépôt externe — prune non permis, nick écarté']]
+                    and set(srch)=={'mail.rc','web.rc'} and dm['f_lst'][0]==200 and dm['f_bkp'][0]==200 and '4242' in dm['f_bkp'][1]['stdout']
+                    and dm['f_index'][0]==200 and 'web 4242, mail 4242' in dm['f_index'][1]['stdout']
+                    and dm['f_login']==[200,403,403] and dm['f_login0']==[400,400]
+                    and dm['f_stats']==200 and dm['stats_argv']==[['web.rc','stats',None],['mail.rc','stats',None]]
+                    and dm['opL']==[['db,front','db'],['db,front','db,m2']])
+                if not ok: print(f"  argv {dm['argv']} ; report {rep} ; search {srch} ; bkp {dm['f_bkp']} ; index {dm['f_index']} ; "
+                                 f"login {dm['f_login']} {dm['f_login0']} ; passphrase {dm['pass']} {dm['pass1']} ; filtre {dm['opfilter']} ; "
+                                 f"stats {dm['f_stats']} {dm['stats_argv']} ; -L {dm['opL']}")
+                return ok
+            check("mode dossier : chaque borgHelper lancé reçoit le -C du rc de ses nicks et la liste EXPLICITE des nicks nus contrôlés "
+                  "(ALL : jamais -n ALL, dépôts externes écartés comme la CLI ; liste multi-rc, Bkp et Index détachés) ; X-Borg-Passphrase "
+                  "multi-rc : 400 ; Login : préfixe obligatoire, admin du [DEFAULT] du rc du préfixe ; Stats sans nick : chaque rc sans -n ; -L valeur de -f : "
+                  "pas une lecture (1.32.0)",_argv_ok)
+            def _multi_ok():
+                p=dm['partial'][1] or {}; t=dm['timeout'][1] or {}
+                ok=(dm['one_rc']==[400]*5+[200,400,400] and dm['one_rc_spawn']==0
+                    and dm['partial'][0]==500 and 'web 4242' in p.get('stdout','') and 'mail : refus simulé' in p.get('stderr','')
+                    and dm['timeout'][0]==400 and t.get('exitcode')==124 and 'web.rc' in json.loads(t.get('stdout') or '{}')
+                    and 'timeout' in t.get('stderr','') and '── mail ──' in t.get('stderr',''))
+                if not ok: print(f"  un seul rc {dm['one_rc']} {dm['one_rc_spawn']} ; partiel {dm['partial']} ; délai {dm['timeout']}")
+                return ok
+            check("mode dossier : 400 « un seul fichier de conf » sans rien lancer (RepoHistory, ArchiveHistory, LstBkpFls, DiffBkp, "
+                  "Report HTML, IdxTop/DiffTop -j sur plusieurs rc) ; lancement détaché ou délai sur un rc : ce qui est fait gardé (1.32.0)",_multi_ok)
+            def _unknown_ok():
+                mr=os.path.join(rd,'mail.rc')
+                p=subprocess.run([sys.executable,str(BORGHELPER_BIN),'-C',mr,'-c','lstbkp','-n','zzz'],env=envc,capture_output=True,
+                                 text=True,timeout=120,stdin=subprocess.DEVNULL)
+                z=dm['zzz'][1] or {}
+                want=(p.returncode,p.stdout.replace(mr,'<rc mail>'),p.stderr.replace(mr,'<rc mail>'))
+                ok=(dm['u404']==[404]*6 and dm['u403']==[403,403] and (z.get('exitcode'),z.get('stdout'),z.get('stderr'))==want
+                    and mr in p.stderr and '<rc mail>' in z.get('stderr','') and rd not in json.dumps(z))
+                if not ok: print(f"  404 {dm['u404']} ; 403 {dm['u403']} ; mail:zzz {z} ; CLI {want}")
+                return ok
+            check("mode dossier : préfixe:inconnu -> réponse de borgHelper pour un nick inconnu (chemin du rc remplacé par <rc préfixe>) ; "
+                  "nom sans préfixe, préfixe inconnu, préfixe:ALL, liste vide -> 404 (1.32.0)",_unknown_ok)
+            def _groups_ok():
+                n=(dm['g_mail'][1] or {}).get('nicks',{})
+                ok=(dm['g_mail'][0]==200 and n.get('mail:db',{}).get('level')=='read' and n['mail:db'].get('read_scope')==['/home']
+                    and n.get('web:db',{}).get('level')=='none' and dm['g_mail_web']==403)
+                if not ok: print(f"  {dm['g_mail']} ; web:db {dm['g_mail_web']}")
+                return ok
+            check("mode dossier : niveaux et périmètres (GROUPS_*, GROUPS_PATHS) lus dans le rc du nick, sous son nom exposé (1.32.0)",_groups_ok)
+            def _scope_dir_ok():
+                ok=dm['scope1']==[400,400,400,400,0] and dm['empty']==[404,404,0]
+                if not ok: print(f"  route à un nick {dm['scope1']} ; nick vide {dm['empty']}")
+                return ok
+            check("correctif de sécurité (mode dossier) : route à un nick, appelant à périmètre — nom à espaces, liste, doublon : 400 sans "
+                  "rien lancer ; `nick=` vide : 404 sans rien lancer (jamais tous les nicks) (1.32.0)",_scope_dir_ok)
+            def _push_mig_ok():
+                p=dm['prefs']; e1=p['ep1']; e2=p['ep2']
+                warn=[l for l in r.stderr.splitlines() if '[WARN] mode dossier : abonnement' in l]
+                ok=(e1['scope_nicks']==['web:front','web:db','zzz','mail:db','m2'] and set(e1['hosts'])=={'web:front','web:db','zzz','mail:db','m2'}
+                    and e1['hosts']['web:front']==H3 and e1['hosts']['mail:db']==dict(H3,start=False)
+                    and e2['scope_nicks']==['web:front'] and e2['hosts']=={'web:front':{'start':True,'success':False,'error':False}}
+                    and p['ep3']==prefs['subscriptions']['ep3'] and len(warn)==2 and any('« zzz » absent du maître' in l for l in warn)
+                    and any('« m2 » absent du maître' in l and 'jamais rattaché à mail:m2' in l for l in warn)
+                    and dm['overdue']==[['m2','A'],['web:db','A'],['web:front','B'],['web:front#sentry','A']]
+                    and dm['prefs2']==['web:front','web:db','zzz','mail:db','m2'] and dm['push_sent']==[['ep4','web:db','end']])
+                if not ok: print(f"  {p} ; warn {warn} ; overdue {dm['overdue']} ; après nettoyage {dm['prefs2']} ; push {dm['push_sent']}")
+                return ok
+            check("mode dossier : abonnements et alertes de retard rattachés au MAÎTRE seulement (jamais à l'homonyme d'un autre rc) ; "
+                  "absent du maître : [WARN] une fois, laissé tel quel, jamais retiré ; notification sous le nom exposé (1.32.0)",_push_mig_ok)
+            def _hot_ok():
+                h={k[4:]:v for k,v in dm.items() if k.startswith('hot_')}
+                base=N0; w2=['web:db','web:front']; HS9={'start':True,'success':True,'error':False}
+                ok=(h['ajout']==[base+['neu:x'],1,[]] and h['modif']==[base+['mail:db2','neu:x'],0,[]]
+                    and h['retrait']==[w2,0,[]] and h['double']==[w2,1,[]] and dm['keep_failed'] is True
+                    and h['retour']==[base+['mail:db2'],1,[]]   # mail.rc revenu : sa section [_borgHelperWWW] redite
+                    and isinstance(dm['illisible'],list) and dm['illisible'][:4]==[base[:2],'MissingSectionHeaderError',200,500]
+                    and '<rc mail>' in dm['illisible'][4] and rd not in dm['illisible'][4] and dm['watched'] is True
+                    and h['absent']==[w2,1,['mail']] and dm['keep_absent']==[True,True,False,False]
+                    and h['revenu']==[base,1,[]]   # mail.rc remis dans son état de départ (sans db2) après le contrôle « illisible »
+                    and h['reattrib']==[w2+['mail:x'],2,[]] and dm['susp']==['préfixe réattribué',True,['mail']]
+                    and dm['overdue_susp'] is True and dm['susp_access']==[['mail'],True,False] and dm['susp_access_w']==[[],False,False]
+                    and dm['susp_sub']==[200,200,200,200,True,HS9,False,HS9] and dm['mem_retry']==[False,False,True,1]
+                    and dm['lift']==[None,[]] and dm['doubt']==['mail'] and dm['mem_write']=='ok' and dm['susp_after']==[]
+                    and h['reattrib_fin']==[base,1,[]] and dm['susp_fin']==[None,[]]
+                    and h['cache_inutilisable']==[base,1,[]] and dm['refus_readers']==[False,False] and dm['retry']==base+['n3:w3','mv:z']
+                    and dm['launch_guard']==[503,200,True] and dm['unav_cache']==[True,True]
+                    and dm['lien']==['alias.rc','alias_rc','alias.rc']
+                    and dm['course']==[base,base+['neu:x']]
+                    and dm['instantane']==[True,base+['neu:x']] and dm['argv_sans_rc']=='refusé')
+                if not ok: print(f"  {h} ; nettoyage (échec) {dm['keep_failed']} ; illisible {dm['illisible']} {dm['watched']} ; gardés {dm['keep_absent']} ; "
+                                 f"suspension {dm['overdue_susp']} {dm['susp_access']} {dm['susp_access_w']} {dm['susp_sub']} {dm['mem_retry']} {dm['lift']} {dm['doubt']} {dm['mem_write']} "
+                                 f"{dm['susp_after']} ; refus {dm['refus_readers']} {dm['retry']} ; lancement {dm['launch_guard']} {dm['unav_cache']} ; "
+                                 f"suspendus {dm['susp']} {dm['susp_fin']} ; lien {dm['lien']} ; course {dm['course']} ; instantané {dm['instantane']}")
+                return ok
+            check("mode dossier : rechargement à chaud — rc ajouté ([WARN] section WWW), modifié, retiré ; liste invalide ou CACHE_DIR "
+                  "inutilisable : ancienne gardée et surveillée, [WARN] une fois, aucun nettoyage, rien construit, nouvel essai ; rc illisible : "
+                  "absent des listes, 500 « configuration illisible » sans chemin pour une action ; CACHE_DIR changé sous une liste refusée : "
+                  "503 ; préfixe réattribué ou mémoire illisible : suspendu (alertes, abonnements, /access), levée par la mémoire ; lien ; "
+                  "écriture pendant la relecture revue ; liste figée par requête (1.32.0)",_hot_ok)
+            def _mig_once():
+                """Row 29 : migration une fois par push.db — 2e démarrage, nick nu que le maître a : laissé (jamais rattaché plus tard)."""
+                with open(spec['prefs'],encoding='utf-8') as f: pr=json.load(f)
+                pr['subscriptions']['ep5']={'scope_nicks':['front'],'hosts':{'front':H3},'expires_at':None}
+                _dm_write(spec['prefs'],json.dumps(pr))
+                r2,_x=_dm_child(env,_DM_LOAD)
+                with open(spec['prefs'],encoding='utf-8') as f: ep5=json.load(f)['subscriptions']['ep5']['scope_nicks']
+                ok=(r2.returncode==0 and ep5==['front'] and 'passés aux noms' not in r2.stderr
+                    and "« front » (passage au mode dossier déjà fait" in r2.stderr)   # revue 3 (row 50) : nom nu restant dit
+                if not ok: print(f"  {r2.returncode} {ep5} {r2.stderr[-400:]!r}")
+                return ok
+            check("mode dossier : migration des abonnements une seule fois par push.db (2e démarrage : rien rattaché, nom nu restant : "
+                  "[WARN]) (1.32.0)",_mig_once)
+            def _real_ok():
+                if not rA:
+                    print(f"  {CFGFILE} : aucun couple de nicks à dépôt local et BORG_EXE (bac à sable lk exigé)"); return False
+                l1,l2=dm['lst']; rep=json.loads(dm['rep'][1]['stdout']); tree=json.loads(dm['tree'][1]['stdout'])
+                first=lambda r: (r[1] or {}).get('stdout','').split()[:1]
+                bk=rep.get('backups',{})
+                ok=(l1[0]==l2[0]==200 and first(l1)==arch['web.rc'][:1] and first(l2)==arch['mail.rc'][:1] and arch['web.rc']!=arch['mail.rc']
+                    and dm['lst2']==l1 and dm['spawn2']==0 and any("'web:db'" in k for k in dm['ckeys']) and any("'mail:db'" in k for k in dm['ckeys'])
+                    and set(rep['summary'])=={'web:db','web:front','mail:db','mail:m2','Totaux'}
+                    and set(arch['web.rc'])<=set(bk.get('web:db',{})) and set(arch['mail.rc'])<=set(bk.get('mail:db',{}))
+                    and not set(arch['mail.rc'])&set(bk.get('web:db',{})) and set(tree)=={'web:db','web:front','mail:db','mail:m2'})
+                if not ok: print(f"  lstbkp {l1} {l2} {arch} ; cache {dm['spawn2']} {dm['ckeys']} ; report {list(rep.get('summary',{}))} {list(bk)} ; treehist {list(tree)}")
+                return ok
+            check("mode dossier réel : web:db et mail:db lisent chacun les bases et le dépôt de leur rc ; Report ALL et TreeHist ALL "
+                  "réunissent tous les rc ; cache de réponses par nick exposé (1.32.0)",_real_ok)
+            def _real_more_ok():
+                if not rA: return False
+                d1,d2=dm['dl']; ex=[]
+                for pat,srt,got in ((None,'chemin',dm['duidx'][0]),('*','added:desc',dm['duidx'][1])):
+                    rows=[x for f in ('web.rc','mail.rc') for x in (rawdu[(f,pat)].get('rows') or [])]
+                    raw={'borghelper_version':rawdu[('web.rc',pat)].get('borghelper_version'),'rows':rows}
+                    ex.append((got[0],json.loads(got[1]['stdout'])==_recompute_duidx(raw,None,pat,srt)))
+                a=dm['acc']
+                ok=(d1[0]==d2[0]==200 and d1[1]==spec['fA'][1] and d2[1]==spec['fB'][1] and spec['fA'][1]!=spec['fB'][1]
+                    and dm['tar']==[200,'attachment; filename="mail_db.tar"']
+                    and dm['spawn_mail']==1 and dm['spawn_web']==0 and dm['scoped_fp']==[True,True,True]
+                    and ex==[(200,True),(200,True)] and dm['duidx_argv']==[True]*4
+                    and a['web:db'][0]==ilast['web.rc'] and a['mail:db'][0]==ilast['mail.rc'] and ilast['web.rc']!=ilast['mail.rc']
+                    and a['mail:db'][1] is True
+                    and dm['watch']==[['mail:db','end'],['mail:db','start']]
+                    and dm['recon']==[[['mail:db','8'*32]],[['mail.rc','db']]])
+                if not ok: print(f"  téléchargements {[x[:1]+[x[1][:40]] for x in dm['dl']]} {spec['fA'][1][:20]!r}/{spec['fB'][1][:20]!r} {dm['tar']} ; "
+                                 f"cache mail {dm['spawn_mail']} web {dm['spawn_web']} périmètre {dm['scoped_fp']} ; "
+                                 f"duidx {ex} {dm['duidx_argv']} ; access {a} / {ilast} ; watcher {dm['watch']} ; rapprochement {dm['recon']}")
+                return ok
+            check("mode dossier réel : téléchargements depuis le dépôt du rc du nick (nom .tar exposé), caches invalidés par rc (bases, rc), "
+                  "DuIdx ALL recalculé des lignes brutes de chaque rc, /access, watcher et rapprochement au nick nu du bon rc (1.32.0)",_real_more_ok)
+    finally:
+        shutil.rmtree(dm_root,ignore_errors=True)
 
     fails=results.count(False)
     print(f"push selftest : {len(results)-fails}/{len(results)} OK"+(f", {fails} FAIL" if fails else ""))
