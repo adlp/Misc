@@ -1,5 +1,88 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.208, borgHelperWWW 1.33.0, UI 1.26.0 — Vue par hôte de stockage — 2026-10-20
+
+Chantier « reconstruction progressive », story 87a (cadrage story 87, D195/A45 ; décisions de l'utilisateur du 2026-10-20).
+Place libre et alertes avant plein : story 87b.
+
+- **borgHelper** : nouvelle commande `Storage` (`-c Storage [-n nick|a,b|ALL] [-j]`, groupe RAPPORTS ET ÉTAT de l'aide ; sans
+  `-n` : `ALL`, décision 5) — dépôts des nicks regroupés par hôte de stockage, sans jamais lancer borg ni ssh (lecture de
+  `history.db`, `df` pour un dépôt local).
+  - Stockage d'un nick : `user@hôte[:port]` d'un dépôt ssh (`ssh://…` ou `user@hôte:chemin`, IPv6 entre crochets ; hôte en
+    minuscules ; port lu comme un nombre, 22 omis ; utilisateur implicite : son propre stockage) ; dépôt `ssh://[user@]localhost:<p>/…`
+    avec un `SSH_REMFO` qui ouvre ce port : cible du tunnel (`9:nas:22` -> `nas`, avec l'utilisateur du dépôt et le port de la
+    cible), jamais « localhost » (cette machine : `localhost…`, `ip6-…`, adresses de bouclage ou non spécifiées par `ipaddress`
+    — `127.1`, `::ffff:…`, `::` —, son nom ; DNS inverse seulement pour un nom à point, 2 s au plus) — `SSH_REMFO` d'un autre
+    port : dépôt ssh de cette machine ; illisible : « tunnel non résolu (<nick>) », jamais réuni ; dépôt local : « local <point de
+    montage> » (`u@h://r` aussi, comme borg 1) ; nouvelle clé de nick `STORAGE = nom` : ce nom, quelle que soit la forme ; forme à
+    identifiants ou borg 2 (`xxx://` hors ssh/file, `s3:`/`b2:` avec `…@`, `ssh://user:mdp@`) : rangée sous `STORAGE` (schéma
+    seul, empreinte sans identifiants), sinon erreur du nick qui cite le schéma seul — jamais l'URL ni un secret ; liste
+    blanche : seules les formes strictes de borg 1 (`ssh://[user@]hôte[:port]/chemin`, `[user@]hôte:chemin` à un seul `@`, sans
+    `=` ni `::`, chemin local, `file://`) sont lues, toute autre (`rclone::…,secret=…`, `ssh://u:p/w@h/r`, `u:mdp@h:/r`…) l'est
+    par son schéma seul — pris d'une liste fixe (`ssh`, `file`, `sftp`, `s3`, `b2`, `rclone`, `http(s)`, `rest`, `socket`),
+    sinon « … », comme pour une valeur à caractère de contrôle (`BORG_REPO` sur plusieurs lignes, ligne suivante du rc
+    comprise : chemin local et `file://` compris) ; empreinte d'un `rclone:` sans ses paires `,clé=valeur`.
+  - Dépôt local : chemin réel (liens, `~`), dossier seul ouvert d'abord (`O_DIRECTORY|O_NOCTTY|O_NONBLOCK` : jamais un
+    périphérique derrière un lien ; autofs ; absent ou pas un dossier : aucun `df`), `df --output=target -- .` dans ce dossier
+    (`fchdir` ; environnement `PATH` et `LC_ALL=C` seuls ; inaccessible : « dossier inaccessible ») par un enfant dans
+    sa propre session (`python -I`, dossier courant `/`), tué avec borgHelper (`PR_SET_PDEATHSIG`, PID du parent vérifié) : 10 s par chemin, 30 s pour l'appel dès le
+    premier dépôt local (tous résolus avant toute lecture de base), groupe tué au délai, sortie relue 2 s au plus (chemin réel
+    gardé), jamais attendu au-delà ; délai coupé par l'échéance : « délai de Storage épuisé », rien retenu ; sinon retenu pour
+    l'appel : le montage du chemin réel, ou le chemin exact (réel inconnu, `/`, autofs) — un lien qui y mène arrête aussitôt son
+    enfant ; décision 7 : `df` encore vivant après sa mise à mort -> clé, PID et heure de démarrage notés dans `CACHE_DIR`
+    (`<préfixe>-storage-df-bloque.json` : verrou `.lock` non bloquant réessayé 2 s, lecture sans lien ni blocage — fichier
+    ordinaire de 64 Kio au plus —, entrées filtrées — clé réduite à `/` écartée —, `.tmp` exclusif sans lien, écriture atomique)
+    — aucun `df` relancé dessous tant que ce PID vit avec la même heure de démarrage (`/proc` refusé : gardée ; masqué :
+    `kill(pid, 0)`, `EPERM` = vivant) ; erreur du nick « montage
+    <m> ne répond pas (df bloqué) » (« ; marque non écrite » si besoin), dépôt « local ? (<chemin>) » ; `df` introuvable, en
+    échec ou enfant impossible : « point de montage non lu (…) ».
+  - Même dépôt sous plusieurs écritures (`ssh://h/./r`, `ssh://h/~/r`, `h:r`, `//`, `~u/`, « / » final, racine du home, lien
+    symbolique local) : un seul dépôt, compté une fois, ses nicks réunis. Taille d'un stockage = somme des dernières mesures
+    (`unique_csize` de `repo_stats`, première et dernière par date, id en départage) de ses dépôts distincts ; croissance = cette
+    somme − somme de leurs premières mesures ; durée couverte = de la plus ancienne première mesure à la plus récente dernière ;
+    moyenne par mois = somme des rythmes des dépôts mesurés sur au moins un jour (croissance / sa propre durée, mois de 30,4375
+    jours). Dépôt jamais mesuré : listé, taille « — ».
+  - Texte (stderr) : une ligne par stockage et une par dépôt ; `-j` (stdout) : `{borghelper_version, storages:[{storage, named,
+    nicks, repos:[{repo, repo_id, kind, named, nicks, size, measured_at, first_size, first_at}], measured_repos, size, first_size,
+    growth, first_at, last_at, days, growth_per_month}], errors:{nick: message}}` (tailles en octets, dates UTC ; chaînes non
+    UTF-8 échappées).
+  - Erreurs par nick, jamais bloquantes, code 1 : rc illisible (seule erreur `*` : « Fichier <rc> absent » ou type de l'erreur
+    et clé seuls, jamais la ligne ni la valeur ; `-n ALL` passé tel quel à Storage, qui contrôle le rc d'abord), nick inconnu du
+    rc (`DEFAULT`, `_…` compris), section illisible, `BORG_REPO` absent
+    ou borg 2 sans `STORAGE` (nick non placé), montage qui ne répond pas, `history.db` ou `diff.db` illisible (nick placé, sans
+    mesure ; base partagée verrouillée attendue une fois par appel), mesures d'avant 1.0.139 encore dans la `diff.db` (Storage ne
+    migre jamais : la commande qui les migre est dite). Report inchangé.
+  - Fonctions de module `_storage_of`, `_LocalResolver`, `_storage_aggregate`, `_storage_merge` (réutilisée par borgHelperWWW),
+    `BorgHelperDB.get_storage_measures`/`storage_unmigrated`, `BorgHelper.storage` (`ALL` développé).
+- **CodecSelfTest** : 15 contrôles « Storage » (regroupement — ssh, ports, IPv6, `user@hôte:chemin`, tunnel, bouclage, STORAGE,
+  formes à identifiants sans secret, `getfqdn` compté et borné — ; identité de dépôt ; `df` borné — groupe tué, petit-enfant
+  `setsid`, échéance et délai coupé, `/` et autofs au chemin exact, lien vers une clé expirée, absent sans `df`, raisons, un
+  résolveur par appel — ; `df` bloqué noté avec son PID et son heure de démarrage, entrées hostiles, `/proc` refusé, marque non
+  écrite ; rc illisible ; moyenne par mois ; tailles, croissance et étiquette locale
+  — oracle `ismount` — sur une base connue ; mesures par date et départage ; texte ; erreurs ; bases partagées verrouillées ; sans
+  `-n` = `ALL` ; chaînes non UTF-8 ; lecture seule ; fusion) ; aide : 37 entrées ; garde de fermeture SQLite : 118 ouvertures.
+- **borgHelperWWW** : route `GET /storage` (niveau lecture, sans `nick`) — `Storage -j` sur les nicks que l'appelant peut lire
+  (groupes actifs : niveau lecture au moins, accès direct par périmètre compris ; un autre nick n'est ni compté ni nommé, ni son
+  dépôt) ; décision 6 : droits d'un nick illisibles -> nick omis, ni compté ni nommé, seule l'erreur générique
+  `errors["*"]` = « droits illisibles : un ou plusieurs nicks omis (détail : journal du serveur) », le détail au journal ; aucun
+  nick lisible : vue vide, rien lancé. Un borgHelper par rc (mode dossier), une seule vue réunie (même dépôt servi par deux rc :
+  compté une fois), noms exposés `préfixe:nick` (« tunnel non résolu » et conseils « borgHelper -C <rc> » compris) ; rc en échec
+  (délai, lancement refusé ou impossible, sortie illisible) ou illisible (absent ou refusé, rc listé par le maître compris ; `"*"`
+    d'un borgHelper renommé) : `errors["<préfixe>:*"]` (`"*"` en mode `-C`), vue des
+  autres rc gardée — rc illisible sous autorisation par groupes : erreur générique de la décision 6, jamais le nom du rc ; avis
+  d'une même clé réunis ; journal : erreur de lecture d'un rc par son type et son numéro de ligne seuls ; section au nom de nick
+  invalide (`[ALL]`…) jamais lancée ; `?nick=` ignoré (route hors `_check_group_access` : jamais un 403 qui nommerait un nick). Jamais en
+  cache. Push selftest : `/storage` en mode `-C` (filtrage par groupes, vue vide, groupes inactifs, droits illisibles — nick ni
+  compté ni nommé, détail au journal —, borgHelper en échec, illisible ou non lancé, rc illisible ou absent, noms exposés,
+  `?nick=`, formes à secrets absentes de la réponse) et en mode
+  dossier (tous, g-mail, g-web, aucun groupe, groupes inactifs — vues comparées aux sorties CLI de chaque rc ; rc refusé au
+  lancement, illisible, indisponible).
+- **UI** : bloc « Stockages » au-dessus de la liste des serveurs (chargé avec elle, à part) — une ligne par stockage (dépôts,
+  taille, croissance, par mois, depuis la première mesure et durée en jours) et une par dépôt (nicks, taille, date de mesure ou
+  « aucune mesure ») ; erreurs par nick et par rc dessous ; masqué si le serveur n'a pas `/storage`. Test UI : rendu, échappement
+  (dates comprises), chargement (succès, code 1, 404 de route, 403, illisible, réponse dépassée), appel par la liste.
+- Report différé : `get_repo_stats` (Report) lit encore la dernière mesure par id (deferred-work.md, story 87a).
+
 ## borgHelperWWW 1.32.1, UI 1.25.0 — UI groupée par fichier de conf (mode dossier) — 2026-10-20
 
 Chantier « reconstruction progressive », story 86b (suite de la story 86, décisions de l'utilisateur du 2026-10-20).

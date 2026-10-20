@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.207"
+Version="1.0.208"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -444,6 +444,510 @@ def _remfo_target_local(spec):
     if len(parts) not in (3,4): return None
     host=parts[-2].strip('[]').lower()
     return host in _LOCAL_HOSTS or host in {socket.gethostname().lower(),socket.getfqdn().lower(),socket.gethostname().split('.')[0].lower()}
+
+# ── Stockages (1.0.208, story 87a, décisions de l'utilisateur) ──────────────────────────────────────────────────────
+# Vue par hôte de stockage : dépôts regroupés par `user@hôte[:port]` (ssh), cible du tunnel SSH_REMFO, ou point de montage
+# (dépôt local) ; STORAGE = nom (clé de nick) surcharge. Lecture seule : history.db (repo_stats) et df pour un dépôt local —
+# jamais borg ni ssh (place libre et alertes : story 87b).
+_MONTH_DAYS=30.4375   # mois moyen (365,25 / 12) : moyenne de croissance par mois
+_ME_NAMES={}          # revue 87a (rows 13, 30, 47) : nom de cette machine et fqdn, lus une fois par processus ; getfqdn (DNS
+                      # inverse) seulement pour un nom à point qui n'est ni le nom ni le nom court, borné à 2 s
+
+def _fqdn_bounded():
+    """socket.getfqdn() mémorisé, borné à 2 s (fil démon : un DNS inverse figé n'arrête jamais Storage) ; délai : ''."""
+    if 'fqdn' not in _ME_NAMES:
+        box=[]
+        def _get():
+            try: box.append(socket.getfqdn().lower())
+            except Exception: box.append('')
+        t=threading.Thread(target=_get,daemon=True); t.start(); t.join(2)
+        _ME_NAMES['fqdn']=box[0] if box else ''
+    return _ME_NAMES['fqdn']
+
+def _this_host(host):
+    """Vrai si `host` (sans crochets ni point final) désigne CETTE machine : `_LOCAL_HOSTS`, `localhost*`, `ip6-*`, adresse de
+    bouclage ou non spécifiée (ipaddress, forme courte `127.1` comprise, IPv4 dans IPv6 `::ffff:…`), son nom ou son nom court ; son
+    fqdn seulement pour un nom à point (_fqdn_bounded)."""
+    import ipaddress
+    h=(host or '').lower().strip('[]').rstrip('.')
+    if h in _LOCAL_HOSTS or h.startswith(('localhost','ip6-')): return True
+    ip=None
+    try: ip=ipaddress.ip_address(h)
+    except ValueError:
+        if re.fullmatch(r'[0-9a-fx.]+',h) and re.search(r'\d',h):
+            try: ip=ipaddress.IPv4Address(socket.inet_aton(h))
+            except (OSError,ValueError): ip=None
+    if ip is not None:
+        ip=getattr(ip,'ipv4_mapped',None) or ip
+        return ip.is_loopback or ip.is_unspecified
+    if 'name' not in _ME_NAMES: _ME_NAMES['name']=socket.gethostname().lower()
+    hn=_ME_NAMES['name']
+    if h in (hn,hn.split('.')[0]): return True
+    if '.' not in h: return False
+    return h==_fqdn_bounded()
+
+def _port_norm(port):
+    """Port écrit (« 022 », « 22 », None) -> chaîne normalisée par int, None pour absent ou 22 (défaut de ssh)."""
+    try: p=int(port) if port not in (None,'') else 22
+    except (TypeError,ValueError): return str(port)
+    return None if p==22 else str(p)
+
+def _storage_host_label(user,host,port):
+    """« user@hôte[:port] » d'un stockage ssh : hôte en minuscules, IPv6 entre crochets, port normalisé (22 omis), hôte de
+    CETTE machine -> son nom (jamais « localhost »). Utilisateur implicite (absent) : son propre stockage (décision 2)."""
+    h=(host or '').lower()
+    if _this_host(h): h=socket.gethostname().lower()
+    if ':' in h: h=f"[{h}]"
+    p=_port_norm(port)
+    return (f"{user}@" if user else '')+h+(f":{p}" if p else '')
+
+_SCP_FORM=re.compile(r'^(?:[^@/:\[]+@)?(?:\[[^\]/]+\]|[^/:\[]+):(.*)$')
+
+def _storage_repo_path(repo):
+    """Chemin d'un dépôt ssh, normalisé pour reconnaître le même dépôt sous plusieurs écritures (« / » doublés réduits D'ABORD,
+    revue 87a row 48) : `ssh://h/./r`, `ssh://h/~/r`, `h:r`, `h:~/r`, `h:./r`, `h:.//r` -> « r » (dossier personnel ; sa racine
+    `ssh://h/~`, `h:~`, `h:` -> « . ») ; `ssh://h/~u/r` et `h:~u/r` -> « ~u/r » ; `ssh://h/r`, `ssh://h//r`, `h:/r` -> « /r » ;
+    « / » final retiré."""
+    import posixpath
+    m=re.match(r'^ssh://(?:[^@/]+@)?(?:\[[^\]/]+\]|[^:/\[]+)(?::\d+)?(/.*)$',repo)
+    if m:
+        p=re.sub(r'/{2,}','/',m.group(1))
+        if p.startswith(('/~','/./')) or p=='/.': p=p[1:]
+    else:
+        m=_SCP_FORM.match(repo)
+        p=re.sub(r'/{2,}','/',m.group(1) if m else repo)
+    if p in ('~','.','~/','./'): p=''
+    elif p.startswith(('~/','./')): p=p[2:]
+    if not p: return '.'
+    p=posixpath.normpath(p)
+    return '.' if p in ('','.') else p
+
+def _remfo_target(spec):
+    """(port écouté, hôte, port de l'hôte) de SSH_REMFO (`[bind:]port:hôte:port_hôte`, argument de ssh -R), hôte sans crochets ;
+    None : forme illisible (socket, -R dynamique, ports non numériques)."""
+    parts=re.split(r':(?![^\[]*\])',(spec or '').strip())
+    if len(parts) not in (3,4): return None
+    lp,host,hp=parts[-3].strip(),parts[-2].strip().strip('[]'),parts[-1].strip()
+    if not (lp.isdigit() and hp.isdigit() and host): return None
+    return lp,host,hp
+
+def _bsr(x):
+    """Revue 87a (rows 32, 43) : chaînes d'une sortie de Storage (chemins, montages, étiquettes non UTF-8 : surrogates de fsdecode,
+    ou d'un fichier de marque) -> échappées par backslashreplace, récursivement (dict, liste) ; jamais un UnicodeEncodeError."""
+    if isinstance(x,str):
+        try: return x.encode('utf-8','surrogateescape').decode('utf-8','backslashreplace')
+        except UnicodeEncodeError: return x.encode('utf-8','backslashreplace').decode('utf-8')
+    if isinstance(x,dict): return {_bsr(k):_bsr(v) for k,v in x.items()}
+    if isinstance(x,list): return [_bsr(v) for v in x]
+    return x
+
+# Enfant de résolution d'un dépôt local (argv : chemin, PID du parent) : tué avec borgHelper (PR_SET_PDEATHSIG, avant exec ; parent
+# déjà mort avant prctl : sortie, code 4 — revue 87a rows 24, 44), chemin réel (NUL final), ouverture du DOSSIER seul
+# (O_DIRECTORY|O_NOCTTY|O_NONBLOCK, revue 87a row 64 : jamais un périphérique ouvert par un lien piégé ; déclenche un montage
+# autofs, comme repoLocalAbsent ; absent ou pas un dossier : code 3, aucun df), dossier courant posé dessus (fchdir ; lecture
+# refusée : chdir, qui n'ouvre rien ; inaccessible : code 6), puis df lui-même sur « . » (exec : un seul processus, tué avec son
+# groupe au délai ; df introuvable : code 5). Environnement : PATH et LC_ALL=C seuls (_LocalResolver._run).
+_RESOLVE_PY=("import os,sys\ntry:\n import ctypes;ctypes.CDLL(None).prctl(1,9)\nexcept Exception: pass\n"
+             "if os.getppid()!=int(sys.argv[2]): sys.exit(4)\n"
+             "p=os.path.realpath(sys.argv[1]);sys.stdout.buffer.write(os.fsencode(p)+b'\\0');sys.stdout.flush()\n"
+             "try: fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOCTTY|os.O_NONBLOCK)\n"
+             "except (FileNotFoundError,NotADirectoryError): sys.exit(3)\nexcept OSError: fd=None\n"
+             "try: os.fchdir(fd) if fd is not None else os.chdir(p)\nexcept OSError: sys.exit(6)\n"
+             "try: os.execvp('df',['df','--output=target','--','.'])\nexcept OSError: sys.exit(5)\n")
+_DF_STUCK_FILE='storage-df-bloque.json'   # CACHE_DIR/<préfixe>-storage-df-bloque.json : {chemin ou montage: [pid, starttime]}
+_STORAGE_LATE="point de montage non lu (délai de Storage épuisé)"
+
+def _mount_table():
+    """{point de montage: type} de /proc/self/mounts (échappements octaux lus) ; {} si illisible."""
+    try:
+        with open('/proc/self/mounts','rb') as f: raw=f.read()
+    except OSError: return {}
+    oc=lambda b: os.fsdecode(re.sub(rb'\\([0-7]{3})',lambda m: bytes([int(m.group(1),8)]),b))
+    out={}
+    for l in raw.split(b'\n'):
+        f=l.split(b' ')
+        if len(f)>2: out[oc(f[1])]=oc(f[2])
+    return out
+
+def _mount_prefixes():
+    """Points de montage de /proc/self/mounts, du plus long au plus court ; [] si illisible."""
+    return sorted(_mount_table(),key=len,reverse=True)
+
+def _pid_start(pid):
+    """starttime (champ 22 de /proc/<pid>/stat) d'un processus vivant et non zombie ; None : absent, zombie ou illisible ;
+    PermissionError levée (hidepid, autre utilisateur)."""
+    try:
+        with open(f"/proc/{int(pid)}/stat",'rb') as f: st=f.read()
+    except PermissionError: raise
+    except (OSError,ValueError,TypeError,OverflowError): return None
+    try:
+        f=st[st.rindex(b')')+2:].split()
+        return None if f[0]==b'Z' else int(f[19])
+    except (ValueError,IndexError): return None
+
+def _mark_alive(v):
+    """Revue 87a (rows 43, 58) : marque [pid, starttime] encore vivante — même PID ET même starttime (jamais un PID réutilisé, jamais
+    la ligne de commande, lecture possiblement bloquante) ; /proc refusé (EACCES) : gardée ; /proc muet (hidepid=2 : ENOENT pour le
+    processus d'un autre utilisateur) : os.kill(pid, 0) — EPERM = vivant, gardée."""
+    try: st=_pid_start(v[0])
+    except PermissionError: return True
+    if st is not None: return st==v[1]
+    try: os.kill(v[0],0)
+    except PermissionError: return True
+    except (OSError,OverflowError,ValueError): return False
+    return False   # même utilisateur, /proc muet : zombie ou disparu entre-temps
+
+def _covers(key,path):
+    return path==key or path.startswith(key.rstrip('/')+'/')
+
+class _LocalResolver:
+    """Revue 87a (rows 2, 7, 14, 20, 21, 23, 24, 42-46) : résolution des dépôts locaux d'UN appel de Storage -> (chemin réel ou None,
+    point de montage ou None, raison ou None) par chemin, par un enfant (_RESOLVE_PY : realpath, ouverture, df) dans sa propre
+    session ; sortie lue au fil de l'eau (poll) : chemin réel couvert par une marque ou un montage expiré -> enfant tué aussitôt.
+    Délai par chemin = min(per_path, reste de l'échéance globale `budget`, comptée dès le premier chemin) ; au délai, groupe tué,
+    sortie relue 2 s au plus, tube fermé, groupe retué en sortie d'exception. Délai réduit par l'échéance : « délai de Storage
+    épuisé », rien retenu. Délai plein : retenu pour l'appel (et, enfant vivant après sa mise à mort, décision 7 : noté dans `marker`
+    avec son PID et son starttime) — le montage (plus long préfixe de /proc/self/mounts du chemin réel, relu après un délai), ou le
+    chemin exact si le chemin réel est inconnu, le montage « / » ou de type autofs. Marques cherchées sur le chemin écrit et sur le
+    chemin réel. Fichier de marques : verrou flock (`.lock`) autour de chaque lecture-écriture, entrées filtrées (clé absolue autre
+    que « / », [pid > 1, starttime]), .tmp créé O_EXCL|O_NOFOLLOW 0600 puis os.replace, retiré sur échec (marque non écrite :
+    dite). Popen impossible, df introuvable ou en échec : raison dite."""
+    def __init__(self,budget=30.0,per_path=10.0,marker=None):
+        self.budget=budget; self.deadline=None; self.per_path=per_path; self.marker=marker
+        self.by_path={}; self.dead=set(); self._mt=None
+    def _key(self,real):
+        """Clé retenue pour un chemin réel : son montage, ou le chemin même (montage « / » ou autofs)."""
+        if self._mt is None: self._mt=_mount_table()
+        for mp in sorted(self._mt,key=len,reverse=True):
+            if _covers(mp,real): return real if (mp=='/' or self._mt[mp]=='autofs') else mp
+        return real
+    # ── fichier de marques (décision 7) ──
+    _MARK_MAX=65536   # octets lus au plus (row 58)
+    def _load(self):
+        """Marques lues sans jamais bloquer ni suivre un lien (O_NOFOLLOW|O_NONBLOCK, fichier régulier, taille bornée) ; entrées
+        filtrées : clé absolue qui ne se réduit pas à « / » (normpath : « // », « /./ », « /.. » refusés), [pid > 1, starttime]."""
+        try:
+            fd=os.open(self.marker,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode): return {}
+                raw=os.read(fd,self._MARK_MAX+1)
+            finally: os.close(fd)
+            if len(raw)>self._MARK_MAX: return {}
+            d=json.loads(raw.decode('utf-8','surrogateescape'))
+            return {k:[v[0],v[1]] for k,v in d.items() if isinstance(k,str) and os.path.isabs(k) and os.path.normpath(k).strip('/')
+                    and isinstance(v,list) and len(v)==2 and all(type(x) is int for x in v) and v[0]>1 and v[1]>=0}
+        except Exception: return {}
+    def _update(self,fn):
+        """fn(marques) -> marques nouvelles, sous verrou ; écrites si elles changent. -> True si rien à écrire ou écrit."""
+        if not self.marker: return True
+        import fcntl
+        try: lk=os.open(self.marker+'.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        except OSError: return False
+        try:
+            end=time.monotonic()+2   # row 58 : verrou tenu ailleurs (fichier piégé) -> jamais une attente sans fin
+            while True:
+                try: fcntl.flock(lk,fcntl.LOCK_EX|fcntl.LOCK_NB); break
+                except BlockingIOError:
+                    if time.monotonic()>end: return False
+                    time.sleep(0.05)
+            d=self._load(); n=fn(dict(d))
+            if n==d: return True
+            if not n:
+                try: os.unlink(self.marker)
+                except FileNotFoundError: pass
+                return True
+            tmp=f"{self.marker}.{os.getpid()}.tmp"
+            try: os.unlink(tmp)
+            except OSError: pass
+            try:
+                fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                with os.fdopen(fd,'w',encoding='utf-8',errors='surrogateescape') as f: json.dump(n,f)
+                os.replace(tmp,self.marker); return True
+            except OSError:
+                try: os.unlink(tmp)
+                except OSError: pass
+                return False
+        except OSError: return False
+        finally: os.close(lk)
+    def _marked(self,*paths):
+        """Marque vivante qui couvre l'un des chemins -> sa clé ; marques mortes retirées."""
+        paths=[p for p in paths if p]
+        if not self.marker or not paths: return None
+        d=self._load()
+        if not d: return None
+        live={k:v for k,v in d.items() if _mark_alive(v)}
+        if live!=d: self._update(lambda c: {k:v for k,v in c.items() if _mark_alive(v)})
+        for k in sorted(live,key=len,reverse=True):
+            if any(_covers(k,p) for p in paths): return k
+        return None
+    def _hit(self,*paths):
+        for p in paths:
+            if not p: continue
+            for k in sorted(self.dead,key=len,reverse=True):
+                if _covers(k,p): return k
+        return self._marked(*paths)
+    def __call__(self,path):
+        if path in self.by_path: return self.by_path[path]
+        if self.deadline is None: self.deadline=time.monotonic()+self.budget
+        k=self._hit(path); left=self.deadline-time.monotonic()
+        if k is not None: res=(None,None,f"montage {k} ne répond pas (df bloqué)")
+        elif left<=0.2: res=(None,None,_STORAGE_LATE)
+        else:
+            capped=left<self.per_path
+            real,mount,state,pid,why,start=self._run(path,min(left,self.per_path))
+            if state=='ok': res=(real,mount,why)
+            elif state=='hit': res=(real,None,f"montage {why} ne répond pas (df bloqué)")
+            elif capped: res=(real,None,_STORAGE_LATE)   # row 45 : délai coupé par l'échéance, rien retenu
+            else:
+                self._mt=None; key=self._key(real) if real else path   # row 42 : chemin réel inconnu -> chemin exact
+                msg=f"montage {key} ne répond pas (df bloqué)"
+                if key!='/':
+                    self.dead.add(key)
+                    if pid is not None:
+                        if start is not None and not self._update(lambda c: dict(c,**{key:[pid,start]})):
+                            msg+=" ; marque non écrite (CACHE_DIR)"
+                res=(real,None,msg)
+        self.by_path[path]=res
+        return res
+    @staticmethod
+    def _parse(out,rc):
+        real,sep,rest=(out or b'').partition(b'\0')
+        real=os.fsdecode(real) if sep and real.startswith(b'/') else None
+        lines=[l.strip() for l in os.fsdecode(rest).splitlines() if l.strip()]
+        mount=lines[-1] if rc==0 and len(lines)>=2 and lines[-1].startswith('/') else None
+        return real,mount
+    @staticmethod
+    def _read(p,buf,until,stop=None):
+        """Lit la sortie de l'enfant (poll) jusqu'à sa fin (EOF), l'instant `until` (monotonic) ou stop(buf) -> (octets, EOF)."""
+        fd=p.stdout.fileno(); po=select.poll(); po.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+        while not (stop and stop(buf)):
+            left=until-time.monotonic()
+            if left<=0: return buf,False
+            try: ev=po.poll(max(1,int(left*1000)))
+            except OSError: return buf,False
+            if not ev: return buf,False
+            try: chunk=os.read(fd,65536)
+            except OSError: return buf,True
+            if not chunk: return buf,True
+            buf+=chunk
+        return buf,False
+    def _run(self,path,timeout):
+        """-> (chemin réel, montage, état 'ok'|'hit'|'expired', PID de l'enfant encore vivant après sa mise à mort ou None, raison,
+        starttime de l'enfant ; état 'hit' : clé de la marque ou du montage expiré qui couvre le chemin réel). Enfant isolé (row 57) :
+        `python -I` (ni dossier courant ni PYTHONPATH sur sys.path), cwd « / », environnement réduit à PATH et LC_ALL=C (row 64 :
+        jamais une passphrase dans l'environ d'un df resté bloqué). starttime lu aussitôt après Popen (row 58 : jamais celui d'un
+        PID déjà réutilisé)."""
+        try:
+            p=subprocess.Popen([sys.executable or 'python3','-I','-c',_RESOLVE_PY,path,str(os.getpid())],stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True,cwd='/',
+                               env={'PATH':os.environ.get('PATH',os.defpath),'LC_ALL':'C'})
+        except OSError as e: return None,None,'ok',None,f"point de montage non lu (lancement impossible : {e})",None
+        try: start=_pid_start(p.pid)
+        except PermissionError: start=None
+        try:
+            end=time.monotonic()+timeout
+            out,eof=self._read(p,b'',end,stop=lambda b: b'\0' in b)
+            if not eof and b'\0' in out:
+                real,_m=self._parse(out,1); k=self._hit(real) if real else None
+                if k is not None:   # row 42 : chemin réel sous une marque ou un montage expiré -> aucun df
+                    try: os.killpg(p.pid,9)
+                    except OSError: pass
+                    return real,None,'hit',None,k,start
+                out,eof=self._read(p,out,end)
+            if eof:
+                try:
+                    p.wait(timeout=max(0.1,end-time.monotonic()))
+                    real,mount=self._parse(out,p.returncode); rc=p.returncode
+                    why=(None if mount or rc==3 else "point de montage non lu (df introuvable)" if rc==5
+                         else "point de montage non lu (dossier inaccessible)" if rc==6
+                         else f"point de montage non lu (df en échec, code {rc})")
+                    return real,mount,'ok',None,why,start
+                except subprocess.TimeoutExpired: pass
+            try: os.killpg(p.pid,9)
+            except OSError: pass
+            if not eof: out,eof=self._read(p,out,time.monotonic()+2)
+            try: p.wait(timeout=0.5 if eof else 0.1)
+            except subprocess.TimeoutExpired: pass   # enfant en état D : abandonné, jamais attendu
+            real,_m=self._parse(out,1)
+            return real,None,'expired',(p.pid if p.poll() is None else None),None,start
+        finally:
+            if p.poll() is None:
+                try: os.killpg(p.pid,9)
+                except OSError: pass
+            try: p.stdout.close()
+            except OSError: pass
+
+_URL_FORM=re.compile(r'^([A-Za-z][A-Za-z0-9+.-]*)://')
+# Revue 87a (row 61) : schémas que Storage peut citer — tout autre premier mot (clé d'accès d'un `s3:` oublié, utilisateur de
+# `u:mdp@h:/r`) : « … »
+_STORAGE_SCHEMES=('ssh','file','sftp','s3','b2','rclone','http','https','rest','socket')
+
+_STRICT_SSH=re.compile(r'^ssh://(?:[^@:/\[\]]+@)?(?:\[[0-9A-Fa-f:.]+\]|[^:/@\[\]]+)(?::\d+)?/[^@]*$',re.I)
+_STRICT_SCP=re.compile(r'^(?:[^@:/\[\]]+@)?(?:\[[0-9A-Fa-f:.]+\]|[^:/@\[\]]+):(?!:)[^@=]*$')
+
+def _secret_form(repo):
+    """Revue 87a (rows 19, 41, 53, liste blanche) : Storage ne tire `repo`, `repo_id` ni étiquette d'un BORG_REPO que s'il a une
+    forme stricte de borg 1 — `ssh://[user@]hôte[:port]/chemin` (utilisateur `[^@:/]+`, aucun autre `@`), scp `[user@]hôte:chemin`
+    (aucun autre `@`, ni `=`, ni `::` : rien d'une chaîne d'identifiants), chemin local (sans « : », ou commençant par / . ~) ou
+    `file://`. Toute autre forme (borg 2 `xxx://`, `s3:…@`, `rclone::…,secret=…`, `ssh://u:mdp@`, `u:mdp@h:/r`…) -> son schéma
+    seul (« sftp://… », « s3:… » : liste fixe _STORAGE_SCHEMES, sinon « … »), jamais le reste ; caractère de contrôle (valeur sur
+    plusieurs lignes) : « … », chemin local compris (row 60) ; forme stricte : None."""
+    if re.search(r'[\x00-\x1f\x7f]',repo): return "…"   # row 60 : valeur sur plusieurs lignes (ligne suivante du rc) : jamais lue
+    if repo.lower().startswith('file://') or ':' not in repo or repo.startswith(('/','.','~')): return None
+    sc=lambda x,sep: f"{x.lower()}{sep}…" if x.lower() in _STORAGE_SCHEMES else "…"   # row 61 : liste fixe, sinon « … »
+    u=_URL_FORM.match(repo)
+    if u and u.group(1).lower()!='ssh': return sc(u.group(1),'://')   # borg 2 (prédicat de borg 1, row 25)
+    if _STRICT_SSH.match(repo) or (not repo.lower().startswith('ssh://') and _STRICT_SCP.match(repo)): return None
+    m=re.match(r'^([A-Za-z][A-Za-z0-9+.-]*)(://|:)',repo)
+    return sc(m.group(1),m.group(2)) if m else "…"
+
+def _storage_of(cfg,nick=None,resolve=None):
+    """Stockage d'un nick d'après sa section rc -> {'storage': étiquette, 'named': STORAGE posé, 'kind': 'ssh'|'tunnel'|'local'|
+    'autre', 'repo': BORG_REPO, 'repo_id': identité du dépôt (deux nicks sur le même dépôt : même identité, compté une fois),
+    'warn': raison d'un montage non lu ou None}.
+    ssh (`_ssh_repo_host`) : « user@hôte[:port] » ; hôte de cette machine avec SSH_REMFO qui ouvre le port du dépôt (tunnel,
+    `BORG_REPO=ssh://localhost:<p>/…`) : cible du tunnel avec l'utilisateur du dépôt et le port de la cible ; SSH_REMFO illisible :
+    « tunnel non résolu (<nick>) », propre au nick (jamais réuni, jamais « localhost ») ; SSH_REMFO d'un autre port : dépôt ssh de
+    cette machine. Forme scp dont le chemin commence par `//` (`u@h://r`) : chemin local, comme borg 1. Local : chemin réel et
+    « local <point de montage> » par `resolve` (_LocalResolver ; inconnu : « local ? (<chemin>) »). STORAGE = nom : ce nom, quelle
+    que soit la forme. Forme à identifiants ou borg 2 (_secret_form) : rangée sous STORAGE s'il est posé (dépôt cité par son schéma
+    seul, identité = empreinte de l'URL sans identifiants), sinon ValueError citant le schéma seul. BORG_REPO absent : ValueError."""
+    repo=(cfg.get('BORG_REPO') or '').strip()
+    if not repo: raise ValueError("BORG_REPO absent du rc")
+    name=(cfg.get('STORAGE') or '').strip()
+    sch=_secret_form(repo)
+    if sch is not None:
+        if not name: raise ValueError(f"forme de BORG_REPO non reconnue (borg 2 ?) : {sch}")
+        # empreinte sans identifiants : userinfo retiré jusqu'au premier « @ » (« / » compris, row 53) ; `rclone:` : paires
+        # `,clé=valeur` retirées (row 61)
+        bare=re.sub(r'^([A-Za-z][\w+.-]*:(?://)?)[^@]*@',r'\1',repo)
+        if bare.lower().startswith('rclone:'): bare=re.sub(r',[^,:=]+=[^,:]*','',bare)
+        return {'storage':name,'named':True,'kind':'autre','repo':sch,
+                'repo_id':'autre|'+hashlib.sha256(bare.encode('utf-8','surrogateescape')).hexdigest()[:24],'warn':None}
+    hp=_ssh_repo_host(repo); warn=None
+    if hp is not None and not repo.startswith('ssh://'):
+        m=_SCP_FORM.match(repo)
+        if m and m.group(1).startswith('//'): hp=None   # row 48 : `u@h://r` — chemin local pour borg 1 (scp_path_re)
+    if hp is not None:
+        uh,port=hp; user,_s,host=uh.rpartition('@')
+        path=_storage_repo_path(repo); kind='ssh'
+        remfo=(cfg.get('SSH_REMFO') or '').strip()
+        t=_remfo_target(remfo) if remfo else None
+        if _this_host(host) and remfo and t is None:
+            kind='tunnel'; label=f"tunnel non résolu ({nick})"; ident=f"tunnel?|{nick}"
+        elif _this_host(host) and t is not None and int(t[0])==int(port or 22):
+            kind='tunnel'; label=_storage_host_label(user,t[1],t[2]); ident=label
+        else: label=_storage_host_label(user,host,port); ident=label
+        rid=f"{ident}|{path}"
+    else:
+        path=repo[len('file://'):] if repo.startswith('file://') else repo
+        kind='local'; mp=None
+        if '{' not in path:
+            path=os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+            real,mp,warn=(resolve or _LocalResolver())(path)
+            if real: path=real
+        rid=f"local|{path}"
+        label=f"local {mp}" if mp else f"local ? ({path})"
+    return {'storage':name or label,'named':bool(name),'kind':kind,'repo':repo,'repo_id':rid,'warn':warn}
+
+def _utc_ts(s):
+    """« AAAA-MM-JJ HH:MM:SS » (UTC, datetime('now') de SQLite) -> datetime, None si illisible."""
+    from datetime import datetime
+    try: return datetime.strptime(str(s)[:19],'%Y-%m-%d %H:%M:%S')
+    except (TypeError,ValueError): return None
+
+def _days_between(a,b):
+    """Jours (2 décimales) de la date UTC `a` à `b`, None si l'une est illisible."""
+    ta,tb=_utc_ts(a),_utc_ts(b)
+    return round((tb-ta).total_seconds()/86400,2) if ta and tb else None
+
+def _storage_aggregate(repos):
+    """Stockages depuis des entrées de dépôt (une par nick, ou déjà réunies : sortie d'un autre rc en mode dossier) -> liste triée
+    par nom. Entrée : {storage, named, kind, repo, repo_id, nicks, size, measured_at, first_size, first_at} (tailles = unique_csize,
+    dates UTC ; None : aucune mesure). Même repo_id : un seul dépôt — nicks réunis, dernière mesure la plus récente, première la
+    plus ancienne, nom posé par STORAGE préféré (`named` du DÉPÔT), sinon étiquette résolue préférée à « local ? (…) » (row 36).
+    Taille d'un stockage = somme des dernières tailles de ses dépôts mesurés ; croissance = cette somme - somme de leurs premières
+    tailles ; durée couverte = plus ancienne première mesure -> plus récente dernière ; moyenne par mois (revue 87a, row 1) =
+    somme, sur les dépôts dont les mesures couvrent au moins un jour, de leur croissance / leur propre durée (ramenée à un mois) —
+    None sans un tel dépôt. Aucun dépôt mesuré : taille, croissance et dates None."""
+    by={}
+    for r in repos:
+        k=r['repo_id']; cur=by.get(k)
+        if cur is None:
+            by[k]=dict(r,nicks=sorted(set(r.get('nicks') or [])),named=bool(r.get('named'))); continue
+        cur['nicks']=sorted(set(cur['nicks'])|set(r.get('nicks') or []))
+        if r.get('named') and (not cur.get('named') or r['storage']<cur['storage']): cur['storage']=r['storage']; cur['named']=True
+        elif (not r.get('named') and not cur.get('named') and cur['storage'].startswith('local ? (')
+              and not r['storage'].startswith('local ? (')): cur['storage']=r['storage']
+        if r.get('size') is not None and (cur.get('size') is None or (r.get('measured_at') or '')>(cur.get('measured_at') or '')):
+            cur['size']=r['size']; cur['measured_at']=r.get('measured_at')
+        if r.get('first_size') is not None and (cur.get('first_size') is None or (r.get('first_at') or '')<(cur.get('first_at') or '')):
+            cur['first_size']=r['first_size']; cur['first_at']=r.get('first_at')
+        if r['repo']<cur['repo']: cur['repo']=r['repo']
+    st={}
+    for r in by.values(): st.setdefault(r['storage'],[]).append(r)
+    out=[]
+    for label in sorted(st,key=lambda s:(s.lower(),s)):
+        rs=sorted(st[label],key=lambda r:(r['repo'],r['repo_id']))
+        m=[r for r in rs if r.get('size') is not None and r.get('first_size') is not None]
+        size=sum(r['size'] for r in m) if m else None
+        first=sum(r['first_size'] for r in m) if m else None
+        fa=min((r['first_at'] for r in m if r.get('first_at')),default=None)
+        la=max((r['measured_at'] for r in m if r.get('measured_at')),default=None)
+        days=_days_between(fa,la) if fa and la else None
+        growth=None if size is None else size-first
+        rates=[(r['size']-r['first_size'])/(d/_MONTH_DAYS) for r in m for d in [_days_between(r.get('first_at'),r.get('measured_at'))]
+               if d is not None and d>=1]
+        gpm=round(sum(rates)) if rates else None
+        out.append({'storage':label,'named':any(r.get('named') for r in rs),'nicks':sorted({n for r in rs for n in r['nicks']}),
+                    'repos':[{k:r.get(k) for k in ('repo','repo_id','kind','named','nicks','size','measured_at','first_size','first_at')}
+                             for r in rs],
+                    'measured_repos':len(m),'size':size,'first_size':first,'growth':growth,'first_at':fa,'last_at':la,'days':days,
+                    'growth_per_month':gpm})
+    return out
+
+def _storage_merge(parts):
+    """Sorties JSON de Storage de plusieurs rc (mode dossier de borgHelperWWW, nicks déjà exposés) -> une seule vue : dépôts
+    réunis par _storage_aggregate (même dépôt servi par deux rc : compté une fois ; `named` de chaque dépôt, revue 87a row 5),
+    erreurs réunies."""
+    repos=[]; errors={}; ver=None
+    for d in parts:
+        if not isinstance(d,dict): continue
+        ver=ver or d.get('borghelper_version')
+        for s in d.get('storages') or []:
+            for r in s.get('repos') or []:
+                repos.append(dict(r,storage=s.get('storage'),named=bool(r['named'] if 'named' in r else s.get('named'))))
+        if isinstance(d.get('errors'),dict): errors.update(d['errors'])
+    return {'borghelper_version':ver,'storages':_storage_aggregate(repos),'errors':errors}
+
+def _storage_err(e):
+    """Revue 87a (row 54) : texte d'une erreur de lecture du rc pour Storage — configparser : type et clé seuls (jamais la valeur
+    brute, la ligne ni le chemin du rc) ; OSError : type et strerror ; autre : type et message."""
+    if isinstance(e,configparser.Error):
+        opt=getattr(e,'option',None)
+        return type(e).__name__+(f" (clé {opt})" if opt else '')
+    if isinstance(e,OSError): return f"{type(e).__name__} ({e.strerror})" if e.strerror else type(e).__name__
+    return f"{type(e).__name__}: {e}"
+
+def _storage_text(d):
+    """Lignes de Storage en texte (sans -j) depuis la sortie JSON."""
+    sz=lambda v: '—' if v is None else convert_octets_readable(v)
+    sg=lambda v: '—' if v is None else ('-' if v<0 else '+')+convert_octets_readable(abs(v))
+    L=[]
+    for s in d['storages']:
+        n=len(s['repos'])
+        head=f"{s['storage']} — {n} dépôt{'s' if n>1 else ''}, taille {sz(s['size'])}"
+        if s['size'] is not None:
+            head+=f", croissance {sg(s['growth'])} depuis le {(s['first_at'] or '?')[:10]}"
+            head+=f" ({s['days']:.0f} j" if s['days'] is not None else " (durée inconnue"
+            head+=f" ; {sg(s['growth_per_month'])}/mois)" if s['growth_per_month'] is not None else ")"
+        L.append(head)
+        for r in s['repos']:
+            what=(f"{sz(r['size'])} (mesurée le {(r['measured_at'] or '?')[:10]})" if r['size'] is not None else "— (aucune mesure)")
+            L.append(f"  {r['repo']} [{', '.join(r['nicks'])}] : {what}")
+    if not d['storages']: L.append("Aucun dépôt.")
+    for n,e in d['errors'].items(): L.append(f"[ERREUR] {n} : {e}")
+    return L
 
 def _bkp_file_status(i):
     """(status, path) si `i` (entrée stderr de boex, dict --log-json ou chaîne) est une ligne
@@ -1028,7 +1532,8 @@ _CLI_OPTAB={k:v+'P' for k,v in {
     'filehist':'CcdnfbBj','cacheinfo':'Ccdn','cacheclean':'Ccdn','duidx':'CcdnfbBsjR',
     'idxtop':'CcdnNpj','difftop':'CcdnNpbj','idxpurge':'CcdnxD','treehist':'CcdnfbBjX',
     'treefind':'Ccdnfmj','dbencrypt':'CcdnDy','dbdecrypt':'CcdnDy','dbrekey':'Ccdny','dbstatus':'Ccdn',
-    'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj','borgcleanup':'CcdyD','bkpreconcile':'Ccdnj'}.items()}
+    'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj','borgcleanup':'CcdyD','bkpreconcile':'Ccdnj',
+    'storage':'Ccdnj'}.items()}
 # Options longues de commande : réservées à une seule commande (_cli_options).
 _CLI_LONG_OWNER={'--rebuild':'index','--keys':'borgcleanup','--history':'borgcleanup'}
 # Commandes traitées par _cli_main AVANT _CLI_OPTAB (aucune base, aucun rc) : options lues par leur branche.
@@ -1283,6 +1788,18 @@ _HELP={
          ("nick qui porte le nom de la machine","borgHelper -c ArchiveHistory -j")),
         long=("Colonnes brutes, ordre chronologique par archive_date. Sans -j : message court.",
               "Destinée à l'API (borgHelperWWW /archivehistory) ; -j avec plusieurs nicks : refusé.")),
+    'storage':_H('Storage',3,"Dépôts regroupés par hôte de stockage : taille, croissance, sans borg","-c Storage [-n nick|a,b|ALL] [-j]",
+        (('-n <nick>',"dépôt, liste a,b ou ALL (défaut : ALL, tous les nicks du fichier de conf)"),
+         ('-j',"JSON : {storages:[{storage,size,growth,growth_per_month,first_at,days,repos:[…]}],errors}")),
+        (("tous les nicks du fichier de conf, texte","borgHelper -c Storage"),
+         ("deux nicks, en JSON","borgHelper -c Storage -n a,b -j")),
+        long=("Stockage : user@hôte[:port] d'un dépôt ssh ; tunnel SSH_REMFO : sa cible ; dépôt local : son point de",
+              "montage (df) ; clé STORAGE = nom du nick : ce nom. Taille : somme des dernières mesures (history.db) des",
+              "dépôts distincts (deux nicks sur le même BORG_REPO : compté une fois) ; croissance depuis la première",
+              "mesure ; par mois : somme des rythmes des dépôts mesurés sur au moins un jour. Jamais borg ni ssh.",
+              "Code 1 : nick en erreur (inconnu du rc, BORG_REPO absent ou de forme inconnue, base illisible ou",
+              "d'avant 1.0.139 non migrée), les autres affichés.",
+              "Code 2 aussi : erreur d'arguments.")),
     # ── BASES LOCALES ──
     'cacheinfo':_H('CacheInfo',4,"Affiche le contenu du cache SQLite (cache.db)","-c CacheInfo [-n nick|a,b|ALL]",(_HNALL,),
         (("cache d'un nick","borgHelper -c CacheInfo -n mon-serveur"),
@@ -4669,6 +5186,36 @@ class BorgHelperDB:
             return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
         except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return {}   # 1.0.175 (A72)
         finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
+
+    def get_storage_measures(self,nick):
+        """1.0.208 (story 87a) : (première, dernière) mesure de taille du dépôt du nick — (unique_csize, updated_at UTC) des repo_stats
+        de plus petite et de plus grande date (revue 87a, row 6 : par updated_at, id en départage — une ligne recopiée tard par la
+        migration a un id plus grand qu'une mesure plus récente), ou (None, None) : aucune mesure. Lecture seule de history.db par son
+        chemin (jamais créée, jamais migrée : une diff.db d'avant 1.0.139 pas encore rouverte reste sans mesure, storage_unmigrated
+        le dit) ; base absente ou sans repo_stats : (None, None) ; vraie erreur SQLite (corrompue, verrouillée au-delà de 2 s) :
+        levée, dite par l'appelant pour ce nick."""
+        hp=self.get_history_db(nick)
+        try:
+            conn=_open_db(hp,nick=None,role='read',timeout=_READER_WRITE_WAIT)
+            try:
+                q=("SELECT unique_csize,updated_at FROM repo_stats WHERE nick=? AND unique_csize IS NOT NULL "
+                   "ORDER BY updated_at {0}, id {0} LIMIT 1")
+                f=conn.execute(q.format('ASC'),(nick,)).fetchone(); l=conn.execute(q.format('DESC'),(nick,)).fetchone()
+            finally: conn.close()
+        except sqlite3.Error as e:
+            if _sqlite_missing(e): return None,None
+            raise
+        return (tuple(f) if f else None),(tuple(l) if l else None)
+
+    def storage_unmigrated(self,nick):
+        """Revue 87a (row 11) : vrai si la diff.db du nick porte encore repo_stats (mesures d'avant 1.0.139 jamais migrées vers
+        history.db : Storage ne migre jamais). Lecture seule ; base absente : False ; illisible (verrouillée au-delà de 2 s, corrompue) :
+        sqlite3.Error levée (revue 87a row 34 : « diff.db illisible », dite par Storage)."""
+        dp=self.get_diff_db(nick)
+        if not os.path.exists(dp): return False
+        conn=_open_db(dp,nick=None,role='read',timeout=_READER_WRITE_WAIT)
+        try: return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='repo_stats'").fetchone() is not None
+        finally: conn.close()
 
     def is_archive_snapshot_indexed(self,nick,archive,db_path=None):
         if db_path is None: db_path=self.get_diff_db(nick)
@@ -9684,6 +10231,70 @@ class BorgHelper:
         # présence des clés, jamais leur valeur : une exception au message vide rend 'error': '' (revue)
         return 1 if (_READER_FAILED[0]!=_n0 or any('error' in st or 'error' in (st.get('last_backup') or {}) for st in results)) else 0
 
+    def storage(self,nick,debug=0,as_json=False):
+        """1.0.208 (story 87a, décisions de l'utilisateur) : commande Storage — dépôts des nicks regroupés par hôte de stockage
+        (_storage_of : `user@hôte[:port]`, cible d'un tunnel SSH_REMFO, point de montage d'un dépôt local, STORAGE = nom), taille
+        (somme des dernières mesures unique_csize de ses dépôts distincts), croissance depuis la première mesure et moyenne par
+        mois (_storage_aggregate). Lecture seule : history.db et df — jamais borg ni ssh. Erreur d'un nick (inconnu du rc,
+        BORG_REPO absent : nick non placé ; base illisible : nick placé, sans mesure) dite par nick, jamais bloquante ; rend 1 s'il
+        y en a une, sinon 0. -j : {borghelper_version, storages:[…], errors:{nick: message}} sur stdout ; texte sur stderr.
+        Revue 87a : nick None ou 'ALL' -> tous les nicks du rc (row 11 ; CLI sans -n : ALL, décision 5) ; dépôts locaux résolus par UN
+        _LocalResolver (échéance globale, row 2) ; base en erreur retenue pour l'appel (row 16 : une history.db partagée verrouillée
+        n'est attendue qu'une fois ; diff.db de même, « diff.db illisible », row 34) ; diff.db d'avant 1.0.139 jamais migrée : dite
+        (row 11) ; nick hors cfgreadnicks (DEFAULT, _…) : « nick inconnu du rc » (row 29) ; montage qui ne répond pas : dit par nick,
+        marque de df bloqué dans CACHE_DIR (décision 7) ; chaînes échappées (_bsr, row 32)."""
+        repos=[]; errors={}; bad={}; ents=[]
+        # revue 87a (row 51) : rc illisible (droits, syntaxe) -> erreur et code 1, message des autres commandes (absent : celui de
+        # Stats ; sinon l'exception de configparser) — jamais « nick inconnu » ni « Aucun dépôt. » en code 0
+        try:
+            with open(self.borg.cfgfile,encoding='utf-8') as f: configparser.ConfigParser().read_file(f)
+        except Exception as e: errors['*']=_storage_err(e)
+        known=[] if errors else [n for n in (self.borg.cfgreadnicks(debug) or '').split(',') if n]
+        if nick is None or nick=='ALL': nick=','.join(known)
+        nicks=[]
+        for n in (nick or '').split(','):
+            n=n.strip()
+            if n and n not in nicks and not errors.get('*'): nicks.append(n)
+        resolve=_LocalResolver(marker=os.path.join(self.db.cache_dir,f"{self.db.db_prefix}-{_DF_STUCK_FILE}"))
+        # 1re passe : stockage de chaque nick (dépôts locaux résolus AVANT toute lecture de base : l'échéance des df n'est jamais
+        # entamée par les attentes SQLite, row 45)
+        for n in nicks:
+            if n not in known: errors[n]="nick inconnu du rc"; continue   # revue 87a (row 29) : DEFAULT, _… : jamais des nicks
+            try:
+                cfg=self.borg.cfgread(n,debug=debug)
+                if cfg is None: errors[n]="nick inconnu du rc"; continue
+                ent=_storage_of(cfg,nick=n,resolve=resolve)
+                hp=self.db.get_history_db(n); dp=self.db.get_diff_db(n)   # row 34 : rc illisible -> erreur du nick
+            except configparser.Error as e: errors[n]=_storage_err(e); continue   # row 54 : jamais la valeur brute
+            except ValueError as e: errors[n]=str(e); continue
+            except Exception as e: errors[n]=_storage_err(e); continue
+            warn=ent.pop('warn',None)
+            if warn: errors[n]=warn   # décision 7 / row 23 : montage qui ne répond pas, dit par nick
+            ents.append((n,ent,hp,dp))
+        # 2e passe : mesures
+        for n,ent,hp,dp in ents:
+            first=last=None
+            if hp in bad: errors.setdefault(n,bad[hp])
+            else:
+                try: first,last=self.db.get_storage_measures(n)
+                except sqlite3.Error as e: bad[hp]=f"SQLite error ({hp}): {e}"; errors.setdefault(n,bad[hp])
+                except Exception as e: errors.setdefault(n,f"{type(e).__name__}: {e}")
+            if last is None and hp not in bad:
+                if dp in bad: errors.setdefault(n,bad[dp])
+                else:
+                    try:
+                        if self.db.storage_unmigrated(n):
+                            errors.setdefault(n,"mesures d'avant 1.0.139 pas encore migrées vers history.db — les migrer par une lecture : "
+                                                f"borgHelper -c Status -n {n}")
+                    except sqlite3.Error as e: bad[dp]=f"diff.db illisible ({dp}): {e}"; errors.setdefault(n,bad[dp])
+            repos.append(dict(ent,nicks=[n],size=last[0] if last else None,measured_at=last[1] if last else None,
+                              first_size=first[0] if first else None,first_at=first[1] if first else None))
+        out=_bsr({'borghelper_version':Version,'storages':_storage_aggregate(repos),'errors':errors})   # row 32
+        if as_json: print(json.dumps(out,ensure_ascii=False,indent=2))
+        else:
+            for l in _storage_text(out): printer(l)
+        return 1 if errors else 0
+
     # ── Nettoyage des restes de dépôts disparus et de nicks retirés (1.0.160, story 23, A30) ──
     def cleanup_scan(self,home=None):
         """Lecture seule, jamais borg. borg : _borg_leftovers du dossier personnel (pwd par défaut : celui qu'utilise
@@ -11085,7 +11696,7 @@ def _sqlite_close_scan(src,extra=(),tests=('codec_selftest','perf_bench','push_s
 # Liste blanche et compte exact de borgHelper ; ceux de borgHelperWWW sont SES constantes (_SCG_WL_WWW, _SCG_SEEN_WWW, 1.0.204 :
 # un changement de WWW seul ne touche plus borgHelper), lues par la garde de borgHelper dans sa source (_src_literal).
 _SCG_WL={'borgHelper':{'_open_db':5,'ensure_cache_db':1,'ensure_diff_db':1,'ensure_history_db':1,'_audit_witness':1}}
-_SCG_SEEN={'borgHelper':116}   # nombre EXACT d'ouvertures analysées (1.0.203 ; 1.0.207, story 85 : +3 — _index_old_snaps, _snap_meta_put, _direct_marker, forme (b))
+_SCG_SEEN={'borgHelper':118}   # nombre EXACT d'ouvertures analysées (1.0.203 ; 1.0.207, story 85 : +3 — _index_old_snaps, _snap_meta_put, _direct_marker, forme (b) ; 1.0.208, story 87a : +2 — get_storage_measures, storage_unmigrated, forme (b))
 def _sqlite_close_file(nm,src,extra,wl,seen_want):
     """Partie fichier de la garde : sites non prouvés hors liste blanche `wl` ({fonction: nombre}), liste blanche au nombre exact
     par fonction, nombre exact d'ouvertures analysées `seen_want` (ouverture ajoutée ou retirée, ouvreur devenu invisible : liste à
@@ -11421,7 +12032,7 @@ def codec_selftest(pattern=None,list_only=False):
         _HL_GROUP_OF={**{n:'SAUVEGARDE' for n in ('Init','Bkp','Prune','DelBkp','Key','BkpReconcile')},
                       **{n:'CONSULTATION ET RESTAURATION' for n in ('Stats','LstBkp','LstBkpFls','DiffBkp','Mount','UMount','Restore')},
                       **{n:'INDEX ET RECHERCHE' for n in ('Index','Search','FileHist','TreeHist','TreeFind','DuIdx','IdxTop','DiffTop')},
-                      **{n:'RAPPORTS ET ÉTAT' for n in ('Report','Status','RepoHistory','ArchiveHistory')},
+                      **{n:'RAPPORTS ET ÉTAT' for n in ('Report','Status','RepoHistory','ArchiveHistory','Storage')},
                       **{n:'BASES LOCALES' for n in ('CacheInfo','CacheClean','IdxPurge','BorgCleanup','DbStatus','DbEncrypt',
                                                      'DbDecrypt','DbRekey')},
                       'Login':'CONNEXION','CodecSelfTest':'DIAGNOSTIC','PerfBench':'DIAGNOSTIC'}
@@ -11444,11 +12055,11 @@ def codec_selftest(pattern=None,list_only=False):
                     seen.setdefault(m.group(1),[]).append(grp)
                     if m.group(2): danger.add(m.group(1))
             groups_ok={n:g for n,g in seen.items() if len(g)==1 and g[0]==_HL_GROUP_OF[n]}
-            ok=(set(_HELP)==want and len(_HELP)==36 and set(_CLI_EARLY)=={'codecselftest','perfbench'}
-                and {h['name'] for h in _HELP.values()}==set(_HL_GROUP_OF) and len(groups_ok)==36 and danger==_HL_DANGER)
+            ok=(set(_HELP)==want and len(_HELP)==37 and set(_CLI_EARLY)=={'codecselftest','perfbench'}
+                and {h['name'] for h in _HELP.values()}==set(_HL_GROUP_OF) and len(groups_ok)==37 and danger==_HL_DANGER)
             if not ok: print(f"  table {sorted(set(_HELP)^want)} n={len(_HELP)} groupes faux {sorted(set(_HL_GROUP_OF)-set(groups_ok))} ⚡ {sorted(danger)}")
             return ok
-        check("aide : une entrée par commande (_CLI_OPTAB + CodecSelfTest/PerfBench, 36), une fois dans -h, dans son groupe, ⚡ exact",_hl_table)
+        check("aide : une entrée par commande (_CLI_OPTAB + CodecSelfTest/PerfBench, 37), une fois dans -h, dans son groupe, ⚡ exact",_hl_table)
         def _hl_opts():
             bad=[]
             for k,h in _HELP.items():
@@ -12052,6 +12663,586 @@ def codec_selftest(pattern=None,list_only=False):
               lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'rhA,rhB')[0])
         check("ArchiveHistory -j -n ALL (plusieurs nicks configurés) : rejeté après expansion",
               lambda: _cli_rh_multi_rejected('ArchiveHistory',rh_rc,'ALL')[0])
+        # ── Storage (1.0.208, story 87a) : vue par hôte de stockage ──
+        def _st_of(nick='x',**kw):
+            """Étiquette, nature et identité de dépôt d'une section rc (dict) ; résolution locale factice : chemin -> (chemin, « /m/<1er
+            élément> »), /absent… -> inconnu."""
+            r=_storage_of(kw,nick=nick,resolve=lambda p: (p,'/m/'+p.strip('/').split('/')[0],None) if not p.startswith('/absent') else (None,None,None))
+            return r['storage'],r['kind'],r['repo_id']
+        me=socket.gethostname().lower()
+        def _st_grouping():
+            got={
+             'ssh port':_st_of(BORG_REPO='ssh://backup@nas:2222/./r1')[:2],
+             'scp':_st_of(BORG_REPO='backup@nas:/r2')[:2],
+             'ssh sans user ni port':_st_of(BORG_REPO='ssh://NAS/srv/r')[:2],
+             'port 22 omis':_st_of(BORG_REPO='ssh://u@nas:22/r')[0],
+             'port 022':_st_of(BORG_REPO='ssh://u@nas:022/r')[0],
+             'port 02222':_st_of(BORG_REPO='ssh://u@nas:02222/r')[0],
+             'ipv6':_st_of(BORG_REPO='ssh://u@[2001:DB8::1]:2222/r')[0],
+             'ipv6 scp':_st_of(BORG_REPO='u@[2001:db8::1]:r')[0],
+             'tunnel':_st_of(BORG_REPO='ssh://localhost:9/r',SSH_REMFO='9:nas:22')[:2],
+             'tunnel port 09':_st_of(BORG_REPO='ssh://localhost:9/r',SSH_REMFO='09:nas:22')[:2],
+             'tunnel user port':_st_of(BORG_REPO='ssh://bk@localhost:9/r',SSH_REMFO='0.0.0.0:9:nas:2200')[0],
+             'tunnel vers ici':_st_of(BORG_REPO='ssh://bk@127.0.0.1:9/r',SSH_REMFO='9:localhost:22')[0],
+             'tunnel illisible':_st_of('tk',BORG_REPO='ssh://localhost:9/r',SSH_REMFO='/tmp/sock')[:2],
+             'autre port que le tunnel':_st_of(BORG_REPO='ssh://localhost:9/r',SSH_REMFO='8:nas:22')[:2],
+             'sans port, tunnel 9':_st_of(BORG_REPO='ssh://u@localhost/r',SSH_REMFO='9:nas:22')[:2],
+             'localhost sans tunnel':_st_of(BORG_REPO='ssh://u@localhost/r')[0],
+             'localhost.localdomain':_st_of(BORG_REPO='ssh://u@localhost.localdomain:9/r',SSH_REMFO='9:nas:22')[0],
+             '127.0.0.2':_st_of(BORG_REPO='ssh://u@127.0.0.2/r')[0],
+             '::ffff:127.0.0.1':_st_of(BORG_REPO='ssh://u@[::ffff:127.0.0.1]/r')[0],
+             'ip6-loopback':_st_of(BORG_REPO='u@ip6-loopback:r')[0],
+             '127.1':_st_of(BORG_REPO='ssh://u@127.1/r')[0],'0.0.0.0':_st_of(BORG_REPO='ssh://u@0.0.0.0/r')[0],
+             '::':_st_of(BORG_REPO='ssh://u@[::]/r')[0],'::1 long':_st_of(BORG_REPO='ssh://u@[0:0:0:0:0:0:0:1]/r')[0],
+             '::ffff:7f00:1':_st_of(BORG_REPO='ssh://u@[::ffff:7f00:1]/r')[0],'localhost.':_st_of(BORG_REPO='ssh://u@localhost./r')[0],
+             'hôte s3 (borg 1)':_st_of(BORG_REPO='s3:/srv/r')[:2],
+             'hôte rclone (borg 1)':_st_of(BORG_REPO='rclone:remote:p')[:2],
+             'STORAGE':_st_of(BORG_REPO='ssh://u@nas/r',STORAGE=' baie1 ')[:2],
+             'STORAGE borg 2':_st_of(BORG_REPO='sftp://u@nas/r',STORAGE='baie2')[:2],
+             'local':_st_of(BORG_REPO='/srv/borg/r')[:2],
+             'local file://':_st_of(BORG_REPO='file:///srv/borg/r/')[0],
+             'local absent':_st_of(BORG_REPO='/absent/r')[0],
+             'local STORAGE':_st_of(BORG_REPO='/absent/r',STORAGE='usb')[0]}
+            want={'ssh port':('backup@nas:2222','ssh'),'scp':('backup@nas','ssh'),'ssh sans user ni port':('nas','ssh'),
+                  'port 22 omis':'u@nas','port 022':'u@nas','port 02222':'u@nas:2222','ipv6':'u@[2001:db8::1]:2222','ipv6 scp':'u@[2001:db8::1]',
+                  'tunnel':('nas','tunnel'),'tunnel port 09':('nas','tunnel'),
+                  'tunnel user port':'bk@nas:2200','tunnel vers ici':f"bk@{me}",'tunnel illisible':('tunnel non résolu (tk)','tunnel'),
+                  'autre port que le tunnel':(f"{me}:9",'ssh'),'sans port, tunnel 9':(f"u@{me}",'ssh'),'localhost sans tunnel':f"u@{me}",
+                  'localhost.localdomain':'u@nas','127.0.0.2':f"u@{me}",'::ffff:127.0.0.1':f"u@{me}",'ip6-loopback':f"u@{me}",
+                  '127.1':f"u@{me}",'0.0.0.0':f"u@{me}",'::':f"u@{me}",'::1 long':f"u@{me}",'::ffff:7f00:1':f"u@{me}",'localhost.':f"u@{me}",
+                  'hôte s3 (borg 1)':('s3','ssh'),'hôte rclone (borg 1)':('rclone','ssh'),
+                  'STORAGE':('baie1','ssh'),'STORAGE borg 2':('baie2','autre'),'local':('local /m/srv','local'),'local file://':'local /m/srv',
+                  'local absent':'local ? (/absent/r)','local STORAGE':'usb'}
+            bad={k:(got[k],want[k]) for k in want if got[k]!=want[k]}
+            b2={}
+            # rows 19, 41 : formes à identifiants — schéma seul, jamais l'URL ; empreinte sans identifiants
+            SEC={'sftp://u@nas/r':'sftp://…','https://h/r':'https://…','s3://AKIA:secretkey@minio/b/r':'s3://…',
+                 's3:AKIA:secretkey@https://minio:9000/b/r':'s3:…','b2:id:secretkey@b/r':'b2:…','ssh://u:secretkey@nas/r':'ssh://…',
+                 # row 53 : secrets à « / » et « + », chaîne rclone, mot de passe ssh à « / », scp avec mot de passe
+                 's3:AKIA:ab/secretkey+x@https://minio:9000/b/r':'s3:…','rclone::s3,secret_access_key=secretkey/+x:bucket':'rclone:…',
+                 'ssh://u:p/secretkey@h/r':'ssh://…','u:secretkey@h:/r':'…','sftp://u:p/secretkey@h/r':'sftp://…',
+                 'h:a=secretkey':'…',
+                 # row 60 : caractère de contrôle (valeur sur plusieurs lignes : ligne suivante du rc), chemin local et file:// compris
+                 'ssh://h/r\nBORG_PASSPHRASE = secretkey':'…','h:/r\n\tBORG_PASSPHRASE: secretkey':'…',
+                 '/srv/x\n\tBORG_PASSPHRASE: secretkey':'…','file:///srv/x\x7fsecretkey':'…','./r\x00secretkey':'…',
+                 # row 61 : schéma hors liste fixe (clé d'accès d'un « s3: » oublié) : « … » ; casse ramenée
+                 'AKIAsecretkey:wJ@https://s3/b':'…','SFTP://u@nas/r':'sftp://…'}
+            for r in SEC:
+                try: _st_of(BORG_REPO=r); b2[r]=None
+                except ValueError as e: b2[r]=str(e)
+            b2_ok=all(b2[r]==f"forme de BORG_REPO non reconnue (borg 2 ?) : {SEC[r]}" for r in SEC)
+            nms=[_storage_of({'BORG_REPO':r,'STORAGE':'baie2'},nick='x') for r in SEC]
+            ids={_storage_of({'BORG_REPO':f"s3:{k}@https://minio:9000/b/r",'STORAGE':'baie2'},nick='x')['repo_id']
+                 for k in ('K1:S1','K2:S2','K3:S/3+x')}
+            ids|={_storage_of({'BORG_REPO':f"sftp://{k}@nas/r",'STORAGE':'baie2'},nick='x')['repo_id'] for k in ('u:p/1','u:p/2')}
+            # row 61 : rclone — paires `,clé=valeur` hors de l'empreinte (même dépôt, autre secret : même identité)
+            ids|={_storage_of({'BORG_REPO':f"rclone::s3,{k}:bucket",'STORAGE':'baie2'},nick='x')['repo_id']
+                  for k in ('secret_access_key=S1','secret_access_key=S/2+x,access_key_id=K2')}
+            nm=nms[2]
+            b2_ok=(b2_ok and 'secretkey' not in json.dumps(nms) and [x['repo'] for x in nms]==list(SEC.values())
+                   and all(x['kind']=='autre' for x in nms) and len(ids)==3)
+            # G6 (row 30) : getfqdn (DNS inverse) seulement pour un nom à point, et une fois par processus
+            saved=dict(_ME_NAMES); _ME_NAMES.clear(); n_fq=[0]; real_fq=socket.getfqdn
+            def fq(*a): n_fq[0]+=1; return real_fq(*a)
+            try:
+                with mock.patch.object(socket,'getfqdn',fq):
+                    for h in ('nas','backup@nas2','u@localhost'): _st_of(BORG_REPO=f"{h}:/r")
+                    n0=n_fq[0]
+                    for h in ('nas.example.org','u@b.example.org','c.example.org'): _st_of(BORG_REPO=f"{h}:/r")
+            finally: _ME_NAMES.clear(); _ME_NAMES.update(saved)
+            # row 47 : DNS inverse figé -> 2 s au plus, fqdn inconnu ('')
+            _ME_NAMES.clear(); t0=time.monotonic()
+            try:
+                with mock.patch.object(socket,'getfqdn',lambda *a: time.sleep(8) or 'x'): slow=_this_host('lent.example.org')
+            finally: _ME_NAMES.clear(); _ME_NAMES.update(saved)
+            fq_ok=n0==0 and n_fq[0]==1 and slow is False and time.monotonic()-t0<4
+            if bad or not b2_ok or not fq_ok: print(f"  {bad} borg 2 {b2} {nm} getfqdn {n0}/{n_fq[0]}")
+            return not bad and b2_ok and fq_ok and 'localhost' not in ' '.join(str(v) for v in got.values())
+        check("Storage : regroupement — ssh avec/sans user/port (22 omis, zéros initiaux), IPv6, user@hôte:chemin, tunnel (cible, user, "
+              "port ; seulement sur le port du dépôt ; illisible : « tunnel non résolu (<nick>) »), bouclage (localhost*, 127/8, ::ffff:127, "
+              "ip6-*, 127.1, 0.0.0.0, ::, forme longue, point final) jamais affiché, STORAGE (borg 2 compris), local par montage ; formes "
+              "à identifiants (xxx://, s3:/b2:…@, ssh://u:mdp@) refusées ou rangées par STORAGE, schéma seul cité, empreinte sans "
+              "identifiants ; getfqdn seulement pour un nom à point, une fois, borné à 2 s",_st_grouping)
+        def _st_identity():
+            ids=lambda *rs: {_st_of(BORG_REPO=r)[2] for r in rs}
+            same=ids('ssh://backup@nas/./r1','ssh://backup@NAS/~/r1/','backup@nas:r1','backup@nas:~/r1','backup@nas:./r1',
+                     'backup@nas:.//r1','backup@nas:~//r1','ssh://backup@nas/.//r1')
+            abso=ids('ssh://backup@nas/r1','backup@nas:/r1/','ssh://backup@nas//r1')
+            home=ids('ssh://h/~','ssh://h/~/','ssh://h/./','h:~','h:','h:./')
+            tilde=ids('ssh://h/~u/r','h:~u/r','h:~u/r/')
+            acc=ids('u1@nas:r','u2@nas:r'); port=ids('ssh://u@nas:2222/r','u@nas:r')
+            tun={_st_of(n,BORG_REPO='ssh://localhost:9/r',SSH_REMFO='x')[2] for n in ('t1','t2')}
+            # lien symbolique et « ~ » d'un dépôt local : même dépôt (realpath, résolveur réel ; G9)
+            lk=os.path.join(tmp,'st-lien'); rl=os.path.join(tmp,'st-reel'); os.makedirs(rl,exist_ok=True)
+            if not os.path.islink(lk): os.symlink(rl,lk)
+            rv=_LocalResolver()
+            with mock.patch.dict(os.environ,{'HOME':tmp}):
+                sym={_storage_of({'BORG_REPO':p},nick='x',resolve=rv)['repo_id'] for p in (lk,rl,rl+'/',rl+'/../st-reel','~/st-reel','~/st-lien')}
+            scp2=_st_of(BORG_REPO='backup@nas://r1')   # row 48 : chemin local pour borg 1 (scp_path_re)
+            res=[len(same),len(abso),len(same|abso),len(home),len(tilde),len(acc),len(port),len(tun),sym,scp2[1]]
+            want=[1,1,2,1,1,2,2,2,{f"local|{os.path.realpath(rl)}"},'local']
+            if res!=want: print(f"  {res}")
+            return res==want
+        check("Storage : identité de dépôt — même chemin sous plusieurs écritures (./, ~/, ~u/, //, scp, / final, racine du home ; dépôt "
+              "local : chemin réel, ~) réuni ; absolu ≠ relatif ; deux comptes ou deux ports : deux dépôts ; tunnel non résolu jamais réuni",_st_identity)
+        st_fb=os.path.join(tmp,'st-fakebin'); os.makedirs(st_fb,exist_ok=True); st_cnt=os.path.join(tmp,'st-df-count')
+        def _st_fakedf(body):
+            """df factice (PATH) qui note chaque lancement (une ligne par df) puis exécute `body`."""
+            with open(os.path.join(st_fb,'df'),'w') as f: f.write(f"#!/bin/sh\necho df >> '{st_cnt}'\n{body}\n")
+            os.chmod(os.path.join(st_fb,'df'),0o755)
+            with open(st_cnt,'w'): pass
+        def _st_ndf():
+            with open(st_cnt) as f: return len(f.read().split())
+        def _st_alive(pid):
+            try: os.kill(pid,0)
+            except OSError: return False
+            try:
+                with open(f"/proc/{pid}/stat",'rb') as f: st=f.read()
+                return st[st.rindex(b')')+2:st.rindex(b')')+3]!=b'Z'
+            except OSError: return False
+        def _st_mkey(p):
+            """Clé retenue attendue d'un chemin (comme _LocalResolver._key) : montage du chemin réel, ou le chemin réel même (« / »,
+            autofs)."""
+            rp=os.path.realpath(p); mt=_mount_table()
+            m=next((x for x in sorted(mt,key=len,reverse=True) if rp==x or rp.startswith(x.rstrip('/')+'/')),'/')
+            return rp if (m=='/' or mt.get(m)=='autofs') else m
+        def _st_cmd(pid):
+            try:
+                with open(f"/proc/{pid}/cmdline",'rb') as f: return f.read().split(b'\0')
+            except OSError: return []
+        def _st_reap(pids,want=b'sleep'):
+            """Tue (seulement si sa ligne de commande est bien celle attendue) puis attend, borné à 3 s, la fin de chaque PID ;
+            -> PID encore vivants."""
+            for x in pids:
+                if _st_cmd(x)[:1]==[want]:
+                    try: os.kill(x,9)
+                    except OSError: pass
+            end=time.monotonic()+3
+            while time.monotonic()<end and any(_st_alive(x) for x in pids): time.sleep(0.05)
+            return [x for x in pids if _st_alive(x)]
+        def _st_resolver():
+            """Rows 2, 14, 20, 21, 24, 42, 45, 46 ; G2-G4 : df bloqué -> groupe tué au délai (petit-enfant du groupe compris), attente
+            bornée même si un petit-enfant setsid garde le tube, chemin réel gardé ; montage expiré retenu (autre chemin du même montage :
+            aucun df), jamais « / » ni un montage autofs (chemin exact) ; chemin réel couvert par un montage expiré : enfant tué, aucun df ;
+            délai coupé par l'échéance : « délai de Storage épuisé », rien retenu ; chemin absent : ouvert d'abord, aucun df ; df
+            introuvable, en échec, lancement impossible : raison dite ; storage() : un seul résolveur pour tous les nicks."""
+            P=lambda: mock.patch.dict(os.environ,{'PATH':st_fb+os.pathsep+os.environ.get('PATH','')})
+            p1=os.path.join(tmp,'st-d1'); p2=os.path.join(tmp,'st-d2'); os.makedirs(p1,exist_ok=True); os.makedirs(p2,exist_ok=True)
+            rp1,rp2=os.path.realpath(p1),os.path.realpath(p2); k1=_st_mkey(p1); kk=k1 not in (rp1,'/')
+            res={}; pids=os.path.join(tmp,'st-pids'); M=lambda k: f"montage {k} ne répond pas (df bloqué)"
+            # groupe tué : df lance un `sleep` en arrière-plan (même groupe) puis attend
+            _st_fakedf(f"sleep 60 & echo $! >> '{pids}'\necho $$ >> '{pids}'\nwait")
+            with open(pids,'w'): pass
+            with P():
+                t0=time.monotonic(); rv=_LocalResolver(budget=30,per_path=3)
+                a=rv(p1); b=rv(p2); el=time.monotonic()-t0
+            with open(pids) as f: pl=[int(x) for x in f.read().split()]
+            left=[x for x in pl if _st_alive(x)]
+            end=time.monotonic()+3
+            while left and time.monotonic()<end: time.sleep(0.05); left=[x for x in pl if _st_alive(x)]
+            res['groupe']=(a==(rp1,None,M(k1)) and (b==(None,None,M(k1)) if kk else b[:2]==(rp2,None))
+                           and el<(9 if kk else 15) and _st_ndf()==(1 if kk else 2) and len(pl)>=2 and not left)
+            _st_reap(left)
+            # petit-enfant setsid qui garde le tube : attente bornée (2 s après la mise à mort), puis retiré (ligne de commande vérifiée)
+            with open(pids,'w'): pass
+            _st_fakedf(f"setsid sleep 60 & echo $! > '{pids}'\nexec sleep 60")
+            with P():
+                t0=time.monotonic(); c=_LocalResolver(budget=30,per_path=3)(p1); el2=time.monotonic()-t0
+            with open(pids) as f: gc=[int(x) for x in f.read().split()]
+            res['setsid']=(c[:2]==(rp1,None) and el2<8.5 and len(gc)==1 and _st_reap(gc)==[],round(el2,1))
+            # délai coupé par l'échéance (reste < per_path) : « délai de Storage épuisé », rien retenu ; échéance comptée au 1er chemin
+            _st_fakedf("exec sleep 60")
+            with P():
+                rv3=_LocalResolver(budget=4,per_path=10); time.sleep(4.1); d=rv3(p1); n_d=_st_ndf()
+                e=rv3('/proc/st-autre'); n_e=_st_ndf()
+            res['échéance']=(d==(rp1,None,_STORAGE_LATE) and n_d==1 and rv3.dead==set() and e==(None,None,_STORAGE_LATE) and n_e==1)
+            # « / » et autofs jamais retenus : chemin exact ; le 2e chemin est essayé
+            for nm_,mt_ in (('racine',{'/':'ext4'}),('autofs',{'/':'ext4',os.path.dirname(rp1):'autofs'})):
+                _st_fakedf("exec sleep 60")
+                with P(), mock.patch.dict(globals(),{'_mount_table':lambda mt_=mt_: dict(mt_)}):
+                    rv4=_LocalResolver(budget=30,per_path=3); f1=rv4(p1); f2=rv4(p2)
+                res[nm_]=(f1==(rp1,None,M(rp1)) and f2==(rp2,None,M(rp2)) and _st_ndf()==2 and rv4.dead=={rp1,rp2})
+            # chemin réel couvert par un montage expiré (lien vers lui) : enfant tué dès le chemin réel lu (row 42)
+            lk=os.path.join(tmp,'st-lien-d1')
+            if not os.path.islink(lk): os.symlink(p1,lk)
+            _st_fakedf("exec sleep 60")
+            with P():
+                rv5=_LocalResolver(budget=30,per_path=3); rv5.dead.add(rp1); t0=time.monotonic(); h=rv5(lk); el5=time.monotonic()-t0
+            res['lien']=(h==(rp1,None,M(rp1)) and el5<2.5)
+            # chemin absent : ouvert d'abord (autofs), aucun df
+            _st_fakedf("echo /x; echo /x")
+            with P(): g=_LocalResolver()(os.path.join(tmp,'st-absent-x'))
+            res['absent']=(g==(os.path.realpath(os.path.join(tmp,'st-absent-x')),None,None) and _st_ndf()==0)
+            # row 64 : lien vers un périphérique, fichier ordinaire, fifo : jamais ouverts (O_DIRECTORY), aucun df ; df lancé sur « . »
+            # dans le dossier (dossier sans droit de lecture : chdir), environnement PATH + LC_ALL=C seuls ; dossier inaccessible : dit
+            dv=os.path.join(tmp,'st-lien-dev'); fo=os.path.join(tmp,'st-fichier'); ff=os.path.join(tmp,'st-fifo-dir')
+            if not os.path.islink(dv): os.symlink('/dev/null',dv)
+            open(fo,'w').close()
+            if not os.path.exists(ff): os.mkfifo(ff)
+            _st_fakedf("echo /x; echo /x")
+            with P(): q=[_LocalResolver()(x) for x in (dv,fo,ff)]; nq=_st_ndf()
+            res['pas un dossier']=(q==[('/dev/null',None,None),(os.path.realpath(fo),None,None),(os.path.realpath(ff),None,None)]
+                                   and nq==0,q,nq)
+            nr=os.path.join(tmp,'st-sans-lecture'); na=os.path.join(tmp,'st-inaccessible'); af=os.path.join(tmp,'st-df-args')
+            for x_,m_ in ((nr,0o311),(na,0)): os.makedirs(x_,exist_ok=True); os.chmod(x_,m_)
+            _st_fakedf(f"echo \"$*|$PWD|$LC_ALL|${{BORGHELPERC_RUNTIME_PASSPHRASE:-absente}}\" >> '{af}'\necho /x; echo /x")
+            with open(af,'w'): pass
+            try:
+                with P(), mock.patch.dict(os.environ,{'BORGHELPERC_RUNTIME_PASSPHRASE':'st-secret','LC_ALL':'fr_FR.UTF-8'}):
+                    q2=[_LocalResolver()(x) for x in (p1,nr,na)]
+            finally:
+                for x_ in (nr,na): os.chmod(x_,0o755)
+            with open(af) as f: al=f.read().splitlines()
+            rnr=os.path.realpath(nr); rna=os.path.realpath(na)
+            res['dossier']=((q2[:2]==[(rp1,'/x',None),(rnr,'/x',None)]
+                             and al[:2]==[f"--output=target -- .|{rp1}|C|absente",f"--output=target -- .|{rnr}|C|absente"]
+                             and (os.geteuid()==0 or (q2[2]==(rna,None,"point de montage non lu (dossier inaccessible)") and len(al)==2))),q2,al)
+            # row 46 : df introuvable, df en échec, lancement impossible -> raison dite, jamais « local ? » muet
+            vide=os.path.join(tmp,'st-sans-df'); os.makedirs(vide,exist_ok=True)
+            with mock.patch.dict(os.environ,{'PATH':vide}): i1=_LocalResolver()(p1)
+            _st_fakedf("exit 1")
+            with P(): i2=_LocalResolver()(p1)
+            def nofork(*a,**k): raise OSError('fork impossible (simulé)')
+            with mock.patch.object(subprocess,'Popen',nofork): i3=_LocalResolver()(p1)
+            res['raisons']=(i1==(rp1,None,"point de montage non lu (df introuvable)") and i2==(rp1,None,"point de montage non lu (df en échec, code 1)")
+                            and i3==(None,None,"point de montage non lu (lancement impossible : fork impossible (simulé))"),i1,i2,i3)
+            # storage() : un seul résolveur (échéance et montages expirés communs) pour tous les nicks (G2)
+            rcd=os.path.join(tmp,'st2'); os.makedirs(os.path.join(rcd,'c'),exist_ok=True); rc2=os.path.join(rcd,'rc')
+            with open(rc2,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(rcd,'c')}\n\n[L1]\nBORG_REPO={p1}\n\n[L2]\nBORG_REPO={p2}\n")
+            os.chmod(rc2,0o600)
+            _st_fakedf("exec sleep 60")
+            with P(), mock.patch.dict(globals(),{'_LocalResolver':functools.partial(_LocalResolver,per_path=3)}), \
+                 contextlib.redirect_stdout(io.StringIO()) as o_:
+                t0=time.monotonic(); rc_=BorgHelper(cfgfile=rc2,cache_dir=os.path.join(rcd,'c')).storage('L1,L2',as_json=True); el3=time.monotonic()-t0
+            d3=json.loads(o_.getvalue())
+            res['storage']=(rc_==1 and d3['errors']=={'L1':M(k1),'L2':M(k1) if kk else M(rp2)} and el3<(9 if kk else 15)
+                            and _st_ndf()==(1 if kk else 2)
+                            and sorted(s['storage'] for s in d3['storages'])==[f"local ? ({rp1})",f"local ? ({rp2})"])
+            ok=all(v is True or (isinstance(v,tuple) and v[0] is True) for v in res.values())
+            if not ok: print(f"  {res} ; {a} {b} {el:.1f}s pids {pl} ; {c} ; {d} {e} ; {h} {el5:.1f}s ; {g} ; {d3} {el3:.1f}s")
+            return ok
+        check("Storage : df borné — délai par chemin (groupe tué, petit-enfant compris), attente bornée (petit-enfant setsid), chemin réel "
+              "gardé, montage expiré retenu (« / » et autofs : chemin exact), lien vers un montage expiré sans df, échéance dès le 1er "
+              "chemin et délai coupé par elle sans rien retenir, chemin absent sans df, raisons dites (df introuvable, en échec, lancement "
+              "impossible), un résolveur par appel",_st_resolver)
+        def _st_stuck():
+            """Décision 7 (rows 23, 43) : enfant encore vivant après sa mise à mort -> clé et [PID, starttime] notés dans CACHE_DIR
+            (verrou, .tmp exclusif, os.replace) ; tant que ce PID vit avec le même starttime, aucun df sur la clé (autre appel compris),
+            erreur dite ; PID mort ou réutilisé : marque retirée ; /proc refusé : gardée ; fichier corrompu ou hostile : entrées
+            filtrées ; marque non écrite : dite."""
+            mk=os.path.join(tmp,'st-marque.json'); fifo=os.path.join(tmp,'st-bloque-d')   # row 64 : un dossier, df figé
+            os.makedirs(fifo,exist_ok=True)
+            P=lambda: mock.patch.dict(os.environ,{'PATH':st_fb+os.pathsep+os.environ.get('PATH','')})
+            _st_fakedf("exec sleep 60"); res={}; kids=[]; real_popen=subprocess.Popen
+            class Spy(real_popen):
+                def __init__(s_,*a,**k): super().__init__(*a,**k); kids.append(s_.pid)
+            try:
+                # écriture : df figé (factice), mise à mort sans effet (factice) -> vivant -> noté
+                kf=_st_mkey(fifo)
+                with P(), mock.patch.object(os,'killpg',lambda *a: None), mock.patch.object(subprocess,'Popen',Spy):
+                    w=_LocalResolver(budget=30,per_path=2,marker=mk)(fifo)
+                try:
+                    with open(mk) as f: m=json.load(f)
+                except (OSError,ValueError): m=None
+                pid=kids[-1] if kids else None
+                res['notée']=(w==(os.path.realpath(fifo),None,f"montage {kf} ne répond pas (df bloqué)") and m=={kf:[pid,_pid_start(pid)]}
+                              and _mark_alive(m[kf]) and not [x for x in os.listdir(tmp) if x.startswith('st-marque.json.') and x!='st-marque.json.lock'])
+                # marque non écrite : dite
+                os.unlink(mk)
+                with P(), mock.patch.object(os,'killpg',lambda *a: None), mock.patch.object(subprocess,'Popen',Spy), \
+                     mock.patch.object(_LocalResolver,'_update',lambda s_,fn: False):
+                    w2=_LocalResolver(budget=30,per_path=2,marker=mk)(fifo)
+                res['non écrite']=w2[2]==f"montage {kf} ne répond pas (df bloqué) ; marque non écrite (CACHE_DIR)"
+                for x in kids:
+                    try: os.kill(x,9); os.waitpid(x,0)
+                    except OSError: pass
+                _st_fakedf("echo /x; echo /x")   # df figés tués et attendus : le script n'est plus lu par personne
+                # marque vivante (processus vivant, son PID et son starttime) : aucun df, autre appel compris ; PID mort, réutilisé
+                # (starttime différent), entrées hostiles : retirées
+                p=Spy(['sleep','60'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,start_new_session=True,cwd='/')
+                sub=os.path.join(tmp,'st-d1'); st0=_pid_start(p.pid)
+                with open(mk,'w') as f:
+                    f.write(json.dumps({sub:[p.pid,st0],os.path.join(tmp,'st-d2'):[os.getpid(),0]})[:-1]
+                            +', "/":[2,1], "rel":[2,1], "/a":[Infinity,1], "/b":[1,1], "/c":"x", "/d":[[[[2]]],1], "//":[%d,%d],'
+                             ' "/./":[%d,%d], "/..":[%d,%d]}' % ((p.pid,st0 or 0)*3))
+                with P(): r1=_LocalResolver(marker=mk)(os.path.join(sub,'x')); n1=_st_ndf()
+                with open(mk) as f: m2=json.load(f)
+                res['vivante']=(st0 is not None and r1==(None,None,f"montage {sub} ne répond pas (df bloqué)") and n1==0 and m2=={sub:[p.pid,st0]})
+                with mock.patch.dict(globals(),{'_pid_start':lambda pid: (_ for _ in ()).throw(PermissionError())}):
+                    res['hidepid']=_mark_alive([p.pid,st0+1]) is True
+                # hidepid=2 : /proc muet (ENOENT) pour le processus d'un autre utilisateur ; kill(pid, 0) -> EPERM : gardée (row 58)
+                def eperm(pid,sig): raise PermissionError(1,'Operation not permitted')
+                with mock.patch.dict(globals(),{'_pid_start':lambda pid: None}), mock.patch.object(os,'kill',eperm):
+                    res['hidepid=2']=_mark_alive([p.pid,st0]) is True
+                res['hidepid=2 mort']=_mark_alive([2**22+12345,1]) is False
+                # fichier piégé : FIFO (jamais bloquant) ; verrou tenu ailleurs : écriture abandonnée en temps borné
+                mf=os.path.join(tmp,'st-marque-fifo.json')
+                if not os.path.exists(mf): os.mkfifo(mf)
+                t0=time.monotonic(); fifo_none=_LocalResolver(marker=mf)._load()=={}; el_f=time.monotonic()-t0
+                import fcntl
+                lk_=os.open(mk+'.lock',os.O_RDWR|os.O_CREAT,0o600)
+                try:
+                    fcntl.flock(lk_,fcntl.LOCK_EX); t0=time.monotonic()
+                    held=_LocalResolver(marker=mk)._update(lambda c: dict(c,**{'/zz':[2,1]})); el_l=time.monotonic()-t0
+                finally: os.close(lk_)
+                res['piégé']=(fifo_none and el_f<1 and held is False and 1.5<el_l<4,round(el_f,2),round(el_l,1))
+                with open(mk,'w') as f: f.write('{pas du json')
+                res['corrompu']=_LocalResolver(marker=mk)._marked(sub) is None
+                with open(mk,'w') as f: json.dump({sub:[p.pid,st0]},f)
+                p.kill(); p.wait()
+                with P(): r2=_LocalResolver(marker=mk)(sub); n2=_st_ndf()
+                res['morte']=(r2==(os.path.realpath(sub),'/x',None) and n2==1 and not os.path.exists(mk))
+            finally:
+                for x in kids:
+                    try: os.kill(x,9)
+                    except OSError: pass
+                    try: os.waitpid(x,0)
+                    except OSError: pass
+            ok=all((v[0] if isinstance(v,tuple) else v) is True for v in res.values())
+            if not ok: print(f"  {res} ; {w} {m} ; {r1 if 'r1' in dir() else ''} ; {r2 if 'r2' in dir() else ''}")
+            return ok
+        check("Storage : df bloqué (enfant vivant après sa mise à mort) noté dans CACHE_DIR avec son PID et son starttime — aucun df "
+              "relancé sur ce montage tant que ce PID vit ; PID mort ou réutilisé, entrées hostiles : retirées ; /proc refusé : gardée ; "
+              "marque non écrite : dite",_st_stuck)
+        def _st_rate():
+            """Row 1 : moyenne par mois = somme des rythmes par dépôt (croissance / sa propre durée), croissance totale inchangée ;
+            row 36 : étiquette résolue préférée à « local ? » pour un même dépôt."""
+            R=lambda i,f,fa,l,la,st='s': {'storage':st,'named':False,'kind':'ssh','repo':i,'repo_id':i,'nicks':[i],'size':l,'measured_at':la,
+                                          'first_size':f,'first_at':fa}
+            s=_storage_aggregate([R('A',100,'2026-01-01 00:00:00',100,'2026-04-01 00:00:00'),R('B',0,'2026-03-31 00:00:00',300,'2026-04-01 00:00:00'),
+                                  R('C',5,'2026-03-01 00:00:00',9,'2026-03-01 10:00:00')])[0]
+            lab=[[x['storage'] for x in _storage_aggregate([R('L',None,None,None,None,a),R('L',None,None,None,None,b)])]
+                 for a,b in (('local ? (/x)','local /m'),('local /m','local ? (/x)'))]
+            ok=s['growth']==304 and s['days']==90.0 and s['growth_per_month']==round(300*30.4375) and lab==[['local /m'],['local /m']]
+            if not ok: print(f"  {s} {lab}")
+            return ok
+        check("Storage : moyenne par mois = somme des rythmes des dépôts mesurés sur au moins un jour ; croissance totale inchangée ; "
+              "étiquette résolue préférée à « local ? »",_st_rate)
+        st_dir=os.path.join(tmp,'storage'); st_rc=os.path.join(st_dir,'rc'); bh_st=None
+        if not list_only:   # -l : aucun décor, aucun fichier (story 83, D132) — décor écrit seulement quand les contrôles tournent
+            os.makedirs(os.path.join(st_dir,'cache')); os.makedirs(os.path.join(st_dir,'loc'))
+            with open(st_rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(st_dir,'cache')}\n\n"
+                        "[sA]\nBORG_REPO=ssh://backup@nas/./r1\n\n[sB]\nBORG_REPO=backup@nas:r1\n\n[sC]\nBORG_REPO=backup@nas:/r2\n\n"
+                        f"[sL]\nBORG_REPO={os.path.join(st_dir,'loc')}\n\n[sN]\nBORG_REPO=backup@nas:/r3\n\n[sX]\nSER_NAME=x\n\n"
+                        "[sK]\nBORG_REPO=backup@nas:/r4\n\n[sD]\nBORG_REPO=backup@nas:/r5\n\n[sU]\nBORG_REPO=backup@nas:/r6\n\n"
+                        "[sS1]\nBORG_REPO=backup@nas:/r7\nDB_NAME=partage\n\n[sS2]\nBORG_REPO=backup@nas:/r8\nDB_NAME=partage\n\n"
+                        "[sQ]\nBORG_REPO=sftp://u:secret@nas/r\n\n[sR]\nBORG_REPO=s3:KEYID:SECRETXYZ@https://minio:9000/b/r\n\n"
+                        "[sP]\nBORG_REPO=ssh://u:MOTDEPASSE@nas/r\n\n[sV]\nBORG_REPO=ssh://u:p/MOTDEPASSE2@nas/r\n\n"
+                        "[sW]\nBORG_REPO=rclone::s3,secret_access_key=CLESECRETE/+x:b\n\n[sI]\nBORG_REPO=/srv/MOTPASSE3%zz\n\n"
+                        "[sM]\nBORG_REPO=ssh://h/r\n BORG_PASSPHRASE = MOTPASSE4\n\n")   # row 60 : ligne suivante prise dans la valeur
+            os.chmod(st_rc,0o600)
+            bh_st=BorgHelper(cfgfile=st_rc,cache_dir=os.path.join(st_dir,'cache'))
+        def _st_put(n,rows):
+            for v,at in rows:
+                bh_st.db.store_repo_stats(n,'bkp',v,v,v)
+                c=sqlite3.connect(bh_st.db.get_history_db(n))
+                try: c.execute("UPDATE repo_stats SET updated_at=? WHERE id=(SELECT MAX(id) FROM repo_stats WHERE nick=?)",(at,n)); c.commit()
+                finally: c.close()
+        def _st_seed():
+            # sA et sB : même dépôt (deux écritures), sA mesuré du 01-01 au 03-02, sB du 01-15 au 04-01 (dernière la plus récente)
+            _st_put('sA',[(100,'2026-01-01 00:00:00'),(130,'2026-03-02 00:00:00')])
+            _st_put('sB',[(110,'2026-01-15 00:00:00'),(140,'2026-04-01 00:00:00')])
+            _st_put('sC',[(1000,'2026-02-01 00:00:00'),(1300,'2026-04-01 00:00:00')])
+            _st_put('sL',[(7,'2026-03-01 00:00:00')])
+            # sD : ligne recopiée tard par une migration (id plus grand, date plus ancienne) — row 6 ; mêmes dates : id en départage (row 39)
+            _st_put('sD',[(50,'2026-02-01 00:00:00'),(80,'2026-05-01 00:00:00'),(10,'2026-01-01 00:00:00'),(60,'2026-03-01 00:00:00'),
+                          (90,'2026-05-01 00:00:00'),(5,'2026-01-01 00:00:00')])
+            # sU : diff.db d'avant 1.0.139 jamais migrée (repo_stats encore dans diff.db, aucune history.db) — row 11
+            c=sqlite3.connect(bh_st.db.get_diff_db('sU'))
+            try: c.execute("CREATE TABLE repo_stats (nick TEXT, unique_csize INTEGER)"); c.commit()
+            finally: c.close()
+            return True
+        _st_seeded=_pre(_st_seed)
+        def _st_cli(*args):
+            saved=sys.argv[:]; out=io.StringIO(); err=io.StringIO(); code=0
+            try:
+                sys.argv=['borgHelper','-C',st_rc,'-c','Storage']+list(args)
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                    try: _cli_main()
+                    except SystemExit as e: code=e.code
+            finally: sys.argv=saved
+            return code,out.getvalue(),err.getvalue()
+        def _st_sizes():
+            if not _st_seeded(): return False
+            c,o,e=_st_cli('-n','sA,sB,sC,sL,sN','-j'); d=json.loads(o); S={s['storage']:s for s in d['storages']}
+            nas=S.get('backup@nas') or {}; loc=[s for k,s in S.items() if k.startswith('local /')]
+            r1=[r for r in nas.get('repos',[]) if r['repo_id']=='backup@nas|r1']
+            r3=[r for r in nas.get('repos',[]) if r['repo_id']=='backup@nas|/r3']
+            # nas : r1 (dernière 140 au 04-01, première 100 au 01-01 : 90 j) + r2 (1300 / 1000, 02-01 -> 04-01 : 59 j) ; r3 sans mesure
+            gpm=round(40/(90/30.4375)+300/(59/30.4375))
+            # G1 : étiquette locale = « local » + point de montage réel (oracle ismount, indépendant de df)
+            q=os.path.realpath(os.path.join(st_dir,'loc'))
+            while not os.path.ismount(q): q=os.path.dirname(q)
+            ok=(c==0 and e=='' and len(S)==2 and len(loc)==1 and loc[0]['storage']=='local '+q and nas.get('size')==1440
+                and nas.get('first_size')==1100
+                and nas.get('growth')==340 and nas.get('first_at')=='2026-01-01 00:00:00' and nas.get('last_at')=='2026-04-01 00:00:00'
+                and nas.get('days')==90.0 and nas.get('growth_per_month')==gpm and nas.get('measured_repos')==2
+                and len(nas.get('repos',[]))==3 and r1 and r1[0]['nicks']==['sA','sB'] and r1[0]['size']==140
+                and r1[0]['measured_at']=='2026-04-01 00:00:00' and r1[0]['first_size']==100 and nas.get('nicks')==['sA','sB','sC','sN']
+                and r3 and r3[0]['size'] is None and r3[0]['nicks']==['sN'] and loc[0]['size']==7 and loc[0]['growth']==0
+                and loc[0]['growth_per_month'] is None and d['errors']=={} and d['borghelper_version']==Version)
+            if not ok: print(f"  code {c} montage {q} {o[-600:]!r} {e[-200:]!r}")
+            return ok
+        check("Storage -j : trois nicks sur backup@nas (deux sur le même dépôt) et un local -> deux stockages ; taille = somme des "
+              "dépôts distincts, croissance depuis la 1re mesure, moyenne par mois ; dépôt sans mesure listé, taille null ; étiquette "
+              "locale = point de montage réel",_st_sizes)
+        def _st_dates():
+            if not _st_seeded(): return False
+            got=bh_st.db.get_storage_measures('sD')
+            ok=got==((10,'2026-01-01 00:00:00'),(90,'2026-05-01 00:00:00'))
+            if not ok: print(f"  {got}")
+            return ok
+        check("Storage : première et dernière mesures par date (updated_at), id en départage à date égale, jamais par id seul",_st_dates)
+        def _st_text():
+            if not _st_seeded(): return False
+            c,o,e=_st_cli('-n','sA,sB,sC,sN'); L=e.splitlines()
+            want=["backup@nas — 3 dépôts, taille 1.44 KB, croissance +340.00 B depuis le 2026-01-01 (90 j ; +168.00 B/mois)",
+                  "  backup@nas:/r2 [sC] : 1.30 KB (mesurée le 2026-04-01)","  backup@nas:/r3 [sN] : — (aucune mesure)",
+                  "  backup@nas:r1 [sA, sB] : 140.00 B (mesurée le 2026-04-01)"]   # même dépôt sous deux écritures : la plus petite
+            if not (c==0 and o=='' and L==want): print(f"  code {c} {L!r} {o[-200:]!r}")
+            return c==0 and o=='' and L==want
+        check("Storage (texte) : une ligne par stockage (dépôts, taille, croissance, durée, moyenne par mois), une par dépôt "
+              "(nicks, taille ou « — (aucune mesure) ») sur stderr, stdout vide",_st_text)
+        def _st_errors():
+            if not _st_seeded(): return False
+            hk=bh_st.db.get_history_db('sK')
+            with open(hk,'wb') as f: f.write(b'pas une base SQLite'*300)
+            c,o,e=_st_cli('-n','sX,sK,inconnu,sC,sU,DEFAULT,sQ,sR,sP,sV,sW,sI,sM','-j'); d=json.loads(o) if o.strip().startswith('{') else {}
+            ct,ot,et=_st_cli('-n','sQ,sR,sP,sV,sW,sI,sM')   # rows 41, 53, 54, 60 : secrets ni en -j ni en texte
+            ers=d.get('errors',{}); S={s['storage']:s for s in d.get('storages',[])}
+            kept=[r['nicks'] for r in (S.get('backup@nas') or {}).get('repos',[])]
+            ok=(c==1 and set(ers)=={'sX','sK','inconnu','sU','DEFAULT','sQ','sR','sP','sV','sW','sI','sM'} and ers['sX']=='BORG_REPO absent du rc'
+                and ers['sM']=='forme de BORG_REPO non reconnue (borg 2 ?) : …'
+                and ers['sV']=='forme de BORG_REPO non reconnue (borg 2 ?) : ssh://…' and ers['sW']=='forme de BORG_REPO non reconnue (borg 2 ?) : rclone:…'
+                and ers['sI']=='InterpolationSyntaxError (clé BORG_REPO)'
+                and ers['sR']=='forme de BORG_REPO non reconnue (borg 2 ?) : s3:…' and ers['sP']=='forme de BORG_REPO non reconnue (borg 2 ?) : ssh://…'
+                and ct==1 and not any(x in o+e+ot+et for x in ('secret','SECRETXYZ','KEYID','MOTDEPASSE','CLESECRETE','MOTPASSE3','MOTPASSE4'))
+                and ers['inconnu']==ers['DEFAULT']=='nick inconnu du rc' and ers['sQ']=='forme de BORG_REPO non reconnue (borg 2 ?) : sftp://…'
+                and ers['sK'].startswith(f"SQLite error ({hk}): ") and ers['sU'].startswith("mesures d'avant 1.0.139 pas encore migrées")
+                and kept==[['sC'],['sK'],['sU']] and S['backup@nas']['size']==1300 and 'secret' not in o)
+            c2,o2,e2=_st_cli('-n','sX,sC'); L=e2.splitlines()
+            ok2=c2==1 and L[-1]==f"[ERREUR] sX : BORG_REPO absent du rc  [borgHelper v{Version}]" and L[0].startswith('backup@nas — 1 dépôt')
+            if not (ok and ok2): print(f"  {c} {ers} {kept} | {c2} {L}")
+            return ok and ok2
+        check("Storage : erreurs par nick (BORG_REPO absent ou borg 2 — schéma seul cité —, inconnu du rc, DEFAULT, history.db "
+              "corrompue : nick placé sans mesure ; diff.db d'avant 1.0.139 non migrée : dite), jamais bloquantes, code 1, texte et -j",_st_errors)
+        def _st_shared_lock():
+            """Rows 16, 34 : history.db (puis diff.db) partagée (DB_NAME) verrouillée : une seule attente pour l'appel, la MÊME erreur
+            dite pour chaque nick (G5)."""
+            if not _st_seeded(): return False
+            calls=[]; hp=bh_st.db.get_history_db('sS1'); dp=bh_st.db.get_diff_db('sS1')
+            def locked(n): calls.append(n); raise sqlite3.OperationalError('database is locked')
+            def run():
+                o=io.StringIO()
+                with contextlib.redirect_stdout(o): rc=bh_st.storage('sS1,sS2',as_json=True)
+                return rc,json.loads(o.getvalue())['errors']
+            with mock.patch.object(bh_st.db,'get_storage_measures',locked): rc1,e1=run()
+            c1=list(calls); calls.clear()
+            with mock.patch.object(bh_st.db,'storage_unmigrated',locked): rc2,e2=run()
+            m1=f"SQLite error ({hp}): database is locked"; m2=f"diff.db illisible ({dp}): database is locked"
+            ok=(rc1==rc2==1 and c1==['sS1'] and calls==['sS1'] and e1=={'sS1':m1,'sS2':m1} and e2=={'sS1':m2,'sS2':m2}
+                and hp==bh_st.db.get_history_db('sS2') and dp==bh_st.db.get_diff_db('sS2'))
+            if not ok: print(f"  {rc1} {c1} {e1} ; {rc2} {calls} {e2}")
+            return ok
+        check("Storage : history.db et diff.db partagées verrouillées attendues une seule fois par appel, même erreur dite pour chaque nick "
+              "(« diff.db illisible »)",_st_shared_lock)
+        def _st_all():
+            """Décision 5 / row 11 : sans -n (CLI) et `ALL` (bibliothèque) = tous les nicks du rc."""
+            if not _st_seeded(): return False
+            names=lambda d: sorted({n for s in d['storages'] for n in s['nicks']}|set(d['errors']))
+            c,o,e=_st_cli('-j'); out=io.StringIO()
+            with contextlib.redirect_stdout(out): bh_st.storage('ALL',as_json=True)
+            want=sorted(bh_st.borg.cfgreadnicks(0).split(','))
+            # row 62 : -n ALL passé tel quel à storage() (qui contrôle le rc avant de développer ALL), jamais développé avant
+            got=[]; ca,oa,ea=_st_cli('-n','ALL','-j')
+            with mock.patch.object(BorgHelper,'storage',lambda self,n,**k: got.append(n) or 0): _st_cli('-n','ALL','-j')
+            ok=(names(json.loads(o))==want and names(json.loads(out.getvalue()))==want and len(want)==18 and names(json.loads(oa))==want
+                and got==['ALL'])
+            if not ok: print(f"  {names(json.loads(o))} / {want} ; -n ALL {names(json.loads(oa))} reçu {got}")
+            return ok
+        check("Storage : sans -n (CLI) et ALL (bibliothèque) -> tous les nicks du fichier de conf",_st_all)
+        def _st_badrc():
+            """Row 51 : rc illisible -> erreur « * » (message de configparser ou d'ouverture, comme les autres commandes), code 1 —
+            jamais « nick inconnu » ni « Aucun dépôt. » en code 0. Droits (hors root) : par la CLI (HOME du décor : le dossier de
+            cache par défaut n'est jamais celui de l'utilisateur) ; syntaxe : par la bibliothèque (la CLI s'arrête avant, à la
+            lecture de CACHE_DIR, comme toute commande)."""
+            bd=os.path.join(tmp,'st-badrc'); os.makedirs(os.path.join(bd,'c'),exist_ok=True); brc=os.path.join(bd,'rc')
+            with open(brc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(bd,'c')}\n[x]\nBORG_REPO=/r\n")
+            os.chmod(brc,0o600); res={}
+            bhb=BorgHelper(cfgfile=brc,cache_dir=os.path.join(bd,'c'))
+            with open(brc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(bd,'c')}\n[x\nBORG_REPO=/r\n")
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o): rc=bhb.storage('ALL',as_json=True)
+            d=json.loads(o.getvalue())
+            res['syntaxe']=(rc==1 and d['storages']==[] and d['errors']=={'*':'ParsingError'},rc,d)
+            if os.geteuid()!=0:
+                with open(brc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(bd,'c')}\n[x]\nBORG_REPO=/r\n")
+                os.chmod(brc,0)
+                try:
+                    for k_,xa in (('droits',[]),('droits -n ALL',['-n','ALL'])):   # row 62 : -n ALL de même
+                        saved=sys.argv[:]; out=io.StringIO(); err=io.StringIO(); code=0
+                        try:
+                            sys.argv=['borgHelper','-C',brc,'-c','Storage','-j']+xa
+                            with mock.patch.dict(os.environ,{'HOME':bd}),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                                try: _cli_main()
+                                except SystemExit as x: code=x.code
+                        finally: sys.argv=saved
+                        d=json.loads(out.getvalue()) if out.getvalue().strip().startswith('{') else {}
+                        res[k_]=(code==1 and d.get('storages')==[] and list(d.get('errors',{}))==['*']
+                                 and d['errors']['*']=='PermissionError (Permission denied)' and brc not in out.getvalue(),code,d)
+                finally: os.chmod(brc,0o600)
+            ok=all(v[0] for v in res.values())
+            if not ok: print(f"  {res}")
+            return ok
+        check("Storage : rc illisible (syntaxe, droits) -> erreur « * », code 1",_st_badrc)
+        def _st_bsr():
+            """Row 32 : chemin ou étiquette non UTF-8 (surrogates de fsdecode) -> échappé, jamais un UnicodeEncodeError."""
+            x=_bsr({'k\udcff':['local ? (/a\udcfe)',{'r':'b\udcff'}],'n':3})
+            ok=x=={'k\\xff':['local ? (/a\\xfe)',{'r':'b\\xff'}],'n':3}
+            json.dumps(x,ensure_ascii=False).encode('utf-8')
+            if not ok: print(f"  {x}")
+            return ok
+        check("Storage : chaînes non UTF-8 échappées (backslashreplace) avant l'impression",_st_bsr)
+        def _st_readonly():
+            if not _st_seeded(): return False
+            calls=[]; real=subprocess.Popen
+            class Spy(real):
+                def __init__(s,args,*a,**k):
+                    calls.append(list(args) if isinstance(args,(list,tuple)) else [args]); envs.append((k.get('env'),k.get('cwd')))
+                    super().__init__(args,*a,**k)
+            envs=[]; before={f:os.stat(os.path.join(st_dir,'cache',f)).st_mtime_ns for f in os.listdir(os.path.join(st_dir,'cache'))}
+            with mock.patch.object(subprocess,'Popen',Spy), mock.patch.dict(os.environ,{'BORGHELPERC_RUNTIME_PASSPHRASE':'st-secret'}):
+                c,o,e=_st_cli('-n','ALL','-j'); pth=os.environ.get('PATH',os.defpath)
+            after={f:os.stat(os.path.join(st_dir,'cache',f)).st_mtime_ns for f in os.listdir(os.path.join(st_dir,'cache'))}
+            only=[a for a in calls if a[1:4]!=['-I','-c',_RESOLVE_PY]]
+            # row 64 : environnement de l'enfant réduit à PATH et LC_ALL=C (jamais une passphrase), dossier courant « / »
+            ok=(len(calls)==1 and not only and not any(os.path.basename(str(x)) in ('borg','ssh') for a in calls for x in a)
+                and envs==[({'PATH':pth,'LC_ALL':'C'},'/')]
+                and before==after and not os.path.exists(bh_st.db.get_history_db('sN')) and c==1)
+            if not ok: print(f"  {calls} {envs} {sorted(set(after)^set(before))} code {c}")
+            return ok
+        check("Storage : lecture seule — seul l'enfant de résolution locale (realpath, ouverture, df) lancé, jamais borg ni ssh, aucune "
+              "base créée ni écrite",_st_readonly)
+        def _st_merge():
+            if not _st_seeded(): return False
+            outs=[]
+            for n in ('sA','sB,sC'):
+                c,o,e=_st_cli('-n',n,'-j'); outs.append(json.loads(o))
+            m=_storage_merge(outs+[{'storages':[],'errors':{'web:x':'nick inconnu du rc'}},None])
+            nas=[s for s in m['storages'] if s['storage']=='backup@nas'][0]
+            # row 5 : `named` par dépôt — R non nommé dans un stockage nommé (rc 1), nommé zzz dans le rc 2 -> sous zzz
+            R=lambda i,nm: {'repo':i,'repo_id':i,'kind':'ssh','named':nm,'nicks':[i+nm*'n'],'size':None,'measured_at':None,
+                             'first_size':None,'first_at':None}
+            p1={'storages':[{'storage':'backup@nas','named':True,'repos':[R('R',False),R('S',True)]}],'errors':{}}
+            p2={'storages':[{'storage':'zzz','named':True,'repos':[R('R',True)]}],'errors':{}}
+            g={s['storage']:[r['repo_id'] for r in s['repos']] for s in _storage_merge([p1,p2])['storages']}
+            ok=(nas['size']==1440 and nas['growth']==340 and [r['nicks'] for r in nas['repos']]==[['sC'],['sA','sB']]
+                and m['errors']=={'web:x':'nick inconnu du rc'} and m['borghelper_version']==Version and g=={'backup@nas':['S'],'zzz':['R']})
+            if not ok: print(f"  {m} ; {g}")
+            return ok
+        check("Storage : fusion de plusieurs sorties -j (mode dossier de borgHelperWWW) — même dépôt compté une fois, nom STORAGE du "
+              "dépôt (named par dépôt), erreurs réunies",_st_merge)
         # ── bkp_status (Story 1, spec-notifications-push) ──
         bs_path=os.path.join(tmp,'bkpstatus-history.db'); bh.ensure_history_db(bs_path)   # bkp_status vit dans history.db (1.0.139)
         def _bs_cols():
@@ -26850,7 +28041,7 @@ def _cli_main():
     if cmd=='login' and '-n' not in options:
         nick=options.get('-s',socket.gethostname())   # cible réelle de Login, contrôlée ci-dessous (1.0.142)
     _all_nicks=(nick=="ALL")
-    if nick=="ALL":
+    if nick=="ALL" and cmd!='storage':   # revue 87a (row 62) : Storage développe ALL lui-même, après son contrôle du rc (row 51)
         nick=bh.borg.cfgreadnicks(debug)
 
     # Autorité des opérations (1.0.142, AD-12) : avant tout appel borg. -n ALL écarte les nicks refusés (information) ;
@@ -27043,6 +28234,9 @@ def _cli_main():
         if '-j' not in options:   # 1.0.160 : notice de nettoyage, texte et CLI seulement
             _note=bh.cleanup_notice()
             if _note: printer(_note)
+        if _rc: sys.exit(_rc)
+    elif cmd=='storage':   # 1.0.208 (story 87a) : 1 si un nick est en erreur (dit par nick, les autres affichés)
+        _rc=bh.storage(nick if '-n' in options else 'ALL',debug=debug,as_json=('-j' in options))   # décision 5 : sans -n = ALL
         if _rc: sys.exit(_rc)
     elif cmd=='difftop':
         _depth=int(options.get('-p','3'))

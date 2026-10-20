@@ -454,6 +454,16 @@ state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('
 # rend 1 si un nick finit en erreur (champ `error`, ou `last_backup.error`) ou si un lecteur a dit une erreur SQLite réelle
 # (`[ERREUR]`) pendant l'appel, sinon 0 (avant : None) — la CLI en fait son code de sortie.
 code = bh.status('mon-serveur,autre', as_json=True)
+# 1.0.208 (story 87a) : commande Storage entière — dépôts regroupés par hôte de stockage, taille et croissance (texte sur stderr,
+# as_json=True : {borghelper_version, storages, errors} sur stdout) ; rend 1 si un nick est en erreur, sinon 0. Jamais borg ni ssh.
+# None ou 'ALL' : tous les nicks du rc.
+code = bh.storage('mon-serveur,autre', as_json=True)
+# Briques : bh.db.get_storage_measures('mon-serveur') -> ((unique_csize, updated_at) première, idem dernière, par date) ou (None,
+# None) — history.db lue sans création ni migration, vraie erreur SQLite levée ; bh.db.storage_unmigrated('mon-serveur') : mesures
+# d'avant 1.0.139 encore dans diff.db ; fonctions de module _storage_of(section_rc, nick, resolve) (étiquette, identité du dépôt ;
+# ValueError sans BORG_REPO, ou forme à identifiants ou borg 2 sans STORAGE), _LocalResolver(marker=…) (chemin réel, montage et raison d'un
+# dépôt local ; df borné, df bloqué noté dans le fichier `marker`),
+# _storage_aggregate(dépôts), _storage_merge(sorties -j) — voir TECHNICAL.md.
 # 1.0.186 : base seule (une ligne d'un Bkp tué compte « en cours » jusqu'au délai). Comme la commande Status et Report
 # (marqueur de Bkp, borg create orphelin) : bh._status_one('mon-serveur', bkp_live=True) (méthode interne, forme du JSON de
 # Status) -> bkp_running {started_at, en_attente, orphelin, sans_suivi (1.0.196)}, bkp_interrupted {started_at, verifie}, bkp_stale ; sans

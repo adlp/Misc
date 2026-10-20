@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.25.0 -->
+<!-- UI_VERSION: 1.26.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -93,6 +93,10 @@
   pre.stderr{color:#ffb4a8}
   .result-meta{display:flex;gap:10px;align-items:center;margin:10px 0}
   .hint{font-size:12px;color:var(--muted);margin-top:-6px;margin-bottom:10px}
+  /* UI 1.26.0 (story 87a) : bloc « Stockages » */
+  .storage-table td.num{text-align:right;white-space:nowrap}
+  .storage-table tr.storage-repo td{font-size:12px;color:var(--muted);border-top:none;padding-top:0}
+  .storage-table tr.storage-repo td:first-child{padding-left:22px;word-break:break-all}
   .spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--border);
     border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;
     vertical-align:middle;margin-right:6px}
@@ -136,6 +140,14 @@
 
   <!-- VIEW 2 : MACHINES LIST -->
   <section id="view-machines" hidden>
+    <!-- UI 1.26.0 (borgHelperWWW 1.33.0, story 87a) : stockages au-dessus de la liste des serveurs ; masqué si le serveur ne
+         connaît pas /storage -->
+    <div class="card" id="storageCard" hidden>
+      <h2 style="margin:0 0 10px">Stockages</h2>
+      <p class="hint">Dépôts regroupés par hôte de stockage : taille = dernières mesures des dépôts distincts, croissance depuis la première mesure (history.db, aucun accès au dépôt).</p>
+      <div id="storageError" class="error"></div>
+      <div id="storageList"></div>
+    </div>
     <div class="card">
       <div class="machine-head">
         <h2 style="margin:0">Serveurs</h2>
@@ -655,9 +667,60 @@ function badgeFor(depuisStr){
   return '<span class="badge ok">'+depuisStr+'</span>';
 }
 
+// ── Stockages (UI 1.26.0, borgHelperWWW 1.33.0, story 87a) ─────────────────────────────────────────────────────────
+// GET /storage : le serveur ne compte que les nicks que l'appelant peut lire (noms exposés en mode dossier : une seule vue
+// globale). Serveur sans /storage (404 de route, < 1.33.0) : bloc masqué. Réponse en code 1 (nick en erreur) : vue affichée,
+// erreurs dessous. Tailles en base 1000 (_fmtBytes), dates UTC de repo_stats affichées en jour.
+let storageLoadSeq=0;
+async function loadStorage(){
+  const seq=++storageLoadSeq;
+  const card=document.getElementById('storageCard');
+  const errEl=document.getElementById('storageError');
+  const listEl=document.getElementById('storageList');
+  errEl.textContent=''; listEl.innerHTML=SPINNER; card.hidden=false;
+  const r=await apiCall('GET','/storage',{},false);
+  if(seq!==storageLoadSeq) return;
+  if(r.httpStatus===401) return;
+  if(r.httpStatus===404 && r.detail==='Not Found'){ card.hidden=true; listEl.textContent=''; return; }
+  let d=null;
+  try{ d=JSON.parse(r.stdout||''); }catch(e){ d=null; }
+  if(!d || typeof d!=='object' || !Array.isArray(d.storages)){
+    errEl.textContent='Erreur : '+respError(r); listEl.textContent=''; return;
+  }
+  listEl.innerHTML=storageHtml(d);
+}
+function storageHtml(d){
+  const sz=v=>(typeof v==='number')?_fmtBytes(v):'—';
+  const sg=v=>(typeof v==='number')?(v<0?'':'+')+_fmtBytes(v):'—';
+  const day=v=>v?String(v).slice(0,10):'';
+  const errs=(d.errors && typeof d.errors==='object')?Object.entries(d.errors):[];
+  let h='';
+  if(!d.storages.length) h+='<p class="hint">Aucun dépôt.</p>';
+  else{
+    h+='<table class="storage-table"><tr><th>Stockage</th><th>Dépôts</th><th>Taille</th><th>Croissance</th><th>Par mois</th><th>Depuis</th></tr>';
+    d.storages.forEach(s=>{
+      const repos=Array.isArray(s.repos)?s.repos:[];
+      const since=s.first_at?`${escapeHtml(day(s.first_at))}${typeof s.days==='number'?` (${escapeHtml(Math.round(s.days))} j)`:''}`:'—';
+      h+=`<tr class="storage-row"><td><strong>${escapeHtml(s.storage)}</strong></td><td class="num">${repos.length}</td>`
+        +`<td class="num">${escapeHtml(sz(s.size))}</td><td class="num">${escapeHtml(s.size==null?'—':sg(s.growth))}</td>`
+        +`<td class="num">${escapeHtml(s.growth_per_month==null?'—':sg(s.growth_per_month)+'/mois')}</td><td>${since}</td></tr>`;
+      repos.forEach(rp=>{
+        const ns=Array.isArray(rp.nicks)?rp.nicks:[];
+        h+=`<tr class="storage-repo"><td colspan="2">${escapeHtml(rp.repo)} — ${ns.map(n=>escapeHtml(n)).join(', ')}</td>`
+          +`<td class="num">${escapeHtml(sz(rp.size))}</td>`
+          +`<td colspan="3">${rp.size==null?'aucune mesure':'mesurée le '+escapeHtml(day(rp.measured_at))}</td></tr>`;
+      });
+    });
+    h+='</table>';
+  }
+  if(errs.length) h+='<p class="error">'+errs.map(([n,e])=>'⚠ '+escapeHtml(n)+' : '+escapeHtml(e)).join('<br>')+'</p>';
+  return h;
+}
+
 let machinesLoadSeq=0;
 async function loadMachines(){
   const seq=++machinesLoadSeq;
+  loadStorage();   // UI 1.26.0 : bloc « Stockages », chargé à part (jamais attendu par la liste)
   const errEl=document.getElementById('machinesError');
   const listEl=document.getElementById('machinesList');
   const jumpEl=document.getElementById('machinesJump');

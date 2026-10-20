@@ -53,7 +53,7 @@ toute erreur d'arguments, getopt invalide et argument parasite compris — `usag
 borgHelperWWW : statut HTTP inchangé (tout code non nul hors 4 -> 400), corps avec `exitcode` 2 et le nouveau message ;
 /repohistory et /archivehistory multi-nicks ne sont plus mis en cache (code 2, `[ERREUR]`).
 
-Contrôles CodecSelfTest « aide : … » : table = `_CLI_OPTAB` + `_CLI_EARLY` (36 entrées, chacune une fois dans `-h`, dans le
+Contrôles CodecSelfTest « aide : … » : table = `_CLI_OPTAB` + `_CLI_EARLY` (37 entrées depuis 1.0.208, chacune une fois dans `-h`, dans le
 groupe d'un oracle fixe {commande -> groupe}, ⚡ exactement sur Prune, DelBkp, IdxPurge) ; options de chaque fiche = options
 de la commande hors `-C -c -d -P` (longues comprises), chacune affichée, blocs Syntaxe et Description égaux à la table ;
 2 à 4 exemples, chacun accepté par `_help_example_error` (getopt, `_cli_options`, `_cli_required` ou `_early_values_error`,
@@ -4404,6 +4404,111 @@ le multi-nick).
   HH:MM (XhYYmin) » pendant la fenêtre d'exécution, dernier backup + âge après coup ; idem avec un
   `Prune` réel — capture « Opération prioritaire en cours (Restore ou Prune) » pendant l'exécution,
   disparu après coup.
+
+## `Storage` — vue par hôte de stockage (`borgHelper` 1.0.208 / `borgHelperWWW` 1.33.0 / UI 1.26.0, story 87a)
+
+Lecture seule : `history.db` (`repo_stats`) et `df` pour un dépôt local ; jamais borg ni ssh (place libre et alertes :
+story 87b). Fonctions de module de `borgHelper` :
+
+- `_storage_of(cfg, nick, resolve)` -> `{storage, named, kind, repo, repo_id, warn}` pour une section rc. `kind` = accès au dépôt
+  (`ssh`, `tunnel`, `local`, `autre`) ; `storage` = étiquette, qui est aussi la clé de regroupement. `_secret_form` (liste
+  blanche, revue 4 row 53) : seules les formes strictes de borg 1 sont lues — `_STRICT_SSH` `ssh://[user@]hôte[:port]/chemin`
+  (utilisateur sans `@:/`, aucun autre `@`), `_STRICT_SCP` `[user@]hôte:chemin` (aucun autre `@`, ni `=`, ni `::`), chemin local
+  (sans « : » ou commençant par `/ . ~`), `file://` ; toute autre forme (`xxx://` hors `ssh://`, `s3:…@`, `rclone::…,secret=…`,
+  `ssh://u:p/w@h/r`, `u:mdp@h:/r`…) -> avec `STORAGE`, rangée sous ce nom (`kind` `autre`, `repo` = schéma seul `sch://…`,
+  `sch:…` ou `…`, identité = sha256 de l'URL dont le `…@` qui suit le schéma est retiré jusqu'au premier `@`, « / » compris, et,
+  pour `rclone:`, chaque paire `,clé=valeur`) ; sans, `ValueError` citant le schéma seul (jamais l'URL ni un secret). Schéma cité
+  pris d'une liste fixe (`_STORAGE_SCHEMES` : ssh, file, sftp, s3, b2, rclone, http, https, rest, socket, en minuscules), sinon
+  `…` (premier mot d'une clé d'accès, d'un utilisateur, row 61) ; caractère de contrôle dans `BORG_REPO` (valeur sur plusieurs
+  lignes : configparser y joint une ligne suivante indentée, `BORG_PASSPHRASE` compris) : `…`, avant tout autre test, chemin
+  local et `file://` compris (row 60). `BORG_REPO` absent : `ValueError`. Forme scp dont le chemin
+  commence par `//` (`u@h://r`) : chemin local (scp_path_re de borg 1). ssh (`_ssh_repo_host`) : `_storage_host_label(user, hôte,
+  port)` — minuscules, IPv6 entre crochets, port normalisé par `int` (`_port_norm` : 22 omis), hôte de cette machine (`_this_host` :
+  `_LOCAL_HOSTS`, `localhost*`, `ip6-*`, point final retiré, `ipaddress` — bouclage ou non spécifiée, forme courte par
+  `inet_aton`, IPv4 dans IPv6 —, nom et nom court ; fqdn seulement pour un nom à point, `_fqdn_bounded` : fil démon borné à 2 s,
+  mémorisé) -> `socket.gethostname()` ; utilisateur absent : son propre stockage (décision 2, rows 8 et 28 rejetées). Tunnel : hôte
+  du dépôt sur cette machine ET `_remfo_target(SSH_REMFO)` dont le port écouté = port du dépôt (absent : 22, comparés par `int`) ->
+  étiquette de la cible ; `SSH_REMFO` d'un autre port : dépôt ssh de cette machine ; illisible : « `tunnel non résolu (<nick>)` »,
+  identité `tunnel?|<nick>`. Local : `file://` retiré, `~` développé, `abspath` ; sans `{…}` : `resolve(chemin)` -> (chemin réel,
+  montage, raison) ; `warn` = raison.
+- `_LocalResolver(budget=30, per_path=10, marker)` (un par appel de `storage`, `marker` = `CACHE_DIR/<préfixe>-storage-df-bloque.json`) :
+  un enfant par chemin, `[sys.executable, -I, -c, _RESOLVE_PY, chemin, PID de borgHelper]` (mode isolé : ni `PYTHON*`, ni site
+  utilisateur, ni dossier courant dans le chemin d'import ; `cwd='/'`) dans sa propre session —
+  `prctl(PR_SET_PDEATHSIG, SIGKILL)` par ctypes puis sortie (code 4) si `getppid()` n'est plus ce PID, `realpath` écrit sur stdout
+  (fin NUL), ouverture `O_RDONLY|O_DIRECTORY|O_NOCTTY|O_NONBLOCK` (autofs ; absent ou pas un dossier — lien vers un périphérique,
+  fichier, fifo : jamais ouvert, row 64 — : code 3, aucun df), `fchdir` sur ce dossier (lecture refusée : `chdir`, qui n'ouvre
+  rien ; inaccessible : code 6, « dossier inaccessible »), `exec df --output=target -- .` (introuvable : code 5) ; environnement
+  de l'enfant : `PATH` et `LC_ALL=C` seuls (jamais une passphrase dans l'environ d'un df resté bloqué ; sous C, df ne remplace que
+  les caractères de contrôle). Sortie
+  lue au fil de l'eau (`select.poll`) jusqu'au NUL : chemin réel couvert par une clé expirée ou marquée -> enfant tué aussitôt
+  (état `hit`) ; puis jusqu'à la fin ou au délai = min(`per_path`, reste de l'échéance, comptée dès le premier chemin). Au délai
+  `killpg(SIGKILL)`, sortie relue 2 s au plus (chemin réel gardé), tube fermé, groupe retué en sortie d'exception. Délai réduit par
+  l'échéance (reste < `per_path`) ou reste < 0,2 s : `_STORAGE_LATE`, rien retenu. Délai plein : clé retenue pour l'appel — montage
+  du chemin réel (`_mount_table` : `/proc/self/mounts` avec le type, relu après un délai), ou le chemin réel même (montage `/` ou
+  autofs), ou le chemin écrit (chemin réel inconnu : realpath bloqué). Décision 7 : enfant encore vivant après sa mise à mort ->
+  `{clé: [pid, starttime]}` (champ 22 de `/proc/<pid>/stat`, lu juste après le `Popen`) ajouté à `marker`. Marques (`_load`,
+  `_update`) : `flock(LOCK_EX|LOCK_NB)` sur `<marker>.lock` (ouvert `O_NOFOLLOW`) autour de chaque lecture-modification-écriture,
+  réessayé 2 s au plus puis abandonné (marque non écrite ; verrou tenu ailleurs : jamais d'attente sans fin) ; lecture
+  `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, fichier régulier seulement, 64 Kio au plus (FIFO, lien, fichier énorme : aucune marque) ;
+  entrées filtrées (clé absolue dont `normpath` n'est pas `/` — `//`, `/./`, `/..` refusés —, `[pid > 1, starttime >= 0]`
+  entiers ; toute exception de lecture : aucune) ; écriture par `<marker>.<pid>.tmp` créé `O_EXCL|O_NOFOLLOW` 0600
+  puis `os.replace`, retiré sur échec ; marque non écrite : « `; marque non écrite (CACHE_DIR)` » ajouté à la raison. Vivante
+  (`_mark_alive`) = même PID ET même starttime (jamais la ligne de commande) ; `/proc` refusé (`PermissionError`) : gardée ;
+  starttime illisible (hidepid=2 : `/proc/<pid>` absent) : `os.kill(pid, 0)` — `EPERM` = vivant, gardée ; sinon retirée (fichier supprimé s'il est vide). Avant chaque chemin, clés retenues et marques cherchées
+  sur le chemin écrit (et, en cours de route, sur le chemin réel). Popen impossible, df introuvable, df en échec (code ≠ 0, sans
+  `--output`) : raison « `point de montage non lu (…)` ».
+- `repo_id` (identité d'un dépôt) : `<étiquette d'accès>|<chemin>` en ssh/tunnel — chemin par `_storage_repo_path`
+  (« / » doublés réduits d'abord ; `/./x`, `/~/x`, `~/x`, `./x` -> `x` relatif au dossier personnel, sa racine `/~`, `~`, `` ->
+  `.` ; `/~u/x` -> `~u/x` ; `posixpath.normpath`) ; `local|<chemin réel>`. Tiré de l'accès, jamais de `STORAGE`.
+- `BorgHelperDB.get_storage_measures(nick)` -> (première, dernière) `(unique_csize, updated_at)` par `updated_at`, `id` en
+  départage (une ligne recopiée tard par la migration a un id plus grand qu'une mesure plus récente ; `get_repo_stats` lit
+  encore par id : report différé) ; `history.db` ouverte par son chemin (`_open_db(role='read')` : jamais créée, jamais migrée),
+  délai de verrou 2 s ; table/base absente : `(None, None)` ; autre `sqlite3.Error` : levée. `storage_unmigrated(nick)` : la
+  `diff.db` porte encore `repo_stats` (mesures d'avant 1.0.139) ; illisible : `sqlite3.Error` levée.
+- `_storage_aggregate(repos)` : entrées par dépôt -> stockages triés. Même `repo_id` : nicks réunis, dernière mesure de plus grand
+  `measured_at`, première de plus petit `first_at`, nom `STORAGE` préféré (`named` du dépôt ; le plus petit s'il y en a plusieurs),
+  sinon étiquette résolue préférée à « `local ? (…)` », écriture `repo` la plus petite. Stockage : `size` = somme des dernières
+  tailles des dépôts mesurés, `growth` = `size` − somme des premières, `first_at`/`last_at` = min/max, `days` (2 décimales),
+  `growth_per_month` = `round(Σ croissance_dépôt / (durée_dépôt / 30.4375))` sur les dépôts dont la durée atteint un jour, sinon
+  `null`. `_storage_merge` (sorties de plusieurs rc, `named` lu sur chaque dépôt) redonne la vue d'un seul appel.
+- `BorgHelper.storage(nick, as_json)` (la CLI lui passe `-n ALL` tel quel, sans le développer avant : son contrôle du rc vient
+  d'abord, row 62) : rc illisible (ouvert et lu par configparser d'abord) -> seule erreur `*` (« `Fichier <rc>
+  absent` », sinon `_storage_err` : erreur configparser -> son type et sa clé seuls, `ParsingError`, `DuplicateOptionError (clé
+  X)`, jamais la ligne, la valeur ni le chemin ; `OSError` -> type et `strerror`), code 1 ; erreur configparser d'une section :
+  idem. Deux passes : stockage de chaque nick (tous les
+  dépôts locaux résolus avant toute lecture de base), puis mesures. `None`/`ALL` -> nicks du rc (la CLI passe `ALL` sans `-n`,
+  décision 5) ; nick hors
+  `cfgreadnicks` (`DEFAULT`, `_…`) : « nick inconnu du rc » ; rc illisible, `BORG_REPO` absent ou borg 2 sans `STORAGE` : erreur,
+  nick non placé ; `warn` : erreur, nick placé ; erreur SQLite de `history.db`, puis de `diff.db` (« diff.db illisible ») : erreur,
+  nick placé sans mesure — base en erreur retenue par chemin pour l'appel (une base partagée par `DB_NAME` n'est attendue qu'une
+  fois) ; mesures d'avant 1.0.139 : erreur qui nomme la commande qui les migre. Sortie passée par `_bsr` (chaînes non UTF-8 :
+  `backslashreplace`). Rend 1 s'il y a une erreur. Texte : `printer` (stderr), `_storage_text`.
+
+borgHelperWWW : `GET /storage` (`_ROUTE_LEVELS` 1, absent de `_ROUTE_NICK_DEFAULT`, écarté en tête de `_check_group_access` :
+un `?nick=` éventuel est ignoré, jamais un 403 qui le nommerait ; la route filtre seule) — `_storage_nicks` -> (nicks lisibles, erreurs) : `_effective_level >= 1` sur le rc du nick ; décision 6 :
+droits illisibles (exception de `_cfgread`/`_effective_level`) -> nick omis, ni compté ni nommé, `errors['*']` =
+`_STORAGE_RIGHTS_MSG` (générique), nick et exception au journal (`[WARN] /storage : …`, chemins de rc retirés ; texte de
+`_storage_err` — erreur de configparser : type, clé et « (ligne N) » seuls, jamais la ligne brute du rc, row 62) ; nom hors
+`_valid_nick_name` (section `[ALL]`, `all` compris ; nick nu en mode dossier) écarté avant tout filtrage — jamais un `-n ALL`
+lancé, qui développerait tout le rc (row 63) ; rc illisible :
+`_STORAGE_RC_MSG` sous `'*'` (mode `-C` : `CFGFILE` ouvert d'abord — absent ou refusé —, ou `_nick_list` qui lève ; garde AST
+de `_dm_source_guard` : toute lecture de `CFGFILE` dans `_storage_nicks` sous un `if not DIR_MODE:`, row 65) ; mode
+dossier : `_rc_bare_nicks` note l'échec dans l'instantané de la requête (`nicks_err`, une seule lecture des nicks d'un rc), et
+chaque préfixe de `_rc_state().unavailable` (rc listé par le maître mais absent ou refusé) est dit de même ->
+`'<préfixe>:*'` sans autorisation par groupes, sinon
+`_STORAGE_RIGHTS_MSG` sous `'*'` (jamais le nom d'un rc). Avis sur une même clé réunis (« `a ; b` »), jamais écrasés.
+Puis un `_exec_borghelper('storage', nicks du rc, ['-j'])` par rc : `HTTPException` (délai 504, `_rc_launch_check` 503, préfixe
+disparu 404), `OSError` ou sortie non JSON -> `errors['<préfixe>:*']` (`'*'` en `-C`), les autres rc gardés ; vues réunies par
+`_storage_merge`, erreurs ajoutées ; code = le pire, 1 dès qu'une erreur est dite (HTTP 400, corps complet). Jamais en cache.
+Mode dossier : chaque rc par `_exec_dir` ; `_expose_json('storage')` expose `nicks` (stockages et dépôts), les clés d'`errors` (`'*'`
+d'un rc illisible pour son borgHelper -> `'<préfixe>:*'` ; conseils
+« `borgHelper -c` » réécrits « `borgHelper -C <rc préfixe> -c` », nick nu gardé), et l'étiquette « `tunnel non résolu (<nick>)` » et l'identité `tunnel?|<nick>|…` (deux rc au même nick nu jamais réunis).
+UI : `loadStorage` (appelée au début de `loadMachines`, non attendue, numéro de chargement contre les réponses dépassées),
+`storageHtml` (`escapeHtml` partout, erreurs par nick et par rc dessous) ; 404 de route (`detail: "Not Found"`, serveur < 1.33.0) :
+bloc masqué ; code 1 (HTTP 400) : vue et erreurs affichées.
+
+Vérifié : CodecSelfTest (15 contrôles « Storage »), push selftest (`/storage` modes `-C` et dossier, vue comparée aux sorties
+CLI de chaque rc), test UI.
 
 ## `push.db` — clés VAPID et abonnements push (`borgHelperWWW` 1.17.0 Story 2a / 1.18.0 Story 2b de `spec-notifications-push`)
 

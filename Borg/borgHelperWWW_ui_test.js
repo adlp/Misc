@@ -876,7 +876,7 @@ async ${grab('runBrowseSearch')}
       const document={getElementById:id=>odom.byId(id)};
       ${grabLine('SPINNER')}
       let myAccess=null, http10=false, machinesLoadSeq=0, historyLoadSeq=0, machineCardLabels={};
-      const applyBadges=()=>{}, renderCleanupNotice=()=>{};
+      const applyBadges=()=>{}, renderCleanupNotice=()=>{}, loadStorage=()=>{};   // UI 1.26.0 : bloc Stockages, testé à part
       const apiCall=async()=>hooks.resp;
 ${grab('escapeHtml')}
 ${grab('respError')}
@@ -1033,6 +1033,7 @@ async ${grab('downloadViaFetch')}
     const loadMyAccess=async()=>{ myAccess=h.access; return h.access; };
     const apiCall=async(m,p,params)=>{ h.sent.push(params.nick); return h.report(params); };
     const getPassphrases=()=>h.passes, getPassphrase=()=>'', loadHistoryInline=n=>h.hist.push(n), updateNotifAll=()=>{};
+    const loadStorage=()=>{ h.storage=(h.storage||0)+1; };   // UI 1.26.0 (story 87a) : bloc Stockages, testé à part
     const openMachine=n=>h.opened.push(n), openHistory=n=>h.opened.push('hist '+n), openBrowse=()=>{}, runBackupNow=n=>h.opened.push('bkp '+n);
     ${['escapeHtml','escapeAttr','respError','opAllowed','stateBadges','badgeFor','dbEncryptCmd','plainDbBadge','machineCardHtml',
        'rcOrder','nickGroups','rcGroupLabel','rcCollapsed','rcCollapsedSave','setRcCollapsed','rcGroupHtml','showRcGroup','setRcGroupCollapsed',
@@ -1174,6 +1175,86 @@ async ${grab('downloadViaFetch')}
        [ng(['a','b'],undefined),ng(['m:b','w:z','w:a','q:c','m:a'],['w','m','w']).map(g=>g.prefix+'='+g.items.map(i=>i.bare).join(','))],
        [null,['w=a,z','m=a,b','q=c']]);
   }catch(e){ eq('mode dossier (story 86b) : rendu sans exception',String(e&&e.stack||e),''); }   // exception = FAIL, jamais un plantage du test
+  // UI 1.26.0 (borgHelperWWW 1.33.0, story 87a) : bloc « Stockages » au-dessus de la liste des serveurs — GET /storage (le serveur
+  // ne compte que les nicks lisibles), une ligne par stockage et une par dépôt, erreurs par nick, échappement ; 404 de route : masqué.
+  try{
+    const vm=src.indexOf('<section id="view-machines"'), sc=src.indexOf('id="storageCard"'), sv=src.indexOf('<h2 style="margin:0">Serveurs</h2>');
+    eq('Stockages : bloc dans la vue des serveurs, au-dessus de la liste (masqué au départ)',
+       [vm>0 && vm<sc && sc<sv,/<div class="card" id="storageCard" hidden>/.test(src)],[true,true]);
+    const sh=new Function(grab('escapeHtml')+'\n'+grab('escapeAttr')+'\n'+grab('_fmtBytes')+'\n'+grab('storageHtml')+'\nreturn storageHtml;')();
+    const text=h=>h.replace(/<br>/g,' | ').replace(/<\/tr>/g,' ¶ ').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+    const D={borghelper_version:'1.0.208',errors:{'web:x':'BORG_REPO absent du rc'},storages:[
+      {storage:'backup@nas',nicks:['web:a','web:b','mail:c'],size:1440,growth:340,growth_per_month:115,first_at:'2026-01-01 00:00:00',
+       last_at:'2026-04-01 00:00:00',days:90,repos:[
+        {repo:'backup@nas:/r2',nicks:['mail:c'],size:1300,measured_at:'2026-04-01 00:00:00'},
+        {repo:'backup@nas:r1',nicks:['web:a','web:b'],size:140,measured_at:'2026-03-02 00:00:00'},
+        {repo:'backup@nas:/r3',nicks:['web:n'],size:null,measured_at:null}]},
+      {storage:'local /srv',nicks:['l'],size:5000,growth:-50,growth_per_month:null,first_at:'2026-05-01 00:00:00',days:0.5,
+       repos:[{repo:'/srv/borg/l',nicks:['l'],size:5000,measured_at:'2026-05-01 00:00:00'}]},
+      {storage:'baie1',nicks:['g'],size:null,growth:null,growth_per_month:null,first_at:null,days:null,
+       repos:[{repo:'u@h:/r',nicks:['g'],size:null,measured_at:null}]}]};
+    const h1=sh(D);
+    eq('Stockages : une ligne par stockage (dépôts, taille, croissance, par mois, depuis) et une par dépôt (nicks, taille, mesure)',
+       text(h1).split(' ¶ ').map(x=>x.trim()).filter(Boolean),
+       ['Stockage Dépôts Taille Croissance Par mois Depuis',
+        'backup@nas 3 1.44 KB +340.00 B +115.00 B/mois 2026-01-01 (90 j)',
+        'backup@nas:/r2 — mail:c 1.30 KB mesurée le 2026-04-01',
+        'backup@nas:r1 — web:a, web:b 140.00 B mesurée le 2026-03-02',
+        'backup@nas:/r3 — web:n — aucune mesure',
+        'local /srv 1 5.00 KB -50.00 B — 2026-05-01 (1 j)',
+        '/srv/borg/l — l 5.00 KB mesurée le 2026-05-01',
+        'baie1 1 — — — —',
+        'u@h:/r — g — aucune mesure',
+        '⚠ web:x : BORG_REPO absent du rc']);
+    eq('Stockages : aucun dépôt -> « Aucun dépôt. », sans tableau ni erreur',[sh({storages:[],errors:{}})],['<p class="hint">Aucun dépôt.</p>']);
+    const HX=`<b>&"'`, eX='&lt;b&gt;&amp;&quot;&#39;';
+    // dates hostiles de moins de 10 caractères : jamais tronquées par l'affichage du jour (revue 87a, row 10)
+    const h2=sh({storages:[{storage:'s'+HX,size:1,growth:0,growth_per_month:null,first_at:HX,days:1,
+                            repos:[{repo:'r'+HX,nicks:['n'+HX],size:1,measured_at:HX}]}],errors:{['e'+HX]:'m'+HX}});
+    eq('Stockages : noms hostiles échappés partout (stockage, dépôt, nick, dates, erreur), jamais bruts',
+       [/<b>|&"|"'/.test(h2.replace(/<\/?(table|tr|th|td|strong|p)[^>]*>|<br>/g,'')),['s','r','n','e','m'].every(c=>h2.includes(c+eX)),
+        h2.includes('<td>'+eX+' (1 j)</td>'),h2.includes('mesurée le '+eX+'</td>')],[false,true,true,true]);
+    // loadStorage : vraie fonction, DOM et API simulés
+    // élément fidèle : textContent remplace tout le contenu (innerHTML compris), comme un navigateur
+    const sdom={els:{},byId(id){ return this.els[id]||(this.els[id]={id,hidden:true,_t:'',_h:'',
+      get textContent(){ return this._t; }, set textContent(v){ this._t=String(v); this._h=String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;'); },
+      get innerHTML(){ return this._h; }, set innerHTML(v){ this._h=String(v); this._t=String(v).replace(/<[^>]*>/g,''); }}); }};
+    const shk={calls:[],resp:null,defer:null};
+    const ls=new Function('sdom','hooks',`
+      const document={getElementById:id=>sdom.byId(id)};
+      ${grabLine('SPINNER')}
+      const apiCall=async(m,p,q)=>{ hooks.calls.push([m,p,JSON.stringify(q)]); const d=hooks.defer; if(d){ hooks.defer=null; return await d; } return hooks.resp; };
+${grab('escapeHtml')}
+${grab('escapeAttr')}
+${grab('respError')}
+${grab('_fmtBytes')}
+${grab('storageHtml')}
+      let storageLoadSeq=0;
+async ${grab('loadStorage')}
+      return loadStorage;`)(sdom,shk);
+    const st=()=>[sdom.byId('storageCard').hidden,sdom.byId('storageError').textContent,sdom.byId('storageList').innerHTML];
+    shk.resp={httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify(D)}; await ls();
+    const a=st();
+    eq('loadStorage : GET /storage sans paramètre ; bloc affiché, tableau rendu, aucune erreur',
+       [shk.calls,a[0],a[1],a[2]===sh(D)],[[['GET','/storage','{}']],false,'',true]);
+    shk.resp={httpStatus:400,exitcode:1,stderr:'',stdout:JSON.stringify(D)}; await ls();
+    eq('loadStorage : code 1 (nick en erreur, HTTP 400) -> vue affichée avec ses erreurs',[st()[0],st()[1],st()[2]===sh(D)],[false,'',true]);
+    shk.resp={httpStatus:404,detail:'Not Found'}; await ls();
+    eq('loadStorage : serveur sans /storage (404 de route) -> bloc masqué',[st()[0],st()[2]],[true,'']);
+    shk.resp={httpStatus:404,detail:'Nick inconnu : web:x'}; await ls();
+    eq('loadStorage : autre 404 (detail du serveur) -> erreur dite, bloc affiché',[st()[0],st()[1],st()[2]],[false,'Erreur : Nick inconnu : web:x','']);
+    shk.resp={httpStatus:403,detail:DETAIL403}; await ls();
+    eq('loadStorage : 403 -> « Erreur : <detail> », liste vide',[st()[1],st()[2]],['Erreur : '+DETAIL403,'']);
+    shk.resp={httpStatus:200,exitcode:0,stderr:'',stdout:'pas du json'}; await ls();
+    eq('loadStorage : stdout illisible -> erreur, jamais « undefined »',[/^Erreur : /.test(st()[1]),/undefined/.test(st()[1]),st()[2]],[true,false,'']);
+    // réponse d'un chargement dépassé par un plus récent : ignorée
+    let release; shk.defer=new Promise(r=>{ release=r; });
+    const p1=ls(); shk.resp={httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({storages:[],errors:{}})}; await ls();
+    release({httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify(D)}); await p1;
+    eq('loadStorage : réponse d\'un chargement dépassé ignorée (le plus récent reste affiché)',st()[2],'<p class="hint">Aucun dépôt.</p>');
+    const c87=await runList(src,cFix);
+    eq('loadMachines lance loadStorage une fois par chargement de la liste',c87.h.storage,1);
+  }catch(e){ eq('Stockages (story 87a) : rendu sans exception',String(e&&e.stack||e),''); }
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();

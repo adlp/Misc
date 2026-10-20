@@ -71,17 +71,18 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
                          _DIFF_ADDED_TYPES, _DIFF_REMOVED_TYPES, _enc_header_read, sentry_alert, _bkp_status_timeout,
                          _sentry_alert_kinds, db_plain_anomalies, _cfg_bool, convert_octets_readable,
-                         op_allowed, allowed_ops, is_external, command_op, _rb_errmsg, _valid_nick_name, _mei_mapped, _purge_mei_dirs,   # command_op : 1.32.0 (row 26)
+                         op_allowed, allowed_ops, is_external, command_op, _rb_errmsg, _valid_nick_name, _storage_err, _mei_mapped, _purge_mei_dirs,   # command_op : 1.32.0 (row 26)
                          _group_pids, _group_alive, _group_wait,   # 1.31.2 : communs à borgHelper (zombies exclus, /proc illisible)
                          RK_CLOSED, RK_ABSENT, RK_ALIVE, RK_ORPHAN, RK_BADEND, RK_NOTCLOSED,   # 1.31.8 : états de BkpReconcile
                          RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE, RK_NOPASS,   # 1.31.15 : passphrase absente (story 77)
                          _ORPHAN_TXT,   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
-                         _MIGR_PENDING_TXT)   # 1.31.16 : mesures d'avant 1.0.139 pas encore migrées (_never_cache), borgHelper 1.0.201
+                         _MIGR_PENDING_TXT,   # 1.31.16 : mesures d'avant 1.0.139 pas encore migrées (_never_cache), borgHelper 1.0.201
+                         _storage_merge)   # 1.33.0 (story 87a) : /storage multi-rc (mode dossier) — dépôts réunis, compté une fois
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.32.1"
+WWW_VERSION="1.33.0"
 # Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
 # nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
 # selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
@@ -723,7 +724,9 @@ def _rc_bare_nicks(e):
     r=_RC_REQ.get()
     if r is not None and e.prefix in r['nicks']: return r['nicks'][e.prefix]
     try: v=[n.strip() for n in (e.bh.borg.cfgreadnicks() or '').split(',') if n.strip()]
-    except (OSError,UnicodeDecodeError,configparser.Error): v=[]
+    except (OSError,UnicodeDecodeError,configparser.Error) as x:
+        v=[]
+        if r is not None: r.setdefault('nicks_err',{})[e.prefix]=x   # 1.33.0 (revue 87a row 49) : /storage le dit, une seule lecture
     if r is not None: r['nicks'][e.prefix]=v
     return v
 
@@ -1523,6 +1526,7 @@ _ROUTE_LEVELS={
     '/stats':1,'/lstbkp':1,'/lstbkpfls':1,'/report':1,'/diffbkp':1,'/search':1,'/filehist':1,
     '/treehist':1,'/treefind':1,'/duidx':1,'/cacheinfo':1,'/idxtop':1,'/difftop':1,
     '/repohistory':1,'/archivehistory':1,
+    '/storage':1,   # 1.33.0 (story 87a) : sans `nick` — la route ne compte que les nicks que l'appelant peut lire (_storage_nicks)
     '/restore/perms':1,'/download/file':1,'/download/tar':1,
     '/bkp':2,'/index':2,'/restore':2,'/cacheclean':2,
     '/prune':3,'/delbkp':3,'/idxpurge':3,'/init':3,'/key':3,
@@ -1807,6 +1811,9 @@ def _check_group_access(request: Request):
     if API_PREFIX and path.startswith(API_PREFIX): path=path[len(API_PREFIX):]
 
     if path=='/access': return  # consulter ses propres droits ne requiert aucun droit particulier
+    # 1.33.0 (revue 87a row 56) : /storage filtre lui-même les nicks lisibles (_storage_nicks) ; un `nick` en paramètre est ignoré
+    # par la route — jamais un 403 qui nommerait un nick sans droit
+    if path=='/storage': return
 
     user_groups=_parse_groups(request.headers.get(GROUPS_HEADER))
 
@@ -3089,8 +3096,27 @@ def _expose_row(r,k,mp):
 def _expose_json(cmd,data,mp):
     """Nicks NUS d'une sortie JSON de borgHelper -> noms exposés (`mp` {nu: exposé}, nicks de CE rc dans la requête) : clés des
     lecteurs multi-nicks (_NICK_KEYED_CMDS) ; champ `nick` (objet, ou liste d'objets) ; Report : clés de summary et backups, `nom`
-    d'une ligne de résumé (« *** » gardé), `bkp_voisin.nick`, champ au nom du nick d'une ligne d'archive. Rien d'autre (chemins,
-    archives)."""
+    d'une ligne de résumé (« *** » gardé), `bkp_voisin.nick`, champ au nom du nick d'une ligne d'archive ; Storage (1.33.0) : `nicks`
+    des stockages et de leurs dépôts, clés de `errors`. Rien d'autre (chemins, archives)."""
+    if cmd=='storage' and isinstance(data,dict):
+        ex=lambda ns: sorted(mp.get(n,n) for n in ns) if isinstance(ns,list) else ns
+        def tun(s_):   # revue 87a (row 22) : « tunnel non résolu (<nick nu>) » -> nom exposé (jamais deux rc réunis)
+            m_=re.fullmatch(r'tunnel non résolu \((.*)\)',s_) if isinstance(s_,str) else None
+            return f"tunnel non résolu ({mp[m_.group(1)]})" if m_ and m_.group(1) in mp else s_
+        def rid(r_):
+            p_=r_.split('|',2) if isinstance(r_,str) else []
+            return '|'.join([p_[0],mp[p_[1]],*p_[2:]]) if len(p_)>=2 and p_[0]=='tunnel?' and p_[1] in mp else r_
+        st=[dict(s,storage=tun(s.get('storage')),nicks=ex(s.get('nicks')),
+                 repos=[dict(r,nicks=ex(r.get('nicks')),repo_id=rid(r.get('repo_id'))) if isinstance(r,dict) else r for r in (s.get('repos') or [])])
+            if isinstance(s,dict) else s for s in (data.get('storages') or [])]
+        er=data.get('errors')
+        pfx=next((v.partition(':')[0] for v in mp.values() if ':' in v),None)
+        if isinstance(er,dict) and pfx and '*' in er:   # row 54 : erreur du rc entier -> « <préfixe>:* » (jamais écrasée à la fusion)
+            er={(f"{pfx}:*" if k=='*' else k):v for k,v in er.items()}
+        def hint(k,v):   # revue 87a (row 50) : « borgHelper -c Status -n <nu> » -> -C du rc du nick, comme _rc_scrub
+            if not (isinstance(v,str) and k in mp and ':' in mp[k]): return v
+            return v.replace('borgHelper -c ',f"borgHelper -C <rc {mp[k].partition(':')[0]}> -c ")
+        return dict(data,storages=st,errors={mp.get(k,k):hint(k,v) for k,v in er.items()} if isinstance(er,dict) else er)
     if isinstance(data,list):
         return [dict(x,nick=mp[x['nick']]) if isinstance(x,dict) and isinstance(x.get('nick'),str) and x['nick'] in mp else x
                 for x in data]
@@ -4734,6 +4760,84 @@ def archivehistory(nick: str, x_api_key: Optional[str]=Header(default=None)):
     même patron que /repohistory ci-dessus."""
     require_api_key(x_api_key)
     return run_borghelper('archivehistory',nick=nick,extra_args=['-j'],cacheable=True)
+
+_STORAGE_RIGHTS_MSG="droits illisibles : un ou plusieurs nicks omis (détail : journal du serveur)"
+_STORAGE_RC_MSG="fichier de conf illisible (détail : journal du serveur)"
+
+def _storage_nicks(request):
+    """1.33.0 (story 87a) : nicks comptés par /storage -> (nicks, erreurs) — tous (ALL : ceux du rc ; mode dossier : nicks exposés de
+    chaque rc) sans autorisation par groupes ; avec : ceux que l'appelant peut LIRE (niveau >= lecture, accès direct par périmètre
+    compris), jamais un autre (ni compté ni nommé). Décision 6 (revue 87a rows 18, 49) : droits d'un nick illisibles (rc illisible,
+    GROUPS_PATHS devenu ambigu : _effective_level lève) -> nick omis, ni compté ni nommé ; une seule erreur générique
+    `errors['*']` (_STORAGE_RIGHTS_MSG), le détail (nick, exception) au journal du serveur seulement. Rc illisible (row 35) : mode -C
+    -> `errors['*']` (_STORAGE_RC_MSG) ; mode dossier -> `errors['<préfixe>:*']` sans autorisation par groupes, sinon l'erreur
+    générique de décision 6 (jamais le nom d'un rc à un appelant). Nicks d'un rc lus une fois par requête (_rc_bare_nicks)."""
+    errs={}
+    def log(what,x):   # revue 87a (row 62) : type (+ clé) et numéro de ligne seuls d'une erreur de configparser, jamais la ligne brute du rc
+        ln=getattr(x,'lineno',None)
+        if ln is None and isinstance(x,configparser.ParsingError) and x.errors: ln=x.errors[0][0]
+        t=_storage_err(x)+(f" (ligne {ln})" if isinstance(x,configparser.Error) and ln else '')
+        print(f"[WARN] /storage : {what} — {_rc_scrub_all(t)}",file=sys.stderr,flush=True)
+    if not DIR_MODE:   # row 55 : rc illisible (droits) -> erreur, jamais une vue vide en code 0 (cfgreadnicks avale l'OSError)
+        try:
+            with open(CFGFILE,'rb'): pass
+        except (OSError,TypeError) as x: log("rc illisible",x); return [],{'*':_STORAGE_RC_MSG}
+    try: nicks=_nick_list('ALL')
+    except Exception as x: log("rc illisible",x); return [],{'*':_STORAGE_RC_MSG}
+    # row 63 : nom hors règle de nick (section [ALL] comprise) écarté avant tout filtrage — jamais un `-n ALL` lancé
+    nicks=[n for n in nicks if _valid_nick_name(n.partition(':')[2] if DIR_MODE else n)]
+    if DIR_MODE:
+        bad_rc=dict(((_RC_REQ.get() or {}).get('nicks_err') or {}))
+        for p_ in _rc_state().unavailable:   # row 55 : rc écarté au rechargement (illisible, disparu) : dit de même
+            bad_rc.setdefault(p_,RuntimeError('rc indisponible'))
+        for p_,x in sorted(bad_rc.items()):
+            log(f"rc du préfixe {p_} illisible",x)
+            if GROUPS_HEADER: errs['*']=_STORAGE_RIGHTS_MSG
+            else: errs[f"{p_}:*"]=_STORAGE_RC_MSG
+    if not GROUPS_HEADER: return nicks,errs
+    ug=_parse_groups(request.headers.get(GROUPS_HEADER)); keep=[]
+    for n in nicks:
+        try:
+            cfg=_cfgread(n)
+            if cfg is not None and _effective_level(ug,cfg)>=1: keep.append(n)
+        except Exception as x: log(f"droits illisibles pour {n}, nick omis",x); errs['*']=_STORAGE_RIGHTS_MSG
+    return keep,errs
+
+@router.get("/storage",response_model=CommandResult,tags=["lecture"],
+            summary="Stockages : dépôts regroupés par hôte (user@hôte[:port], cible de tunnel, montage local, STORAGE), taille et croissance — sans borg")
+def storage(request: Request, x_api_key: Optional[str]=Header(default=None)):
+    """1.33.0 (story 87a) : `borgHelper -c Storage -j` sur les nicks que l'appelant peut lire (_storage_nicks) — un borgHelper par
+    rc (mode dossier ; -C : un seul), vues réunies (_storage_merge : même dépôt compté une fois), noms exposés. Revue 87a (row 3) :
+    rc en échec (délai, refus de lancement, préfixe disparu, sortie non JSON) -> `errors['<préfixe>:*']` (mode -C : `errors['*']`),
+    vue des autres rc gardée. Code : le pire des rc, 1 dès qu'une erreur est dite. Aucun nick lisible : vue vide (ses erreurs),
+    rien lancé. Jamais en cache (rc, montages : état hors des bases). Lecture seule (history.db, df), jamais borg ni ssh."""
+    require_api_key(x_api_key)
+    nicks,errs=_storage_nicks(request)
+    def add(k,m): errs[k]=m if k not in errs else errs[k] if m in errs[k] else f"{errs[k]} ; {m}"   # row 49 : jamais un avis écrasé
+    groups={}
+    for n in nicks: groups.setdefault(n.partition(':')[0] if DIR_MODE else '',[]).append(n)
+    parts=[]; code=0; err=''
+    for p,ns in groups.items():
+        key=f"{p}:*" if p else '*'
+        try: r=_exec_borghelper('storage',','.join(ns),['-j'])
+        except HTTPException as x:
+            add(key,_rc_scrub_all(f"HTTP {x.status_code} : {x.detail}")); continue
+        except OSError as x:   # revue 87a (row 35) : lancement impossible -> erreur de ce rc, jamais une 500
+            add(key,_rc_scrub_all(f"lancement impossible ({type(x).__name__} : {x})")); continue
+        try: d=json.loads(r.stdout or '')
+        except ValueError: d=None
+        err+=r.stderr or ''
+        if not isinstance(d,dict) or not isinstance(d.get('storages'),list):
+            last=[l for l in (r.stderr or r.stdout or '').strip().splitlines() if l.strip()][-1:]
+            add(key,_rc_scrub_all(f"code {r.exitcode}, réponse illisible"+(f" : {last[0][:300]}" if last else '')))
+            code=max(code,r.exitcode if isinstance(r.exitcode,int) and r.exitcode>0 else 1); continue
+        parts.append(d); code=max(code,r.exitcode)
+    out=_storage_merge(parts)
+    for k,m in errs.items(): out['errors'][k]=f"{out['errors'][k]} ; {m}" if k in out['errors'] else m
+    out['borghelper_version']=out['borghelper_version'] or BORGHELPER_VERSION
+    if out['errors']: code=max(code,1)
+    return JSONResponse(status_code=_http_status(code),content={'exitcode':code,'stdout':json.dumps(out,ensure_ascii=False,indent=2),
+                                                               'stderr':err})
 
 @router.post("/cacheclean",response_model=CommandResult,tags=["mutation"])
 def cacheclean(nick: str="ALL", x_api_key: Optional[str]=Header(default=None)):
@@ -8460,6 +8564,126 @@ def push_selftest():
             return not bad and set(got)==set(_ROUTE_NICK_DEFAULT)
         check("correctif de sécurité (modes -C et dossier) : route à nick par défaut sans `nick`, groupe sans droit -> 403 sans rien lancer ; "
               "avec droit : inchangé (1.32.0)",_dm_nick_default)
+        def _storage_route():
+            """1.33.0 (story 87a, mode -C) : GET /storage — borgHelper réel (lecture seule) lancé sur les nicks que l'appelant peut LIRE
+            seulement : un autre nick ni compté ni nommé (ni son dépôt) ; aucun nick lisible : vue vide, rien lancé ; groupes inactifs :
+            tous les nicks du rc. Niveau par nick simulé (groupe « lit-<nick> »)."""
+            from fastapi.testclient import TestClient as _T
+            c=_T(app,raise_server_exceptions=False); ns=_nick_list('ALL')
+            if len(ns)<2: print(f"  {CFGFILE} : deux nicks au moins attendus (bac à sable lk)"); return False
+            n1,n2=ns[0],ns[1]; seen=[]; real=_exec_borghelper
+            def spy(cmd,nick,extra,passphrase=None): seen.append([cmd,nick,list(extra)]); return real(cmd,nick,extra,passphrase)
+            def get(groups):
+                r=c.get(API_PREFIX+'/storage',headers={'X-API-Key':API_KEY,'X-Groups':groups}); b=r.json()
+                try: d=json.loads(b.get('stdout') or '')
+                except ValueError: d=None
+                return r.status_code,b,d
+            names=lambda d: sorted({n for s in d['storages'] for r in s['repos'] for n in r['nicks']}|set(d['errors']))
+            log=io.StringIO()
+            with mock.patch(f"{__name__}._exec_borghelper",spy), contextlib.redirect_stderr(log):
+                with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), \
+                     mock.patch(f"{__name__}._effective_level",lambda g,cf: 1 if 'lit-'+cf.name in g else 0):
+                    a=get('lit-'+n1); k=len(seen); b=get('aucun'); kb=len(seen)-k
+                with mock.patch(f"{__name__}.GROUPS_HEADER",None): z=get('')
+                zs=seen[-1:]
+                def lvl_boom(g,cf):
+                    if cf.name==n2: raise ValueError('GROUPS_PATHS ambigu (simulé) : grp-secret:/chemin-secret')
+                    return 1 if 'lit-'+cf.name in g else 0
+                ky=len(seen)
+                with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), mock.patch(f"{__name__}._effective_level",lvl_boom):
+                    # décision 6 (revue 87a row 18) : droits illisibles -> nick omis, ni compté ni nommé ; erreur générique seule
+                    y=get('aucun'); ky=len(seen)-ky; y1=get('lit-'+n1)
+            lgr=io.StringIO()
+            with mock.patch(f"{__name__}.GROUPS_HEADER",None), contextlib.redirect_stderr(lgr):
+                def to(*a,**k): raise HTTPException(504,detail='Commande storage : timeout après 1s')
+                with mock.patch(f"{__name__}._exec_borghelper",to): t=get('')   # row 3 : rc en échec -> errors['*']
+                with mock.patch(f"{__name__}._exec_borghelper",lambda *a,**k: CommandResult(exitcode=1,stdout='Traceback x',stderr='boom')):
+                    u=get('')
+                def oserr(*a,**k): raise OSError('fork impossible (simulé)')
+                with mock.patch(f"{__name__}._exec_borghelper",oserr): o=get('')   # row 35 : OSError -> errors['*']
+                def rc_bad(*a,**k):   # row 62 : ligne brute du rc (secret) jamais au journal — type et numéro de ligne seuls
+                    e_=configparser.ParsingError('rc'); e_.append(5,'BORG_PASSPHRASE hunter2\n'); raise e_
+                with mock.patch(f"{__name__}._nick_list",rc_bad): rcb=get('')   # row 35 : rc illisible en -C -> errors['*']
+            lgr=lgr.getvalue(); log_ok='[WARN] /storage : rc illisible — ParsingError (ligne 5)' in lgr and 'hunter2' not in lgr
+            # row 63 : section [ALL] (ou nom hors règle de nick) jamais lancée, avec ou sans groupes — `-n ALL` développerait tout le rc
+            ran=[]; ok_r=CommandResult(exitcode=0,stdout=json.dumps({'borghelper_version':BORGHELPER_VERSION,'storages':[],'errors':{}}),stderr='')
+            with mock.patch(f"{__name__}._nick_list",lambda *a: [n1,'ALL','all','a b','-x']), \
+                 mock.patch(f"{__name__}._exec_borghelper",lambda cmd,nick,*a,**k: ran.append(nick) or ok_r), \
+                 mock.patch(f"{__name__}._cfgread",lambda n: {}), mock.patch(f"{__name__}._effective_level",lambda g,cf: 1), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with mock.patch(f"{__name__}.GROUPS_HEADER",None): get('')
+                with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'): get('lit-ALL')
+            # row 56 : ?nick=ALL (et un nick sans droit) -> jamais un 403 qui nommerait ce nick ; la route filtre seule
+            with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), \
+                 mock.patch(f"{__name__}._effective_level",lambda g,cf: 1 if 'lit-'+cf.name in g else 0), contextlib.redirect_stderr(io.StringIO()):
+                qa=[c.get(API_PREFIX+'/storage',headers={'X-API-Key':API_KEY,'X-Groups':'lit-'+n1},params={'nick':v}) for v in ('ALL',n2)]
+            qa_ok=all(r.status_code==200 and n2 not in json.dumps(r.json()) for r in qa)
+            # row 55 : rc illisible en -C (absent, droits) -> erreur, jamais une vue vide en code 0
+            with mock.patch(f"{__name__}.GROUPS_HEADER",None), mock.patch(f"{__name__}.CFGFILE",'/inexistant-87a/rc'), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                ra=get('')
+            # rows 41, 53 : formes à secrets — ni en sortie de WWW (stdout, stderr), ni nommées autrement que par leur schéma
+            sd=tempfile.mkdtemp(prefix='bhww-87a-'); src_=os.path.join(sd,'rc')
+            try:
+                with open(src_,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={sd}\n\n[q1]\nBORG_REPO=s3:AKIA:ab/ZSECRET1+x@https://minio:9000/b/r\n\n"
+                            "[q2]\nBORG_REPO=rclone::s3,secret_access_key=ZSECRET2/+x:bucket\n\n[q3]\nBORG_REPO=ssh://u:p/ZSECRET3@h/r\n\n"
+                            "[q4]\nBORG_REPO=u:ZSECRET4@h:/r\n\n[q5]\nBORG_REPO=sftp://u:p/ZSECRET5@h/r\nSTORAGE=baie\n\n"
+                            "[q6]\nBORG_REPO=ssh://h/r\n BORG_PASSPHRASE = ZSECRET6\n")   # row 60 : ligne suivante prise dans la valeur
+                os.chmod(src_,0o600)
+                with mock.patch(f"{__name__}.GROUPS_HEADER",None), mock.patch(f"{__name__}.CFGFILE",src_), \
+                     mock.patch(f"{__name__}._nick_list",lambda *a: ['q1','q2','q3','q4','q5','q6']), contextlib.redirect_stderr(io.StringIO()):
+                    rs=c.get(API_PREFIX+'/storage',headers={'X-API-Key':API_KEY})
+                bs=rs.json(); ds=json.loads(bs.get('stdout') or '{}')
+                sec_ok=(not re.search('ZSECRET',json.dumps(bs)) and ds.get('errors')=={
+                    'q1':'forme de BORG_REPO non reconnue (borg 2 ?) : s3:…','q2':'forme de BORG_REPO non reconnue (borg 2 ?) : rclone:…',
+                    'q3':'forme de BORG_REPO non reconnue (borg 2 ?) : ssh://…','q4':'forme de BORG_REPO non reconnue (borg 2 ?) : …',
+                    'q6':'forme de BORG_REPO non reconnue (borg 2 ?) : …'}
+                    and [(s_['storage'],[r['repo'] for r in s_['repos']]) for s_ in ds.get('storages',[])]==[('baie',['sftp://…'])])
+            finally: shutil.rmtree(sd,ignore_errors=True)
+            # row 49 : droits illisibles ET borgHelper en échec (mode -C, même clé '*') -> les deux avis, jamais l'un écrasé
+            with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'), mock.patch(f"{__name__}._effective_level",lvl_boom), \
+                 mock.patch(f"{__name__}._exec_borghelper",to), contextlib.redirect_stderr(io.StringIO()):
+                cc=get('lit-'+n1)
+            # row 22 / G8 : noms exposés dans `errors`, l'étiquette et l'identité d'un tunnel non résolu
+            ej=_expose_json('storage',{'storages':[{'storage':'tunnel non résolu (db)','nicks':['db'],'repos':[{'repo_id':'tunnel?|db|r|x',
+                                        'nicks':['db']},{'repo_id':'local|/db','nicks':['db']}]}],
+                                        'errors':{'db':"mesures … : borgHelper -c Status -n db",'autre':'f','*':'ParsingError'}},{'db':'mail:db'})
+            # row 50 : conseil « borgHelper -c » d'une erreur -> -C du rc du nick, nick nu
+            ej_ok=(ej['errors']=={'mail:db':"mesures … : borgHelper -C <rc mail> -c Status -n db",'autre':'f','mail:*':'ParsingError'}
+                   and ej['storages'][0]['storage']=='tunnel non résolu (mail:db)'
+                   and [r['repo_id'] for r in ej['storages'][0]['repos']]==['tunnel?|mail:db|r|x','local|/db'] and ej['storages'][0]['nicks']==['mail:db'])
+            yb=json.dumps(y[1])+json.dumps(y1[1]); lg=log.getvalue()
+            r2=(_cfgread(n2) or {}).get('BORG_REPO') or n2
+            r1=(_cfgread(n1) or {}).get('BORG_REPO')
+            reps=lambda d: [r['repo'] for s_ in d['storages'] for r in s_['repos']]
+            C={'lit':a[0]==200 and isinstance(a[2],dict) and names(a[2])==[n1] and seen[:1]==[['storage',n1,['-j']]] and reps(a[2])==[r1],
+               'aucun':b[0]==200 and kb==0 and b[2]=={'borghelper_version':BORGHELPER_VERSION,'storages':[],'errors':{}},
+               'sans groupes':z[0]==200 and isinstance(z[2],dict) and names(z[2])==sorted(ns) and zs==[['storage',','.join(ns),['-j']]],
+               'droits illisibles':y[0]==400 and y[2]=={'borghelper_version':BORGHELPER_VERSION,'storages':[],'errors':{'*':_STORAGE_RIGHTS_MSG}} and ky==0,
+               'droits illisibles lit':y1[0]==400 and isinstance(y1[2],dict) and names(y1[2])==sorted([n1,'*'])
+                                        and y1[2]['errors']=={'*':_STORAGE_RIGHTS_MSG} and reps(y1[2])==[r1],
+               'rien de n2':(not any(w in yb for w in ('GROUPS_PATHS','secret','simulé')) and names(y[2])==['*']
+                             and all(n2 not in s_['nicks'] and all(n2 not in r['nicks'] for r in s_['repos']) for s_ in y1[2]['storages'])
+                             and n2 not in y1[2]['errors'] and n2 not in y[2]['errors']),
+               'avis réunis':cc[0]==400 and cc[2]['errors']=={'*':f"{_STORAGE_RIGHTS_MSG} ; HTTP 504 : Commande storage : timeout après 1s"},
+               'journal':f"droits illisibles pour {n2}, nick omis" in lg and 'grp-secret' in lg,
+               'délai':t[0]==400 and t[2]['errors']=={'*':'HTTP 504 : Commande storage : timeout après 1s'} and t[2]['storages']==[],
+               'illisible':u[0]==400 and u[2]['errors']=={'*':'code 1, réponse illisible : boom'},
+               'OSError':o[0]==400 and o[2]['errors']=={'*':'lancement impossible (OSError : fork impossible (simulé))'},
+               'rc':rcb[0]==400 and rcb[2]['errors']=={'*':_STORAGE_RC_MSG},'journal rc':log_ok,'section ALL':ran==[n1,n1],
+               'expose':ej_ok,'nick=ALL':qa_ok,
+               'rc absent':ra[0]==400 and ra[2]=={'borghelper_version':BORGHELPER_VERSION,'storages':[],'errors':{'*':_STORAGE_RC_MSG}},
+               'secrets':sec_ok}
+            ok=all(C.values())
+            if not ok: print(f"  en échec {[k for k,v in C.items() if not v]} ; lit-{n1} {a[0]} {a[1]} ; aucun {b[:2]} lancés {kb} ; sans groupes {z[:2]} ; "
+                             f"appels {seen} ; droits illisibles {y[:2]} {y1[:2]} lancés {ky} ; journal {lg[-400:]!r} ; délai {t[:2]} ; illisible {u[:2]} ; "
+                             f"OSError {o[:2]} ; rc {rcb[:2]} ; expose {ej} ; concat {cc[:2]} ; nick=ALL {[r.status_code for r in qa]} ; "
+                             f"rc absent {ra[:2]} ; secrets {bs} ; journal rc {lgr[-300:]!r} ; section ALL lancés {ran}")
+            return ok
+        check("/storage (mode -C) : nicks que l'appelant peut lire seulement (autre nick ni compté ni nommé, ni son dépôt) ; aucun : vue "
+              "vide sans rien lancer ; groupes inactifs : tous les nicks ; droits illisibles d'un nick : omis, erreur générique, détail au "
+              "journal ; borgHelper en échec, illisible ou non lancé, rc illisible : erreur dite, jamais une 500 ; noms exposés (1.33.0)",_storage_route)
         def _dm_single_scope():
             """Correctif de sécurité (revue 3, row 44, mode -C) : routes à un nick (LstBkpFls, DiffBkp, Restore -L, Restore) — appelant
             à périmètre restreint : ALL, vide, espaces, liste, doublon -> 400, borgHelper jamais lancé (avant : périmètre lu sur la
@@ -8542,10 +8766,30 @@ def push_selftest():
             got=uses(src)
             want={'_bh_paths':{'_bhn','_cfgread','_nick_list','_cache_db_paths','_bkp_markers_state','ensure_scope_cache_db',
                                'ensure_push_db','_borg_cleanup_summary','<module>'},
-                  'CFGFILE':{'_default_section_groups','_capture_fingerprints','_build_borghelper_argv_env','_borg_cfg','_stats_sections','<module>'}}
+                  'CFGFILE':{'_default_section_groups','_capture_fingerprints','_build_borghelper_argv_env','_borg_cfg','_stats_sections','<module>',
+                             '_storage_nicks'}}   # revue 87a (row 55) : ouvert en mode -C seulement (`if not DIR_MODE`), jamais le maître
             wit=uses("def ailleurs(n):\n    return _bh_paths.db.get_diff_db(n)\n")['_bh_paths']=={'ailleurs'}
-            if got!=want or not wit: print(f"  en trop {({k:sorted(got[k]-want[k]) for k in want})} ; manquants {({k:sorted(want[k]-got[k]) for k in want})} ; témoin {wit}")
-            return got==want and wit
+            def unguarded(text):
+                """Revue 87a (row 65) : lignes des lectures de CFGFILE dans _storage_nicks hors d'un `if not DIR_MODE:` (corps)."""
+                out=[]
+                def walk(nd,ok):
+                    if isinstance(nd,_ast.Name) and nd.id=='CFGFILE' and isinstance(nd.ctx,_ast.Load) and not ok: out.append(nd.lineno)
+                    if (isinstance(nd,_ast.If) and isinstance(nd.test,_ast.UnaryOp) and isinstance(nd.test.op,_ast.Not)
+                            and isinstance(nd.test.operand,_ast.Name) and nd.test.operand.id=='DIR_MODE'):
+                        walk(nd.test,ok)
+                        for c_ in nd.body: walk(c_,True)
+                        for c_ in nd.orelse: walk(c_,ok)
+                        return
+                    for c_ in _ast.iter_child_nodes(nd): walk(c_,ok)
+                for top in _ast.parse(text).body:
+                    if isinstance(top,_ast.FunctionDef) and top.name=='_storage_nicks': walk(top,False)
+                return out
+            ung=unguarded(src)
+            wit_ok=unguarded("def _storage_nicks(r):\n    if not DIR_MODE:\n        open(CFGFILE)\n    else: x=CFGFILE\n    return CFGFILE\n")==[4,5]
+            if got!=want or not wit or ung or not wit_ok:
+                print(f"  en trop {({k:sorted(got[k]-want[k]) for k in want})} ; manquants {({k:sorted(want[k]-got[k]) for k in want})} ; "
+                      f"témoin {wit} ; _storage_nicks : CFGFILE hors « if not DIR_MODE » l. {ung}, témoin {wit_ok}")
+            return got==want and wit and not ung and wit_ok
         check("mode dossier : _bh_paths et CFGFILE (maître) lus seulement par la liste blanche de fonctions — garde AST (1.32.0)",_dm_source_guard)
 
         # ── démarrages refusés, précédence des modes ──
@@ -8834,6 +9078,29 @@ out['rc_order']=[call('GET','/access')[1].get('rc_order'),(out['g_mail'][1] or {
                  call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'g-web'})[1].get('rc_order'),
                  call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'aucun-groupe-86b'})[1].get('rc_order')]
 with mock.patch.object(w,'GROUPS_HEADER',None): out['rc_order'].append(call('GET','/access')[1].get('rc_order'))
+# 1.33.0 (story 87a) : /storage — nicks lisibles seulement, noms exposés, une seule vue réunie pour plusieurs rc
+def stor(hdr=None):
+    st_,b_=call('GET','/storage',hdr=hdr)
+    try: d_=json.loads((b_ or {}).get('stdout') or '')
+    except ValueError: d_=None
+    if not isinstance(d_,dict): return [st_,None,b_]
+    return [st_,sorted(d_),sorted({n for s_ in d_.get('storages',[]) for r_ in s_.get('repos',[]) for n in r_.get('nicks',[])}|set(d_.get('errors',{}))),
+            d_.get('storages'),d_.get('errors')]
+out['storage']=[stor(),stor({'X-API-Key':'k','X-Groups':'g-mail'}),stor({'X-API-Key':'k','X-Groups':'g-web'}),
+                stor({'X-API-Key':'k','X-Groups':'aucun-groupe-87a'})]
+with mock.patch.object(w,'GROUPS_HEADER',None): out['storage'].append(stor())
+# référence : la CLI de chaque rc (nicks nus), réunie par le parent après exposition — tailles et regroupement comparés (row 10)
+out['storage_cli']={}
+for f_,ns_ in (('web.rc','db,front'),('mail.rc','db,m2'),('mail.rc','db')):
+    q_=_sp.run([sys.executable,str(w.BORGHELPER_BIN),'-C',os.path.join(spec['rd'],f_),'-c','Storage','-n',ns_,'-j'],capture_output=True,text=True,
+               timeout=120,stdin=_sp.DEVNULL,env=dict(os.environ,BORGHELPERC_NO_CLEANUP_NOTICE='1'))
+    out['storage_cli'][f_+' '+ns_]=json.loads(q_.stdout) if q_.stdout.strip().startswith('{') else q_.stdout+q_.stderr
+# row 3 : un rc refusé au lancement -> errors['mail:*'], vue de web gardée
+real_chk=w._rc_launch_check
+def chk_(e_):
+    if e_.prefix=='mail': raise w.HTTPException(503,detail='rc du préfixe mail modifié (simulé)')
+    return real_chk(e_)
+with mock.patch.object(w,'GROUPS_HEADER',None), mock.patch.object(w,'_rc_launch_check',chk_): out['storage_fail']=stor()
 # revue 3 (row 44) : g-mail à périmètre (/home) sur mail:db — nom à espaces, liste, doublon : 400, rien lancé (avant : périmètre lu sur
 # la chaîne brute -> illimité, nom nettoyé au lancement) ; (row 45) `nick=` vide : 404, rien lancé (avant : tous les nicks des rc)
 calls.clear()
@@ -8918,12 +9185,16 @@ try:
     with contextlib.redirect_stderr(e_):
         try: w._cfgread('mail:db'); cf='None'
         except Exception as x_: cf=type(x_).__name__
+        out['stor_bad']=[stor()]   # revue 87a (row 49) : groupes actifs -> erreur générique, jamais le nom du rc
+        with mock.patch.object(w,'GROUPS_HEADER',None): out['stor_bad'].append(stor())
         with mock.patch.object(w,'GROUPS_HEADER',None): b_=call('POST','/bkp',nick='mail:db')
         out['illisible']=[w._nick_list('ALL'),cf,call('GET','/access')[0],b_[0],(b_[1] or {}).get('detail','')]
 except Exception as x: out['illisible']=repr(x)
 out['watched']=os.path.join(rd,'mail.rc') in w._RC['files']   # row 34 : rc servi toujours surveillé
 put(os.path.join(rd,'mail.rc'),mail0); put(m,m0); w._nick_list('ALL')
 os.rename(os.path.join(rd,'mail.rc'),os.path.join(rd,'mail.rc.bak')); phase('absent')
+out['stor_unav']=[stor()]   # revue 87a (row 55) : rc indisponible -> dit (générique sous groupes, « mail:* » sans)
+with mock.patch.object(w,'GROUPS_HEADER',None): out['stor_unav'].append(stor())
 out['keep_absent']=[w._push_prune_keep(set(w._nick_list('ALL')))(n) for n in ('mail:db','db','web:zz','gone:x')]
 os.rename(os.path.join(rd,'mail.rc.bak'),os.path.join(rd,'mail.rc')); phase('revenu')
 HS={'start':True,'success':True,'error':False}
@@ -9097,6 +9368,32 @@ print('S86JSON:'+json.dumps(out,ensure_ascii=False))
                 return ok
             check("mode dossier : /access rc_order = ordre des lignes [_borgHelperWWW_rc] du maître (relu à chaud), préfixes que "
                   "l'appelant peut lire seulement (1.32.1)",_rc_order_ok)
+            def _storage_dir_ok():
+                K=['borghelper_version','errors','storages']
+                sb=dm.get('stor_bad') or [[None]*5,[None]*5]
+                bad_ok=all(x_[0][4]=={'*':_STORAGE_RIGHTS_MSG} and x_[1][4]=={'mail:*':_STORAGE_RC_MSG}
+                           and all(n.startswith('web:') for x in x_ for n in (x[2] or []) if n not in ('*','mail:*'))
+                           for x_ in (sb,dm.get('stor_unav') or [[None]*5,[None]*5]))
+                want=[[200,K,N0],[200,K,['mail:db']],[200,K,['web:db','web:front']],[200,K,[]],[200,K,N0]]
+                got=[[x[0],x[1],sorted(x[2]) if isinstance(x[2],list) else x[2]] for x in dm['storage']]
+                ok=got==[[a,b,sorted(c)] for a,b,c in want]
+                # revue 87a (row 10) : vues complètes (tailles, regroupement) = sorties CLI de chaque rc, exposées puis réunies
+                cli_=dm['storage_cli']
+                ex=lambda k,pfx,bare: _expose_json('storage',cli_[k],{b:f"{pfx}:{b}" for b in bare})
+                try:
+                    full=_storage_merge([ex('web.rc db,front','web',['db','front']),ex('mail.rc db,m2','mail',['db','m2'])])['storages']
+                    mail=_storage_merge([ex('mail.rc db','mail',['db'])])['storages']
+                except (KeyError,TypeError,AttributeError) as x_: full=mail=f"CLI illisible : {x_} {cli_}"
+                f_=dm['storage_fail']
+                ok=(ok and bad_ok and dm['storage'][0][3]==full==dm['storage'][4][3] and dm['storage'][1][3]==mail and bool(full)
+                    and f_[0]==400 and set(f_[4])=={'mail:*'} and 'mail' in f_[4]['mail:*']
+                    and sorted({n for s_ in f_[3] for r_ in s_['repos'] for n in r_['nicks']})==['web:db','web:front'])
+                if not ok: print(f"  /storage (tous, g-mail, g-web, aucun groupe, groupes inactifs) {dm['storage']} ; attendu {full} / {mail} ; "
+                                 f"rc mail en échec {f_} ; rc mail illisible {sb} ; rc mail indisponible {dm.get('stor_unav')}")
+                return ok
+            check("mode dossier : /storage — nicks exposés que l'appelant peut lire seulement (ni comptés ni nommés sinon), une seule vue "
+                  "réunie pour plusieurs rc, égale aux sorties CLI de chaque rc réunies ; rc en échec : errors['préfixe:*'], vue des autres "
+                  "rc gardée ; aucun nick lisible : vue vide (1.33.0)",_storage_dir_ok)
             def _scope_dir_ok():
                 ok=dm['scope1']==[400,400,400,400,0] and dm['empty']==[404,404,0]
                 if not ok: print(f"  route à un nick {dm['scope1']} ; nick vide {dm['empty']}")
