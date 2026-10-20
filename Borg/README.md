@@ -1966,7 +1966,8 @@ clients/c1.rc = c1
 ```
 
 - **Noms** : en mode dossier, tout nick est exposé `préfixe:nick` — API (`nick=web:db`, `ALL`, listes
-  `web:db,mail:db`), `/access`, abonnements push, caches, UI (liste plate, `/serveur/web%3Adb`). Un même
+  `web:db,mail:db`), `/access`, abonnements push, caches, UI (groupée par fichier de conf — UI ≥ 1.25.0, voir
+  [Interface web](#interface-web) —, `/serveur/web%3Adb`). Un même
   nick dans deux rc est donc permis (`web:db`, `mail:db`). Préfixe : mêmes caractères qu'un nick
   (lettres, chiffres, `.`, `_`, `-`, début lettre ou chiffre ; ni `ALL` ni `DEFAULT`).
 - **Isolement** : chaque borgHelper lancé reçoit le `-C` du rc de son nick et le nick **nu** ; toute
@@ -2052,8 +2053,11 @@ clients/c1.rc = c1
   portée).
 - `/access` : nettoyage possible (`borg_cleanup`) = fichiers borgHelper de chaque rc ; entrées borg que
   **aucun** rc servi ne reconnaît (aucune si un rc listé est indisponible ou si la liste est invalide : doute).
-- Limites : l'UI groupée par rc viendra plus tard (story 86b) ; les conseils de commande de `stdout`
-  (Report, lignes d'erreur) gardent la forme sans `-C`.
+- `/access` : `rc_order` (≥ 1.32.1, mode dossier seulement — absent en mode `-C`, réponse inchangée) = préfixes dans
+  l'ordre des lignes `[_borgHelperWWW_rc]` du maître (relu à chaud), restreints à ceux dont l'appelant peut lire au
+  moins un nick (même ensemble que `suspended_prefixes`) ; ordre des groupes de l'UI. Ne cache rien de plus : `nicks`
+  liste déjà tout nick exposé, ceux sans droit compris (`level: "none"`). Ex. `"rc_order": ["web", "mail"]`.
+- Limite : les conseils de commande de `stdout` (Report, lignes d'erreur) gardent la forme sans `-C`.
 
 #### Préfixe des routes API
 
@@ -2439,6 +2443,19 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    `cache.db`) est restée en clair alors que `DB_ENCRYPT` est actif et qu'une passphrase est disponible — noms de
    fichiers en clair sur disque ; la bulle donne la commande `DbEncrypt`. Aucun badge pour une base chiffrée ni pour
    `DB_ENCRYPT=false` volontaire. Source : champ `db_plain` de `GET /access`.
+   **Mode dossier** (UI ≥ 1.25.0, borgHelperWWW ≥ 1.32.1, `rc_order` de `GET /access`) : un titre par fichier de conf
+   (préfixe), ses cartes dessous ; groupes dans l'ordre des lignes `[_borgHelperWWW_rc]` du maître (un préfixe absent de
+   cet ordre ensuite, trié), nicks triés par nom dans chaque groupe. Carte titrée du nick **nu** (`db`) ; nom complet
+   `préfixe:nick` en infobulle, dans les boutons, les liens et l'adresse (`/serveur/web%3Adb`), et sur la page du
+   serveur. Clic sur le titre d'un groupe (un bouton : Entrée/Espace au clavier) : replié/déplié — replié, il montre le nombre de serveurs
+   et **⚠ erreur** si l'un d'eux est en erreur ; état gardé par navigateur (`localStorage`), tout déplié par défaut ou
+   si le stockage est indisponible (préfixes qui ne sont plus affichés : oubliés) ; un lien rapide vers une carte d'un
+   groupe replié le déplie à l'écran seulement (replié de nouveau au chargement suivant). Liens rapides groupés
+   de même (« web : db · front │ mail : db · imap ») ; page **🔔 Notifications** : un sous-titre par fichier de conf,
+   nicks nus dessous (nom sans préfixe resté dans un ancien abonnement : sous « (sans préfixe) », en dernier). Liste des serveurs et liens
+   rapides : un groupe n'apparaît que si l'appelant peut lire au moins un de ses nicks ; Notifications, une fois abonné :
+   portée figée de l'abonnement (un préfixe qu'on ne lit plus y garde son sous-titre). Mode `-C` : rien ne
+   change (aucun titre, aucun préfixe).
    Bandeau **🧹 Nettoyage possible sur le serveur** (UI ≥ 1.19.5) quand la machine garde des restes de dépôts borg
    disparus ou de nicks retirés : nombres et tailles seulement, avec la commande `borgHelper -c BorgCleanup` —
    l'interface ne supprime rien. Source : champ `borg_cleanup` de `GET /access` (borgHelperWWW ≥ 1.28.5 ; `null` s'il

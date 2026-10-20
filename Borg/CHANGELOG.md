@@ -1,5 +1,36 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.32.1, UI 1.25.0 — UI groupée par fichier de conf (mode dossier) — 2026-10-20
+
+Chantier « reconstruction progressive », story 86b (suite de la story 86, décisions de l'utilisateur du 2026-10-20).
+
+- **borgHelperWWW** : `GET /access` donne, en mode dossier seulement, `rc_order` — préfixes dans l'ordre des lignes
+  `[_borgHelperWWW_rc]` du maître (relu à chaud), restreints à ceux dont l'appelant peut lire au moins un nick (même
+  ensemble que `suspended_prefixes`). Ce filtre ne cache rien de plus : `nicks` de la même réponse liste déjà tout nick exposé, y
+  compris ceux sans droit (`level: "none"`, comportement antérieur, report différé). Mode `-C` : champ absent, réponse inchangée. Push selftest : contrôle
+  « /access rc_order » (ordre du maître, maître inversé à chaud, filtré par droits : tous, g-mail, g-web, aucun groupe,
+  groupes inactifs) ; contrôle `/access` du mode `-C` : `rc_order` absent.
+- **UI** (mode dossier, `rc_order` présent) : liste des serveurs groupée par fichier de conf — un titre par préfixe, ses
+  cartes dessous, groupes dans l'ordre du maître (préfixe absent de l'ordre ensuite, trié), nicks triés par nom dans chaque
+  groupe ; carte titrée du nick nu, nom complet `préfixe:nick` en infobulle, dans les boutons, liens, URL et requêtes.
+  Groupes repliables (titre `h3` portant un vrai bouton : clic, Entrée/Espace du navigateur ; `aria-expanded`,
+  `aria-controls`, flèche `aria-hidden`) : replié, nombre de serveurs et « ⚠ erreur » si l'un est en
+  erreur (tenu à jour au rechargement d'une carte en fin de Bkp) ; état par navigateur (`localStorage`, clé
+  `bhww_rc_collapsed`, réduite aux préfixes affichés), tout déplié par défaut ou si le stockage est indisponible ; lien rapide
+  vers un groupe replié : déplié à l'écran seulement, choix « replié » gardé ; une carte rechargée en fin de Bkp garde le titre
+  de la liste dessinée. Barre de liens rapides groupée (« web : db · front │ mail : db · imap »), page Notifications : un sous-titre par
+  fichier de conf ; abonné, la page montre la portée figée de l'abonnement (AD-4) — un préfixe qu'on ne lit plus y garde
+  son sous-titre, après ceux de l'ordre (nom sans préfixe d'un ancien abonnement : « (sans préfixe) », en dernier). Un seul utilitaire de
+  regroupement (`nickGroups`) pour les trois listes. L'UI n'a aucun sélecteur de nick (`<select>`) : rien à grouper en
+  `optgroup`. Mode `-C` : rendu identique à 1.24.3.
+- **Test UI** (`borgHelperWWW_ui_test.js`) : mode `-C` comparé au rendu de 1.24.3 (empreintes de la liste, de la barre et des
+  Notifications avant et après abonnement, relevées sur e790e8b avec le même décor) ; mode dossier : ordre, préfixe hors
+  ordre, nicks nus triés, noms complets (boutons, liens, cases, Report), droits (groupe absent), stockage indisponible ou
+  illisible, Notifications abonné ; par les vrais gestionnaires (clic sur le titre, lien rapide, bouton Ouvrir) sur un faux DOM
+  tiré du HTML produit : repli mémorisé, lien rapide sans mémoire, mémoire réduite, `reloadMachineCard` en mode dossier (titre de
+  la liste dessinée, ⚠ du groupe replié), carte retrouvée par le nom de ses boutons ; noms hostiles (préfixe et nick) échappés
+  dans les titres, la barre, les cartes et les Notifications ; exception du rendu = FAIL.
+
 ## borgHelperWWW 1.32.0, UI 1.24.3 — Mode dossier : plusieurs .borghelperrc — 2026-10-20
 
 Chantier « reconstruction progressive », story 86 (report D194, point « plusieurs fichiers borghelperrc », tri A46/A122 S-t).

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.24.3 -->
+<!-- UI_VERSION: 1.25.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -52,6 +52,19 @@
   #machinesJump a:hover{text-decoration:underline}
   #machinesJump a.jump-err{color:var(--danger);font-weight:600}
   .nick-err{color:var(--danger)}
+  /* UI 1.25.0 (story 86b) : mode dossier — un groupe par fichier de conf (préfixe), repliable ; barre de liens et
+     Notifications groupées de même. Mode -C : aucune de ces classes n'est utilisée. */
+  .rc-group-head{margin:18px 0 10px;font-size:16px}
+  .rc-group:first-child .rc-group-head{margin-top:4px}
+  .rc-group-btn{display:flex;align-items:center;gap:8px;padding:0;background:none;color:inherit;font:inherit;text-align:left}
+  .rc-group-btn:hover{background:none}
+  .rc-group-btn:hover .rc-group-name{text-decoration:underline}
+  .rc-group-caret{display:inline-block;width:1em;color:var(--muted)}
+  .rc-group-sum{font-size:12px;font-weight:400;color:var(--muted)}
+  .rc-group-err{font-size:13px;color:var(--danger)}
+  #machinesJump .jump-prefix{color:var(--muted);font-weight:600}
+  #machinesJump .jump-sep{color:var(--muted)}
+  #notifHostsBody tr.notif-group th{padding-top:14px;color:var(--text)}
   .machine-card{display:flex;flex-direction:column;gap:10px;margin-bottom:14px}
   .machine-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
   .machine-head h3{margin:0;font-size:15px}
@@ -685,28 +698,121 @@ async function loadMachines(){
   // Report préfixe 'nom' par '***' quand il remonte une erreur pour ce serveur (diff.db absent,
   // dernière sauvegarde trop ancienne (MAX_AGE_BKP), ou exception SQLite).
   const errFlags={};
-  listEl.innerHTML=nicks.map(nick=>{
+  const cardOf=(nick,label)=>{
     const s=summary[nick];
     const isErr=(s['nom']||'').startsWith('***');
     errFlags[nick]=isErr;
-    return machineCardHtml(nick,s,!!passes[nick],isErr);
-  }).join('');
+    return machineCardHtml(nick,s,!!passes[nick],isErr,label);
+  };
+  // UI 1.25.0 (story 86b) : mode dossier — un groupe par fichier de conf, cartes titrées du nick nu ; mode -C : liste plate
+  const groups=nickGroups(nicks,rcOrder());
+  const order=groups ? groups.flatMap(g=>g.items.map(it=>it.nick)) : nicks;
+  machineCardLabels={};   // titre de chaque carte tel que la liste l'a dessinée (reloadMachineCard)
+  if(!groups) listEl.innerHTML=nicks.map(nick=>cardOf(nick)).join('');
+  else{
+    const saved=rcCollapsed(), shown=new Set(groups.map(g=>g.prefix));
+    const folded=new Set(saved.filter(p=>shown.has(p)));   // mémoire réduite aux préfixes affichés
+    if(folded.size!==saved.length) rcCollapsedSave([...folded]);
+    listEl.innerHTML=groups.map((g,gi)=>{
+      g.items.forEach(it=>{ machineCardLabels[it.nick]=it.bare; });
+      const cards=g.items.map(it=>cardOf(it.nick,it.bare)).join('');
+      return rcGroupHtml(g,cards,g.items.some(it=>errFlags[it.nick]),folded.has(g.prefix),gi);
+    }).join('');
+  }
   machineCardsByNick={};
   Array.from(listEl.querySelectorAll('.machine-card')).forEach((card,i)=>{
-    machineCardsByNick[nicks[i]]=card;
-    loadHistoryInline(nicks[i],card.querySelector('.history-panel'));
+    machineCardsByNick[order[i]]=card;
+    loadHistoryInline(order[i],card.querySelector('.history-panel'));
   });
-  jumpEl.innerHTML=nicks.map(nick=>
-    `<a href="#" class="jump-link${errFlags[nick]?' jump-err':''}" data-nick="${escapeAttr(nick)}">${escapeHtml(nick)}</a>`
-  ).join(' · ');
+  const jumpLink=(nick,label)=>
+    `<a href="#" class="jump-link${errFlags[nick]?' jump-err':''}" data-nick="${escapeAttr(nick)}"`
+    +(label===undefined?`>${escapeHtml(nick)}</a>`:` title="${escapeAttr(nick)}">${escapeHtml(label)}</a>`);
+  jumpEl.innerHTML=groups
+    ? groups.map(g=>`<span class="jump-group"><span class="jump-prefix">${escapeHtml(rcGroupLabel(g.prefix))} :</span> `
+        +g.items.map(it=>jumpLink(it.nick,it.bare)).join(' · ')+'</span>').join(' <span class="jump-sep">│</span> ')
+    : nicks.map(nick=>jumpLink(nick)).join(' · ');
+}
+
+// ── Mode dossier : groupes par fichier de conf (UI 1.25.0, borgHelperWWW 1.32.1, story 86b) ─────────────────
+// /access rc_order (mode dossier seulement) : préfixes que l'appelant peut lire, dans l'ordre des lignes [_borgHelperWWW_rc] du
+// maître. Absent (mode -C, ou serveur < 1.32.1) : null — toutes les listes restent plates, rendu de 1.24.3.
+function rcOrder(){
+  return myAccess && Array.isArray(myAccess.rc_order) ? myAccess.rc_order : null;
+}
+// Seul utilitaire de regroupement (liste des serveurs, barre de liens, Notifications) : nicks exposés « préfixe:nick » ->
+// [{prefix, items:[{nick (nom complet : actions, liens, URL), bare (nick nu : affiché)}]}]. Groupes dans l'ordre `order`, puis
+// les préfixes absents de l'ordre (triés), puis les noms sans préfixe (prefix '') ; nicks nus triés dans chaque groupe.
+// order non tableau (mode -C) : null.
+function nickGroups(nicks,order){
+  if(!Array.isArray(order)) return null;
+  const by=new Map();
+  nicks.forEach(n=>{
+    const s=String(n), i=s.indexOf(':'), p=i<0?'':s.slice(0,i);
+    if(!by.has(p)) by.set(p,[]);
+    by.get(p).push({nick:s,bare:i<0?s:s.slice(i+1)});
+  });
+  const known=[...new Set(order.map(String))].filter(p=>p!=='' && by.has(p));
+  const rest=[...by.keys()].filter(p=>p!=='' && !known.includes(p)).sort();
+  const keys=known.concat(rest,by.has('')?['']:[]);
+  const cmp=(a,b)=>a.bare<b.bare?-1:a.bare>b.bare?1:0;
+  return keys.map(p=>({prefix:p,items:by.get(p).slice().sort(cmp)}));
+}
+function rcGroupLabel(prefix){ return prefix===''?'(sans préfixe)':prefix; }
+// Groupes repliés : par navigateur (localStorage), tout déplié par défaut ; stockage indisponible ou illisible : déplié.
+const LS_RC_COLLAPSED='bhww_rc_collapsed';
+function rcCollapsed(){
+  try{
+    const v=JSON.parse(localStorage.getItem(LS_RC_COLLAPSED)||'[]');
+    return Array.isArray(v) ? v.filter(x=>typeof x==='string') : [];
+  }catch(e){ return []; }
+}
+function rcCollapsedSave(list){
+  try{ localStorage.setItem(LS_RC_COLLAPSED,JSON.stringify(list)); }
+  catch(e){ /* stockage indisponible : l'état n'est pas gardé */ }
+}
+function setRcCollapsed(prefix,on){
+  const s=new Set(rcCollapsed());
+  if(on) s.add(prefix); else s.delete(prefix);
+  rcCollapsedSave([...s]);
+}
+// Groupe de la liste des serveurs : titre (h3) portant un bouton natif (clavier : Entrée/Espace du navigateur) ; replié : nombre
+// de serveurs et signe d'erreur s'il y en a une. gi : rang du groupe (id du corps pour aria-controls).
+function rcGroupHtml(g,cardsHtml,hasErr,collapsed,gi){
+  const n=g.items.length;
+  return `<div class="rc-group" data-prefix="${escapeAttr(g.prefix)}">`
+    +`<h3 class="rc-group-head"><button type="button" class="rc-group-btn" aria-expanded="${collapsed?'false':'true'}" aria-controls="rcg-${gi}" title="Replier ou déplier ce fichier de conf">`
+    +`<span class="rc-group-caret" aria-hidden="true">${collapsed?'▸':'▾'}</span><span class="rc-group-name">${escapeHtml(rcGroupLabel(g.prefix))}</span>`
+    +`<span class="rc-group-sum"${collapsed?'':' hidden'}>${n} serveur${n>1?'s':''}</span>`
+    +`<span class="rc-group-err" title="Au moins un serveur en erreur dans ce groupe"${collapsed&&hasErr?'':' hidden'}>⚠ erreur</span></button></h3>`
+    +`<div class="rc-group-body" id="rcg-${gi}"${collapsed?' hidden':''}>${cardsHtml}</div></div>`;
+}
+// Affiche un groupe replié ou déplié (rien mémorisé : lien rapide) ; signe d'erreur relu sur les cartes (aussi après le
+// rechargement d'une carte en fin de Bkp : rcGroupRefresh).
+function showRcGroup(el,collapsed){
+  el.querySelector('.rc-group-body').hidden=collapsed;
+  const btn=el.querySelector('.rc-group-btn');
+  btn.setAttribute('aria-expanded',collapsed?'false':'true');
+  btn.querySelector('.rc-group-caret').textContent=collapsed?'▸':'▾';
+  rcGroupRefresh(el);
+}
+// Clic sur le titre : affiché ET mémorisé.
+function setRcGroupCollapsed(el,collapsed){
+  showRcGroup(el,collapsed);
+  setRcCollapsed(el.dataset.prefix,collapsed);
+}
+function rcGroupRefresh(el){
+  const body=el.querySelector('.rc-group-body'), collapsed=!!body.hidden;
+  el.querySelector('.rc-group-sum').hidden=!collapsed;
+  el.querySelector('.rc-group-err').hidden=!(collapsed && !!body.querySelector('.machine-card h3.nick-err'));
 }
 
 // Carte d'un serveur (liste) — aussi utilisée pour recharger UNE carte à la fin d'un Bkp (UI 1.19.0).
-function machineCardHtml(nick,s,hasPass,isErr){
+// label (UI 1.25.0, mode dossier) : nick nu affiché en titre — nom complet en infobulle et dans chaque bouton ; absent : nick.
+function machineCardHtml(nick,s,hasPass,isErr,label){
     return `
       <div class="machine-card card" style="margin-bottom:14px">
         <div class="machine-head">
-          <h3${isErr?' class="nick-err"':''}>${escapeHtml(nick)} ${badgeFor(s['depuis'])} ${plainDbBadge(nick)} <span class="state-badges" data-nick="${escapeAttr(nick)}">${stateBadges(nick)}</span></h3>
+          <h3${isErr?' class="nick-err"':''}>${label===undefined?escapeHtml(nick):`<span title="${escapeAttr(nick)}">${escapeHtml(label)}</span>`} ${badgeFor(s['depuis'])} ${plainDbBadge(nick)} <span class="state-badges" data-nick="${escapeAttr(nick)}">${stateBadges(nick)}</span></h3>
           <div>
             ${opAllowed(nick,'bkp')?`<button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>`:''}
             <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
@@ -742,10 +848,13 @@ async function reloadMachineCard(nick){
   try{ s=(JSON.parse(r.stdout).summary||{})[nick]; }catch(e){}
   if(!s || !old.isConnected) return;
   const isErr=(s['nom']||'').startsWith('***');
-  const tmp=document.createElement('div'); tmp.innerHTML=machineCardHtml(nick,s,!!getPassphrase(nick),isErr).trim();
+  // UI 1.25.0 : titre tel que la liste l'a dessiné (nick nu en mode dossier), jamais relu sur un /access plus récent
+  const tmp=document.createElement('div'); tmp.innerHTML=machineCardHtml(nick,s,!!getPassphrase(nick),isErr,machineCardLabels[nick]).trim();
   const card=tmp.firstElementChild; old.replaceWith(card); machineCardsByNick[nick]=card;
   loadHistoryInline(nick,card.querySelector('.history-panel'));
   document.querySelectorAll('#machinesJump .jump-link').forEach(a=>{ if(a.dataset.nick===nick) a.classList.toggle('jump-err',isErr); });
+  const grp=card.closest('.rc-group');
+  if(grp) rcGroupRefresh(grp);   // groupe replié : signe d'erreur à jour
 }
 
 // Relecture de /access toutes les 30 s (UI 1.19.0) sur la liste et la page d'un serveur, onglet visible :
@@ -820,14 +929,21 @@ async function pollAccess(){
 setInterval(pollAccess,30000);
 
 let machineCardsByNick={};
-document.getElementById('machinesJump').addEventListener('click', e=>{
+let machineCardLabels={};   // UI 1.25.0 : nick -> titre dessiné (nick nu en mode dossier ; absent : nick)
+function onMachinesJumpClick(e){
   const a=e.target.closest('.jump-link'); if(!a) return;
   e.preventDefault();
   const card=machineCardsByNick[a.dataset.nick];
-  if(card) card.scrollIntoView({behavior:'smooth',block:'start'});
-});
+  if(!card) return;
+  const grp=card.closest('.rc-group');   // UI 1.25.0 : carte d'un groupe replié -> déplié à l'écran seulement (choix gardé)
+  if(grp && grp.querySelector('.rc-group-body').hidden) showRcGroup(grp,false);
+  card.scrollIntoView({behavior:'smooth',block:'start'});
+}
+document.getElementById('machinesJump').addEventListener('click',onMachinesJumpClick);
 
-document.getElementById('machinesList').addEventListener('click', e=>{
+function onMachinesListClick(e){
+  const btn=e.target.closest('.rc-group-btn');   // UI 1.25.0 : titre d'un groupe (mode dossier) — replier/déplier
+  if(btn){ const grp=btn.closest('.rc-group'); setRcGroupCollapsed(grp,!grp.querySelector('.rc-group-body').hidden); return; }
   const openBtn=e.target.closest('.open-machine-btn');
   if(openBtn){ openMachine(openBtn.dataset.nick); return; }
   const bkpBtn=e.target.closest('.bkp-now-btn');
@@ -836,7 +952,8 @@ document.getElementById('machinesList').addEventListener('click', e=>{
   if(exploreBtn){ openMachine(exploreBtn.dataset.nick); openBrowse(); return; }
   const histBtn=e.target.closest('.history-btn');
   if(histBtn){ openHistory(histBtn.dataset.nick); return; }
-});
+}
+document.getElementById('machinesList').addEventListener('click',onMachinesListClick);
 
 function _renderHistoryRows(backups,withActions){
   const archives=Object.keys(backups).filter(k=>k!=='Prunable'&&k!=='Totaux');
@@ -2028,11 +2145,17 @@ function renderHostsTable(prefs){
   const hosts=notifHostList();
   const body=document.getElementById('notifHostsBody');
   if(!hosts.length){ body.innerHTML='<tr><td colspan="4" class="hint">Aucun host accessible.</td></tr>'; updateNotifAll(); return; }
-  body.innerHTML=hosts.map(n=>{
+  // label (UI 1.25.0, mode dossier) : nick nu affiché sous le sous-titre de son fichier de conf ; cases au nom complet
+  const row=(n,label)=>{
     const h=(prefs&&prefs[n])||NOTIF_DEFAULT_HOST;
-    return `<tr><td>${escapeHtml(n)}</td>`+NOTIF_KINDS.map(k=>
+    return (label===undefined?`<tr><td>${escapeHtml(n)}</td>`:`<tr><td title="${escapeAttr(n)}">${escapeHtml(label)}</td>`)+NOTIF_KINDS.map(k=>
       `<td style="text-align:center"><input type="checkbox" data-nick="${escapeAttr(n)}" data-kind="${k}"${h[k]?' checked':''}></td>`).join('')+'</tr>';
-  }).join('');
+  };
+  const groups=nickGroups(hosts,rcOrder());
+  body.innerHTML=groups
+    ? groups.map(g=>`<tr class="notif-group"><th colspan="4">${escapeHtml(rcGroupLabel(g.prefix))}</th></tr>`
+        +g.items.map(it=>row(it.nick,it.bare)).join('')).join('')
+    : hosts.map(n=>row(n)).join('');
   updateNotifAll();
 }
 function notifBoxes(kind){

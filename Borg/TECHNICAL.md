@@ -3293,7 +3293,7 @@ par nom nu restant. Mémoire des préfixes : `_rc_on_build` — échec -> `_RC['
 l'enfant en code 4 (`require_op` d'un nick nommé) — tout son rc sauté pour cette requête, là où `-n ALL` n'aurait écarté que lui.
 Fenêtre étroite (une modification du rc pendant la requête), aucune action faite à tort.
 
-**Push selftest** (25 contrôles) : liste du maître (liens), sorties exposées/fusionnées (appelant à périmètre, colonne au nom d'un
+**Push selftest** (27 contrôles depuis 1.32.1 ; 26 en 1.32.0) : liste du maître (liens), sorties exposées/fusionnées (appelant à périmètre, colonne au nom d'un
 nick), nettoyage, correctif `nick` absent (mode `-C`, chaque route à défaut, sans droit 403 / avec droits inchangé), route à un nick
 à périmètre (mode `-C` : 20 formes refusées sans lancement, témoin lancé), `/stats` sans nick (section à clé ALL contrôlée), nettoyage
 en `-C`, miroir DuIdx, garde AST, 14 démarrages (refusés et valide), précédence des modes (`--selftest` : aucun fichier créé),
@@ -3306,6 +3306,21 @@ réattribué : alertes, 409, `/access`, doute, levée ; CACHE_DIR inutilisable o
 instantané de requête), lectures réelles par rc (dépôts du bac : LstBkp, Report, TreeHist, téléchargements, invalidation des
 caches par rc, DuIdx `ALL`, `/access`, watcher, rapprochement). Les lectures réelles exigent deux nicks à dépôt local et
 `BORG_EXE` (bac lk) : FAIL sinon.
+
+**UI groupée par rc (1.32.1, UI 1.25.0, story 86b)** : `/access` `rc_order` (mode dossier seulement, dans `_dir`) =
+`[p for p in _rc_state().entries if p in préfixes lisibles]` — l'ordre de `_RcState.entries` est celui des lignes
+`[_borgHelperWWW_rc]` du maître (`_rc_build`), préfixes lisibles = ceux d'au moins un nick de niveau ≠ none (même ensemble que
+`suspended_prefixes` ; aucune confidentialité ajoutée : `nicks` liste déjà tout nick, `level:"none"` compris). UI : `rcOrder()` (null sans `rc_order` : mode `-C`, listes plates — rendu de 1.24.3) et un seul utilitaire
+`nickGroups(nicks, order)` -> `[{prefix, items:[{nick, bare}]}]` (ordre exposé, puis préfixes hors ordre triés, puis noms sans
+préfixe `''` ; nicks nus triés par comparaison de chaînes, comme `.sort()`) utilisé par `loadMachines` (cartes, barre de liens),
+`reloadMachineCard` (titre nu) et `renderHostsTable` (sous-titres `tr.notif-group`). Repli : `localStorage` `bhww_rc_collapsed`
+(tableau de préfixes, réduit aux préfixes affichés à chaque `loadMachines` ; illisible ou stockage indisponible : `[]`, tout
+déplié). Titre : `h3` > `button.rc-group-btn` (`aria-expanded`, `aria-controls` = id `rcg-<rang>` du corps). `showRcGroup` met à
+jour le DOM seul (lien rapide, `onMachinesJumpClick`), `setRcGroupCollapsed` le DOM et la mémoire (clic, `onMachinesListClick`),
+`rcGroupRefresh` relit le signe d'erreur sur les cartes (`.machine-card h3.nick-err`) du groupe. `machineCardLabels` : titre de
+chaque carte tel que la liste l'a dessiné, repris par `reloadMachineCard` (jamais relu sur un `/access` plus récent).
+Notifications abonné : `scope_nicks` figé (AD-4) groupé tel quel — préfixe illisible ou disparu : sous-titre après l'ordre. Push selftest : contrôle
+« /access rc_order » (ordre, maître inversé à chaud, droits).
 
 ---
 

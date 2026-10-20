@@ -81,7 +81,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.32.0"
+WWW_VERSION="1.32.1"
 # Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
 # nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
 # selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
@@ -4345,6 +4345,10 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
             # revue 3 (row 52) : seulement pour les nicks que l'appelant peut lire (rien révélé d'un nick sans droit)
             rd={n for n,v in resp['nicks'].items() if v.get('level')!='none'}
             resp['suspended_prefixes']=sorted({n.partition(':')[0] for n in rd if _push_suspended(n)})
+            # 1.32.1 (story 86b) : ordre des groupes de l'UI = lignes [_borgHelperWWW_rc] du maître ; préfixes que l'appelant peut
+            # lire seulement (au moins un nick lisible), comme suspended_prefixes
+            rp={n.partition(':')[0] for n in rd}
+            resp['rc_order']=[p for p in _rc_state().entries if p in rp]
             for n,v in resp['nicks'].items(): v['prefix_suspended']=n in rd and _push_suspended(n)
         return resp
     if not GROUPS_HEADER:
@@ -7724,6 +7728,7 @@ def push_selftest():
                         rn=client.get(f"{P}/access",headers={**H,'X-Groups':'aucun-groupe-selftest'})
                     none=[v for v in rn.json()['nicks'].values() if v['level']=='none']
                     ok=ok and none and all(not (keys & set(v)) for v in none)
+                    ok=ok and 'rc_order' not in r.json() and 'rc_order' not in rn.json()   # 1.32.1 (story 86b) : mode dossier seulement
                     if not ok: print(f"  /access : {r.status_code} {json.dumps(nk,ensure_ascii=False)[:400]}")
                     return bool(ok)
                 check("/access : external, ops, build, rebuild, bkp_running par nick lisible ; rien pour un nick sans droit",_access_state)
@@ -8824,6 +8829,11 @@ with mock.patch.object(w,'GROUPS_HEADER',None):
 out['u403']=[call('GET','/lstbkp',nick='db')[0],call('GET','/lstbkp',nick='xx:db')[0]]   # groupes actifs : comme un nick inconnu en -C
 out['g_mail']=call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'g-mail'})
 out['g_mail_web']=call('GET','/lstbkp',hdr={'X-API-Key':'k','X-Groups':'g-mail'},nick='web:db')[0]
+# 1.32.1 (story 86b) : rc_order — ordre du maître (web puis mail : jamais l'ordre alphabétique), préfixes lisibles par l'appelant seulement
+out['rc_order']=[call('GET','/access')[1].get('rc_order'),(out['g_mail'][1] or {}).get('rc_order'),
+                 call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'g-web'})[1].get('rc_order'),
+                 call('GET','/access',hdr={'X-API-Key':'k','X-Groups':'aucun-groupe-86b'})[1].get('rc_order')]
+with mock.patch.object(w,'GROUPS_HEADER',None): out['rc_order'].append(call('GET','/access')[1].get('rc_order'))
 # revue 3 (row 44) : g-mail à périmètre (/home) sur mail:db — nom à espaces, liste, doublon : 400, rien lancé (avant : périmètre lu sur
 # la chaîne brute -> illimité, nom nettoyé au lancement) ; (row 45) `nick=` vide : 404, rien lancé (avant : tous les nicks des rc)
 calls.clear()
@@ -8895,6 +8905,10 @@ put(m,m0.replace("mail.rc = mail\n","")); phase('retrait')
 put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = web\n")); phase('double')
 out['keep_failed']=w._push_prune_keep(set(w._nick_list('ALL')))('mail:zz')
 put(m,m0); phase('retour')
+# 1.32.1 (story 86b) : lignes du maître inversées -> rc_order suit, sans redémarrage (même taille : date avancée, relecture certaine)
+put(m,m0.replace("web.rc = web\nmail.rc = mail\n","mail.rc = mail\nweb.rc = web\n")); st_=os.stat(m); os.utime(m,ns=(st_.st_atime_ns,st_.st_mtime_ns+5*10**9))
+w._nick_list('ALL'); out['rc_order_swap']=call('GET','/access')[1].get('rc_order')
+put(m,m0); w._nick_list('ALL')
 # row 11 : liste invalide (ancienne gardée, mail dedans) puis mail.rc illisible -> jamais une erreur, aucun nettoyage
 put(m,m0.replace("mail.rc = mail\n","mail.rc = mail\nneu.rc = web\n")); w._nick_list('ALL')
 put(m,m0.replace("mail.rc = mail\n","neu.rc = web\n")); w._nick_list('ALL')   # liste refusée qui ne cite plus mail.rc
@@ -9077,6 +9091,12 @@ print('S86JSON:'+json.dumps(out,ensure_ascii=False))
                 if not ok: print(f"  {dm['g_mail']} ; web:db {dm['g_mail_web']}")
                 return ok
             check("mode dossier : niveaux et périmètres (GROUPS_*, GROUPS_PATHS) lus dans le rc du nick, sous son nom exposé (1.32.0)",_groups_ok)
+            def _rc_order_ok():
+                ok=dm['rc_order']==[['web','mail'],['mail'],['web'],[],['web','mail']] and dm['rc_order_swap']==['mail','web']
+                if not ok: print(f"  rc_order (tous, g-mail, g-web, aucun groupe, groupes inactifs) {dm['rc_order']} ; maître inversé {dm['rc_order_swap']}")
+                return ok
+            check("mode dossier : /access rc_order = ordre des lignes [_borgHelperWWW_rc] du maître (relu à chaud), préfixes que "
+                  "l'appelant peut lire seulement (1.32.1)",_rc_order_ok)
             def _scope_dir_ok():
                 ok=dm['scope1']==[400,400,400,400,0] and dm['empty']==[404,404,0]
                 if not ok: print(f"  route à un nick {dm['scope1']} ; nick vide {dm['empty']}")

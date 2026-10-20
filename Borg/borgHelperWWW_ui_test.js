@@ -7,6 +7,8 @@
 // chargements croisés, rechargement, réponses en erreur, échec partiel, bibliothèque absente ; UI >= 1.24.0 : axe temporel,
 // premier Prune, avec la vraie Chart.js de vendor/chartjs sur un canvas simulé) ; bandeau de nettoyage ; UI >= 1.24.1 :
 // messages d'erreur (respError) de l'explorateur, de sa recherche et des autres pages (403 capturé, JSON illisible).
+// UI >= 1.25.0 (story 86b) : mode dossier — liste, barre de liens et Notifications groupées par fichier de conf (rc_order),
+// repli mémorisé ; mode -C : rendu de 1.24.3 à l'octet près.
 //
 //   node borgHelperWWW_ui_test.js [chemin/vers/borgHelperWWW_ui.html]
 //
@@ -293,8 +295,8 @@ async ${grab('runBackupNow')}
   let reportStdout='', histLoads=[], versionJson={};
   const page=new Function('dom','hooks',`
     const document={getElementById:id=>dom.byId(id),querySelectorAll:()=>[],
-      createElement:()=>{ const el={set innerHTML(h){ this._h=h; this.firstElementChild={html:h,querySelector:()=>'panel'}; }}; return el; }};
-    let myAccess=null, currentNick=null, currentActionId=null, allowDestructive=true, restoreEnabled=true, machineCardsByNick={};
+      createElement:()=>{ const el={set innerHTML(h){ this._h=h; this.firstElementChild={html:h,querySelector:()=>'panel',closest:()=>null}; }}; return el; }};
+    let myAccess=null, currentNick=null, currentActionId=null, allowDestructive=true, restoreEnabled=true, machineCardsByNick={}, machineCardLabels={};
     let allowDownloads=true, API_PREFIX='/api', pushInfo=null;
     const fetch=async()=>({ok:true,json:async()=>hooks.version}), applyBadges=()=>{}, updateNotifBtn=()=>{};
     const SPINNER='…';
@@ -311,6 +313,7 @@ ${grab('selectAction')}
 async ${grab('loadFooterVersions')}
 ${grab('_renderHistoryRows')}
 ${grab('machineCardHtml')}
+${grab('rcGroupRefresh')}
 async ${grab('reloadMachineCard')}
     return {renderActionList,selectAction,loadFooterVersions,_renderHistoryRows,reloadMachineCard,
       set:(a,n)=>{ myAccess=a; currentNick=n; }, actions:()=>ACTIONS, cards:()=>machineCardsByNick};`)(dom,{hist:histLoads,report:()=>reportStdout,get version(){ return versionJson; }});
@@ -872,12 +875,14 @@ async ${grab('runBrowseSearch')}
     const other=new Function('odom','hooks',`
       const document={getElementById:id=>odom.byId(id)};
       ${grabLine('SPINNER')}
-      let myAccess=null, http10=false, machinesLoadSeq=0, historyLoadSeq=0;
+      let myAccess=null, http10=false, machinesLoadSeq=0, historyLoadSeq=0, machineCardLabels={};
       const applyBadges=()=>{}, renderCleanupNotice=()=>{};
       const apiCall=async()=>hooks.resp;
 ${grab('escapeHtml')}
 ${grab('respError')}
 async ${grab('loadMyAccess')}
+${grab('rcOrder')}
+${grab('nickGroups')}
 async ${grab('loadMachines')}
 async ${grab('loadHistoryInline')}
 async ${grab('loadHistoryFull')}
@@ -984,6 +989,191 @@ async ${grab('downloadViaFetch')}
   eq('téléchargement : flux coupé -> « interrompu », rien enregistré ; 502 -> détail du serveur ; succès -> fichier proposé',
      [cut,e502,okd],[["Téléchargement interrompu (échec de borg pendant l'envoi, ou coupure réseau) — fichier non enregistré.",false],
                      ['Téléchargement échoué : borg export-tar a échoué : x',false],['ok',true]]);
+  // UI 1.25.0 (borgHelperWWW 1.32.1, story 86b) : mode dossier — liste des serveurs, barre de liens et Notifications groupées par
+  // fichier de conf (/access rc_order), repli mémorisé (localStorage) ; mode -C (rc_order absent) : rendu de 1.24.3 à l'octet près
+  // (empreintes relevées en passant ce même décor sur borgHelperWWW_ui.html de e790e8b, UI 1.24.3).
+  // >>> 86b-harness (bloc relu tel quel pour relever les empreintes de 1.24.3 : ne dépend que de `s`)
+  const grabIn=(s,name)=>{ const i=s.indexOf('function '+name+'('); if(i<0) return '';
+    let d=0,j=s.indexOf('{',i); for(;;j++){ if(s[j]==='{') d++; else if(s[j]==='}' && --d===0) break; } return s.slice(i,j+1); };
+  // Faux DOM tiré du HTML produit : groupes (data-prefix, corps replié, bouton, compte, signe d'erreur) et cartes retrouvées par le
+  // nom complet de leurs boutons (data-nick désechappé, comme dataset) — closest, replaceWith, scrollIntoView comme le vrai.
+  const unesc=x=>x.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&');
+  const mkCard=(html,group,h)=>({html,group,isConnected:true,nick:unesc((/class="secondary explore-btn" data-nick="([^"]*)"/.exec(html)||[,''])[1]),
+    querySelector:()=>'panel',closest(sel){ return sel==='.rc-group'?this.group:null; },
+    scrollIntoView(){ h.scrolled.push(this.nick); },
+    replaceWith(n){ n.group=this.group; if(this.group){ const i=this.group.cards.indexOf(this); this.group.cards[i]=n; } this.isConnected=false; }});
+  const mkGroup=(seg)=>{
+    const part=()=>({hidden:false,textContent:'',attrs:{},setAttribute(k,v){ this.attrs[k]=v; }});
+    const g={dataset:{prefix:unesc(/^data-prefix="([^"]*)"/.exec(seg)[1])},cards:[],caret:part(),sum:part(),err:part(),
+      body:Object.assign(part(),{hidden:/class="rc-group-body"[^>]*hidden>/.test(seg),
+        querySelector(sel){ return sel==='.machine-card h3.nick-err' && g.cards.some(c=>c.html.includes('<h3 class="nick-err">')) ? {} : null; }})};
+    g.btn=Object.assign(part(),{querySelector:sel=>sel==='.rc-group-caret'?g.caret:null});
+    g.btn.attrs['aria-expanded']=(/aria-expanded="(\w+)"/.exec(seg)||[])[1];
+    g.caret.textContent=(/class="rc-group-caret"[^>]*>([^<]*)</.exec(seg)||[])[1];
+    g.sum.hidden=/class="rc-group-sum" hidden>/.test(seg); g.err.hidden=/class="rc-group-err"[^>]* hidden>/.test(seg);
+    g.querySelector=sel=>({'.rc-group-body':g.body,'.rc-group-btn':g.btn,'.rc-group-sum':g.sum,'.rc-group-err':g.err})[sel]||null;
+    return g; };
+  const listDom=(h)=>({els:{},byId(id){ return this.els[id]||(this.els[id]={id,hidden:false,textContent:'',_h:'',groups:[],
+    get innerHTML(){ return this._h; }, set innerHTML(v){ this._h=String(v); },
+    querySelectorAll(sel){
+      if(sel!=='.machine-card') return [];
+      const segs=this._h.includes('<div class="rc-group" ') ? this._h.split('<div class="rc-group" ').slice(1) : [null];
+      this.groups=[]; const out=[];
+      segs.forEach(seg=>{ const g=seg===null?null:mkGroup(seg); if(g) this.groups.push(g);
+        (seg===null?this._h:seg).split('<div class="machine-card ').slice(1).forEach(c=>{ const k=mkCard(c,g,h); if(g) g.cards.push(k); out.push(k); }); });
+      return out; }}); }});
+  const listHarness=(s,h)=>{
+    const ls=(s.match(/^const LS_RC_COLLAPSED=.*$/m)||[''])[0];
+    return new Function('h',`
+    const document={getElementById:id=>h.dom.byId(id),querySelectorAll:()=>[],
+      createElement:()=>({set innerHTML(v){ this.firstElementChild=h.mkCard(String(v),null,h); }})};
+    const SPINNER='…', NOTIF_KINDS=['start','success','error'], NOTIF_DEFAULT_HOST={start:false,success:true,error:true};
+    let myAccess=null, machinesLoadSeq=0, machineCardsByNick={}, machineCardLabels={}, notifServer=null;
+    const localStorage=h.localStorage; ${ls}
+    const loadMyAccess=async()=>{ myAccess=h.access; return h.access; };
+    const apiCall=async(m,p,params)=>{ h.sent.push(params.nick); return h.report(params); };
+    const getPassphrases=()=>h.passes, getPassphrase=()=>'', loadHistoryInline=n=>h.hist.push(n), updateNotifAll=()=>{};
+    const openMachine=n=>h.opened.push(n), openHistory=n=>h.opened.push('hist '+n), openBrowse=()=>{}, runBackupNow=n=>h.opened.push('bkp '+n);
+    ${['escapeHtml','escapeAttr','respError','opAllowed','stateBadges','badgeFor','dbEncryptCmd','plainDbBadge','machineCardHtml',
+       'rcOrder','nickGroups','rcGroupLabel','rcCollapsed','rcCollapsedSave','setRcCollapsed','rcGroupHtml','showRcGroup','setRcGroupCollapsed',
+       'rcGroupRefresh','onMachinesJumpClick','onMachinesListClick','notifHostList','renderHostsTable'].map(n=>grabIn(s,n)).join('\n')}
+    async ${grabIn(s,'loadMachines')}
+    async ${grabIn(s,'reloadMachineCard')}
+    return {loadMachines,renderHostsTable,setAccess:a=>{ myAccess=a; },setNotif:x=>{ notifServer=x; },cards:()=>machineCardsByNick,
+            fn:n=>{ try{ return eval(n); }catch(e){ return null; } }};`)(h);
+  };
+  const summaryOf=(nicks,err)=>JSON.stringify({summary:Object.assign({Totaux:{}},...nicks.map(n=>({[n]:
+    {nom:(err.includes(n)?'***':'')+n,'date derniere':'2026-10-20 02:00',depuis:err.includes(n)?'60.00 h':'3.00 h',duree:'0:01:00',
+     taille:'1.00 GB',recuperable:'—',reste:'9 GB',modifications:'1%nb / 1.00 MB'}})))});
+  const runList=async(s,o)=>{
+    const h={access:o.access,sent:[],hist:[],opened:[],scrolled:[],passes:o.passes||{},localStorage:o.ls,mkCard,err:o.err||[],
+      report:p=>({httpStatus:200,exitcode:0,stderr:'',stdout:summaryOf((p.nick==='ALL'?o.all:p.nick.split(',')),h.err)})};
+    h.dom=listDom(h);
+    const ui=listHarness(s,h); await ui.loadMachines();
+    let notif=null, notifSub=null;
+    if(ui.renderHostsTable){
+      ui.renderHostsTable(o.prefs||null); notif=h.dom.byId('notifHostsBody').innerHTML;
+      if(o.scope){ ui.setNotif({scope_nicks:o.scope,hosts:{}}); ui.renderHostsTable({}); notifSub=h.dom.byId('notifHostsBody').innerHTML; }
+    }
+    return {list:h.dom.byId('machinesList').innerHTML,jump:h.dom.byId('machinesJump').innerHTML,hist:h.hist,sent:h.sent,
+            cards:Object.keys(ui.cards()),notif,notifSub,ui,h};
+  };
+  const cFix={access:{groups_auth_enabled:false,nicks:{'srv-b':{level:'admin',db_plain:['diff.db']},'srv-a':{level:'admin',external:true,ops:['read','restore']},
+                                                       "o'k&<x>":{level:'admin',bkp_running:{started_at:'x'}}}},
+              all:['srv-b','srv-a',"o'k&<x>"],err:['srv-b'],passes:{'srv-a':'pw'},ls:{getItem:()=>'["srv-a"]',setItem(){}},
+              prefs:{'srv-a':{start:true,success:false,error:true}},scope:['srv-b','zz:old','srv-a']};
+  // <<< 86b-harness
+  try{
+    const crypto=require('crypto'), sha=x=>crypto.createHash('sha256').update(String(x)).digest('hex').slice(0,16);
+    const c=await runList(src,cFix);
+    const got=[sha(c.list),sha(c.jump),sha(c.notif),sha(c.notifSub),c.hist,c.sent,c.cards];
+    eq('mode -C (rc_order absent) : liste, barre de liens, Notifications (avant/après abonnement) identiques à 1.24.3, aucun groupe',
+       [...got,/rc-group|jump-group|notif-group/.test(c.list+c.jump+c.notif+c.notifSub)],
+       ['f2e34317c8bb866c','7a19973977a458f2','f8f5e7fd718be40c','7295f89b8623f2d2',["o'k&<x>",'srv-a','srv-b'],['ALL'],["o'k&<x>",'srv-a','srv-b'],false]);
+    eq('mode -C : chaque carte rangée sous le nom de ses boutons ; aucun groupe dans le faux DOM',
+       [c.cards.every(n=>c.ui.cards()[n].nick===n),c.h.dom.byId('machinesList').groups.length],[true,0]);
+  }catch(e){ eq('mode -C (story 86b) : rendu sans exception',String(e&&e.stack||e),''); }
+  try{
+    // Mode dossier : ordre du maître web puis mail (jamais alphabétique), préfixe hors de l'ordre (zz) en dernier, nicks nus triés.
+    const mem={v:null,w:0}; const store={getItem:()=>mem.v,setItem:(k,v)=>{ mem.k=k; mem.v=v; mem.w++; }};
+    const dAcc=(order,mailLevel)=>({groups_auth_enabled:true,rc_order:order,nicks:{'web:front':{level:'read'},'web:db':{level:'read'},
+      'mail:imap':{level:mailLevel},'mail:db':{level:mailLevel},'zz:x':{level:'read'},'secret:y':{level:'none'}}});
+    const dFix=(o)=>Object.assign({access:dAcc(['web','mail'],'read'),all:[],err:['mail:db'],ls:store},o||{});
+    const heads=h=>[...h.matchAll(/<div class="rc-group" data-prefix="([^"]*)">/g)].map(m=>m[1]);
+    const text=h=>h.replace(/<[^>]*>/g,'').replace(/\s+/g,' ').trim();
+    const grp=(r,p)=>r.h.dom.byId('machinesList').groups.find(g=>g.dataset.prefix===p);
+    const folded=(r,p)=>{ const g=grp(r,p); return [g.body.hidden,g.sum.hidden?null:'compte',!g.err.hidden]; };
+    // clic réel sur le titre (onMachinesListClick) et sur un lien rapide (onMachinesJumpClick)
+    const clickTitle=(r,p)=>r.ui.fn('onMachinesListClick')({target:{closest:sel=>sel==='.rc-group-btn'?{closest:s2=>s2==='.rc-group'?grp(r,p):null}:null}});
+    const clickJump=(r,n)=>{ let prevented=false; r.ui.fn('onMachinesJumpClick')({target:{closest:sel=>sel==='.jump-link'?{dataset:{nick:n}}:null},preventDefault(){ prevented=true; }}); return prevented; };
+    const d=await runList(src,dFix());
+    eq('mode dossier : Report demandé pour les seuls nicks lisibles (noms complets)',d.sent,['mail:db,mail:imap,web:db,web:front,zz:x']);
+    eq('mode dossier : groupes dans l\'ordre du maître (web, mail), préfixe absent de rc_order en dernier',heads(d.list),['web','mail','zz']);
+    const lst=d.h.dom.byId('machinesList');
+    eq('mode dossier : cartes dans l\'ordre des groupes, nicks nus triés ; chaque carte rangée sous le nom complet de SES boutons, dans son groupe',
+       [d.hist,d.cards,d.cards.every(n=>d.ui.cards()[n].nick===n),lst.groups.map(g=>g.dataset.prefix+'='+g.cards.map(c=>c.nick).join(','))],
+       [['web:db','web:front','mail:db','mail:imap','zz:x'],['web:db','web:front','mail:db','mail:imap','zz:x'],true,
+        ['web=web:db,web:front','mail=mail:db,mail:imap','zz=zz:x']]);
+    const titles=[...d.list.matchAll(/<h3[^>]*><span title="([^"]*)">([^<]*)<\/span>/g)].map(m=>m[1]+'='+m[2]);
+    const btns=[...new Set([...d.list.matchAll(/class="open-machine-btn" data-nick="([^"]*)"/g)].map(m=>m[1]))];
+    eq('mode dossier : carte titrée du nick nu (nom complet en infobulle), boutons au nom complet, nick sans droit absent',
+       [titles,btns,/secret|data-nick="db"/.test(d.list+d.jump)],
+       [['web:db=db','web:front=front','mail:db=db','mail:imap=imap','zz:x=x'],['web:db','web:front','mail:db','mail:imap','zz:x'],false]);
+    eq('mode dossier : barre de liens groupée « web : db · front │ mail : db · imap │ zz : x », liens au nom complet, erreur marquée',
+       [text(d.jump),[...d.jump.matchAll(/data-nick="([^"]*)"/g)].map(m=>m[1]),[...d.jump.matchAll(/jump-err" data-nick="([^"]*)"/g)].map(m=>m[1])],
+       ['web : db · front │ mail : db · imap │ zz : x',['web:db','web:front','mail:db','mail:imap','zz:x'],['mail:db']]);
+    const gh=/<div class="rc-group" data-prefix="web"><h3 class="rc-group-head"><button type="button" class="rc-group-btn" aria-expanded="true" aria-controls="(rcg-\d+)"[^>]*><span class="rc-group-caret" aria-hidden="true">/.exec(d.list);
+    eq('titre de groupe : h3 gardé, bouton natif (aria-expanded, aria-controls = id du corps), flèche aria-hidden ; aucun keydown maison',
+       [!!gh,!!gh && d.list.includes(`<div class="rc-group-body" id="${gh[1]}">`),/machinesList'\)\.addEventListener\('keydown'/.test(src)],[true,true,false]);
+    eq('mode dossier : tout déplié par défaut (rien de mémorisé)',['web','mail','zz'].map(p=>folded(d,p)),[[false,null,false],[false,null,false],[false,null,false]]);
+    // Clic réel sur « mail » -> replié, mémorisé ; ouverture d'une carte au nom complet par le même gestionnaire
+    clickTitle(d,'mail'); const gm=grp(d,'mail');
+    d.ui.fn('onMachinesListClick')({target:{closest:sel=>sel==='.open-machine-btn'?{dataset:{nick:'mail:imap'}}:null}});
+    eq('clic sur le titre « mail » : corps masqué, aria-expanded false, ▸, compte et ⚠ visibles, mémorisé ; bouton Ouvrir -> nom complet',
+       [gm.body.hidden,gm.btn.attrs['aria-expanded'],gm.caret.textContent,gm.sum.hidden,gm.err.hidden,mem.k,mem.v,d.h.opened],
+       [true,'false','▸',false,false,'bhww_rc_collapsed','["mail"]',['mail:imap']]);
+    const d2=await runList(src,dFix());
+    eq('rechargement : mail replié (« 2 serveurs », ⚠ erreur), web et zz dépliés ; cartes de mail toujours rendues',
+       [['web','mail','zz'].map(p=>folded(d2,p)),/class="rc-group-sum">2 serveurs</.test(d2.list),d2.cards.length],
+       [[[false,null,false],[true,'compte',true],[false,null,false]],true,5]);
+    // Lien rapide vers mail:imap (groupe replié) : déplié à l'écran seulement, défilement vers SA carte, choix gardé
+    const w0=mem.w; const prev=clickJump(d2,'mail:imap'); const gm2=grp(d2,'mail');
+    eq('lien rapide vers un groupe replié : déplié à l\'écran (▾, compte masqué), défilement vers la carte visée, mémoire inchangée',
+       [prev,gm2.body.hidden,gm2.caret.textContent,gm2.sum.hidden,d2.h.scrolled,mem.v,mem.w-w0],[true,false,'▾',true,['mail:imap'],'["mail"]',0]);
+    const d3=await runList(src,dFix());
+    eq('rechargement après le lien rapide : mail toujours replié',folded(d3,'mail')[0],true);
+    clickTitle(d3,'web'); const v1=mem.v; clickTitle(d3,'web'); const v2=mem.v;
+    eq('clic sur « web » deux fois : mémorisé avec mail puis retiré',[v1,v2],['["mail","web"]','["mail"]']);
+    // Mémoire réduite aux préfixes affichés (préfixe disparu oublié) ; rien réécrit quand il n'y a rien à retirer
+    mem.v='["gone","mail"]'; const w1=mem.w; await runList(src,dFix());
+    const w2=mem.w; await runList(src,dFix());
+    eq('mémoire réduite aux préfixes affichés : préfixe disparu retiré ; aucune écriture s\'il n\'y a rien à retirer',[mem.v,w2-w1,mem.w-w2],['["mail"]',1,0]);
+    // Rechargement d'une carte en fin de Bkp (vrai reloadMachineCard, mode dossier) : titre nu de la liste dessinée même si un
+    // /access plus récent n'a plus rc_order (row 6) ; carte remplacée sous son nom complet ; ⚠ du groupe replié à jour
+    const r4=await runList(src,dFix({err:[]})); const gm4=grp(r4,'mail'); const old4=r4.ui.cards()['mail:imap'];
+    const before4=[gm4.body.hidden,gm4.err.hidden];
+    r4.ui.setAccess({groups_auth_enabled:true,nicks:dAcc([],'read').nicks}); r4.h.err=['mail:imap'];
+    await r4.ui.fn('reloadMachineCard')('mail:imap'); const new4=r4.ui.cards()['mail:imap'];
+    eq('reloadMachineCard (mode dossier) : titre nu dessiné (pas relu sur /access), carte remplacée dans son groupe, ⚠ du groupe replié affiché',
+       [before4,new4!==old4,new4.nick,/<h3 class="nick-err"><span title="mail:imap">imap<\/span>/.test(new4.html),gm4.cards.includes(new4),gm4.err.hidden,
+        r4.h.hist.slice(-1)],[[true,true],true,'mail:imap',true,true,false,['mail:imap']]);
+    const boom={getItem(){ throw new Error('SecurityError'); },setItem(){ throw new Error('SecurityError'); }};
+    const d4=await runList(src,dFix({ls:boom})); const open4=['web','mail','zz'].map(p=>folded(d4,p)[0]);
+    let thrown=false; try{ clickTitle(d4,'web'); }catch(e){ thrown=true; }
+    eq('stockage indisponible : tout déplié, clic sur un titre sans exception (replié à l\'écran)',
+       [open4,thrown,grp(d4,'web').body.hidden],[[false,false,false],false,true]);
+    mem.v='{"pas":"un tableau"}'; const d5=await runList(src,dFix());
+    eq('mémoire illisible (pas un tableau) : tout déplié',['web','mail','zz'].map(p=>folded(d5,p)[0]),[false,false,false]);
+    mem.v=null;
+    // Droits : appelant sans droit sur mail -> groupe mail absent partout (liste, barre, Notifications)
+    const r=await runList(src,dFix({access:dAcc(['web'],'none')}));
+    eq('droits : sans droit sur mail, rc_order sans mail -> groupe mail absent (liste, barre, Notifications), Report sans mail',
+       [heads(r.list),/mail/.test(r.list+r.jump+r.notif),r.sent],[['web','zz'],false,['web:db,web:front,zz:x']]);
+    // Notifications : sous-titres par fichier de conf dans le même ordre, nick nu affiché, cases au nom complet
+    const subt=h=>[...h.matchAll(/<tr class="notif-group"><th colspan="4">([^<]*)<\/th><\/tr>/g)].map(m=>m[1]);
+    const rows=h=>[...h.matchAll(/<tr><td title="([^"]*)">([^<]*)<\/td>/g)].map(m=>m[1]+'='+m[2]);
+    const boxes=h=>[...new Set([...h.matchAll(/data-nick="([^"]*)" data-kind/g)].map(m=>m[1]))];
+    eq('Notifications : sous-titres web, mail, zz ; nicks nus triés ; cases au nom complet',[subt(d.notif),rows(d.notif),boxes(d.notif)],
+       [['web','mail','zz'],['web:db=db','web:front=front','mail:db=db','mail:imap=imap','zz:x=x'],['web:db','web:front','mail:db','mail:imap','zz:x']]);
+    const ds=await runList(src,dFix({scope:['zz:x','old','mail:db','gone:z','web:front']}));
+    eq('Notifications abonné (portée figée de l\'abonnement) : ordre du maître, préfixes hors ordre triés, nom sans préfixe en dernier',
+       [subt(ds.notifSub),boxes(ds.notifSub)],[['web','mail','gone','zz','(sans préfixe)'],['web:front','mail:db','gone:z','zz:x','old']]);
+    // Noms hostiles (préfixe et nick nu) : échappés dans les titres de groupe, la barre, les cartes et les Notifications
+    const HP=`p<"&'x`, HN=`${HP}:n<b>&"'`, eHP='p&lt;&quot;&amp;&#39;x', eHB='n&lt;b&gt;&amp;&quot;&#39;';
+    const hz=await runList(src,dFix({access:{groups_auth_enabled:true,rc_order:[HP],nicks:{[HN]:{level:'read'}}},err:[]}));
+    const all=hz.list+hz.jump+hz.notif;
+    eq('noms hostiles : échappés partout (titre de groupe, barre, titre de carte, Notifications), jamais bruts ; carte retrouvée par son nom',
+       [/<b>|p<"/.test(all),hz.list.includes(`data-prefix="${eHP}"`),hz.list.includes(`<span class="rc-group-name">${eHP}</span>`),
+        hz.list.includes(`<span title="${eHP}:${eHB}">${eHB}</span>`),hz.jump.includes(`<span class="jump-prefix">${eHP} :</span>`),
+        hz.jump.includes(`title="${eHP}:${eHB}">${eHB}</a>`),hz.notif.includes(`<th colspan="4">${eHP}</th>`),
+        hz.notif.includes(`<td title="${eHP}:${eHB}">${eHB}</td>`),hz.ui.cards()[HN] && hz.ui.cards()[HN].nick===HN],
+       [false,true,true,true,true,true,true,true,true]);
+    // Utilitaire de regroupement
+    const ng=d.ui.fn('nickGroups');
+    eq('nickGroups : null sans rc_order (mode -C) ; ordre exposé, puis hors ordre triés ; nicks nus triés ; doublon de l\'ordre ignoré',
+       [ng(['a','b'],undefined),ng(['m:b','w:z','w:a','q:c','m:a'],['w','m','w']).map(g=>g.prefix+'='+g.items.map(i=>i.bare).join(','))],
+       [null,['w=a,z','m=a,b','q=c']]);
+  }catch(e){ eq('mode dossier (story 86b) : rendu sans exception',String(e&&e.stack||e),''); }   // exception = FAIL, jamais un plantage du test
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();
