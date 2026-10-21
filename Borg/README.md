@@ -77,6 +77,7 @@ MAX_AGE_BKP      = 25
 #   bkp_error : sauvegarde en échec (ou bloquée au-delà du délai du watcher de borgHelperWWW)
 #   overdue   : dernière sauvegarde plus vieille que MAX_AGE_BKP (détectée par borgHelperWWW, rappel à
 #               chaque période supplémentaire)
+#   storage   : stockage presque plein (borgHelper >= 1.0.209, au franchissement de STORAGE_ALERT / STORAGE_ALERT_DAYS)
 # liste séparée par des virgules, ou all ; utilisable dans [DEFAULT] pour tous les serveurs
 SENTRY_ALERTS    = bkp_error,overdue
 # Délai au-delà duquel un Bkp démarré mais jamais fini est tenu pour interrompu (borgHelper >= 1.0.155,
@@ -103,6 +104,15 @@ SSH_KEY          = /root/.ssh/id_borg
 # Nom de l'hôte de stockage (borgHelper >= 1.0.208, commande Storage) : remplace celui tiré de BORG_REPO
 # (user@hôte[:port], cible du tunnel SSH_REMFO, point de montage d'un dépôt local)
 # STORAGE        = baie1
+# Place libre et alertes (borgHelper >= 1.0.209, mesure à la fin de chaque Bkp ; voir Storage) — utilisables dans [DEFAULT] :
+# capacité déclarée du stockage, utilisée quand ni df local ni df par ssh ne répondent (serveur borg serve seul) :
+# libre = capacité - taille des dépôts du stockage, affichée « ~ »
+# STORAGE_SIZE   = 2T
+# alerte au premier seuil atteint : nombre seul de 1 à 100 = % occupé (défaut 90), ou place libre AVEC unité (50G) ;
+# off : éteint ; autre valeur : [WARN] et 90
+# STORAGE_ALERT  = 90
+# jours restants (place libre / croissance mensuelle du stockage, mesurée sur 7 jours au moins), défaut 30 ; 0 : éteint
+# STORAGE_ALERT_DAYS = 30
 
 # Identifiant SQLite (optionnel — surcharge le nick dans le nom des fichiers DB)
 # -> borghelperrc-mon-serveur-home-cache.db / -diff.db / -history.db
@@ -347,7 +357,10 @@ dit une fois dans son propre journal, à sa première alerte. Depuis 1.0.132, Se
   sauvegarde en échec, envoyée par borgHelper à la fin du `Bkp`, ou sauvegarde bloquée constatée par borgHelperWWW ;
   `overdue` — dernière sauvegarde plus vieille que `MAX_AGE_BKP`, constatée par le watcher de borgHelperWWW (qui doit
   donc tourner), une alerte au franchissement puis un rappel à chaque période supplémentaire, indépendamment des
-  notifications push. Événements de niveau `error`, étiquetés `alert`/`nick`, regroupés par (type, serveur).
+  notifications push ; `storage` (1.0.209) — stockage presque plein, envoyée par borgHelper à la fin du `Bkp` qui franchit le
+  seuil, une fois par franchissement et par stockage (étiquette `nick` = identité du stockage, empreinte de son nom — jamais
+  son nom, qui peut être un chemin ; le nom est dans le message). Événements de niveau `error`, étiquetés
+  `alert`/`nick`, regroupés par (type, serveur).
 
 Chemins et passphrase sont masqués dans tout ce qui part (voir TECHNICAL.md, AD-15).
 
@@ -501,6 +514,11 @@ graphique « Fichiers modifiés par archive » de l'interface web. Actif aussi a
 
 En mode debug (`-d`), `borgHelper_files` s'ajoute avec la liste complète des fichiers touchés.
 
+Depuis 1.0.209, la fin du Bkp mesure aussi la place libre du stockage du nick (df local, df par ssh, sinon capacité déclarée
+`STORAGE_SIZE` ; budget de 10 s, ~11 s dans le pire cas, jamais un échec du Bkp) : `borgHelper_storage` (`storage`, `source`, `free`, `size`, `used`,
+`pct`, `days_left`, `measured_at`, `approx`, `reason`, `quota`, `alert` — le dépôt dépasse son seuil —, `alert_sent`) — voir [Place libre et
+alertes](#place-libre-et-alertes-10209).
+
 ---
 
 ### `Prune`
@@ -540,7 +558,9 @@ borgHelper -c Report -n ALL -o -j          # offline + JSON
 borgHelper -c Report -n ALL -o -N 10       # offline + 10 dernières archives
 ```
 
-Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde.  
+Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sauvegarde, ou (1.0.209) si le dépôt d'un nick dépasse
+le seuil d'alerte de son stockage (« ⚠ stockage presque plein » dans `reste`, nick en alerte `***`, ligne rouge en HTML — voir
+[Place libre et alertes](#place-libre-et-alertes-10209)) ; un cron qui alerte sur le code de Report le voit donc aussi.  
 Code retour 2 si un dépôt est inaccessible.
 
 Report pendant un Bkp (1.0.183) : un nick dont le Bkp tourne — marqueur du Bkp vivant dans `CACHE_DIR`
@@ -1504,8 +1524,9 @@ vaut `null`, mais `bkp_running`, `rebuild` et `priority_op_running` (lisibles sa
 
 ### `Storage`
 Vue par hôte de stockage (1.0.208) : les dépôts des nicks regroupés par machine qui les porte, leur taille cumulée et leur
-croissance — **sans jamais lancer borg ni ssh** (mesures de `history.db`, `df` pour un dépôt local). Report est inchangé ; la
-place libre et les alertes avant plein viendront avec la story 87b.
+croissance — **sans jamais lancer borg ni ssh** (mesures de `history.db`, `df` pour un dépôt local). Depuis 1.0.209 : la place
+libre de chaque stockage, mesurée à la fin du dernier Bkp, et l'alerte « ⚠ stockage presque plein » (voir
+[Place libre et alertes](#place-libre-et-alertes-10209)).
 
 ```bash
 borgHelper -c Storage                        # tous les nicks du fichier de conf, texte
@@ -1594,6 +1615,12 @@ JSON (tailles en octets, dates UTC de `repo_stats`) :
  "errors": {"srv": "BORG_REPO absent du rc"}}
 ```
 
+Depuis 1.0.209, chaque dépôt porte `space` (sa dernière place mesurée, voir ci-dessous — sans étiquette ni occupation du système
+de fichiers ; `null` : jamais mesuré) et `alert` (il dépasse le seuil d'un de ses nicks) ; chaque stockage, `alert` (l'un de ses dépôts) et `space` (son dépôt le plus plein). Le texte
+ajoute « — ⚠ stockage presque plein » à la ligne du stockage et, sous chaque dépôt mesuré,
+`    place : 92 % occupé, 150.00 GB libres, ~12 j restants (df ssh, 2026-10-20 14:03)` (ou
+`    place inconnue depuis 2026-10-20 14:03 (df ssh : refusé (code 2 …)) — dernière mesure connue : …`).
+
 `kind` : `ssh`, `tunnel` ou `local` (accès au dépôt) ; `named` : nom posé par `STORAGE` (du stockage, et de chaque dépôt) ;
 `repo` : une des écritures du dépôt (la plus petite) ; `kind` `autre` : forme borg 2 rangée par `STORAGE`. Code 1 dès qu'un
 nick est en erreur — inconnu du rc (`DEFAULT` et les sections `_…` compris), `BORG_REPO` absent ou de forme borg 2 sans
@@ -1620,6 +1647,74 @@ générique ci-dessus (ses nicks sont omis) ; nicks d'un rc lus une fois par req
 vise le rc du nick (`borgHelper -C <rc préfixe> -c Status -n <nick nu>`). UI : bloc **Stockages** au-dessus de la liste des serveurs, erreurs dessous.
 
 ---
+
+
+#### Place libre et alertes (1.0.209)
+
+La place libre de chaque **dépôt** est **mesurée à la fin de chaque Bkp** du nick (après la mesure de taille du dépôt et l'Index
+de fin, tous verrous rendus : un Restore, un Prune ou un Index en pause n'attend jamais la mesure ; après la fin enregistrée du
+Bkp — le push de fin ne l'attend jamais, un Ctrl-C pendant elle ne change ni le résultat ni le code — et, en échec, l'alerte
+`bkp_error` ; JSON de sortie imprimé ensuite — un SIGTERM pendant la mesure, arrêt systemd ou délai de borgHelperWWW, laisse
+un Bkp déjà enregistré « success » sortir en 143 sans JSON) et gardée dans `history.db` (table `storage_space`,
+purgée comme `repo_stats`). Storage, Report, borgHelperWWW (`/storage`) et l'UI lisent la dernière mesure : **jamais de ssh ni de
+borg à l'affichage**. Source, dans cet ordre :
+
+1. **df local** quand le dépôt est sur cette machine : dépôt local (sauf avec `SSH_REPO` ou `SSH_REMFO` : le borg du Bkp tourne
+   alors sur `SER_NAME`), hôte ssh qui est cette machine sur le port 22 (un autre port — redirection `-L`, conteneur, VM — est un
+   autre système : mesuré par ssh), ou contre-tunnel (`SSH_REMFO` dont la cible est cette machine, port 22, ex. `8022:localhost:22`
+   : le borg distant revient se connecter ici ; chemin relatif ou `~u` lu dans le dossier personnel de l'utilisateur du dépôt).
+   Dossier illisible ici ou utilisateur inconnu ici (dépôt d'un autre compte) : mesuré par ssh ;
+2. sinon **df par ssh** : `<BORG_RSH|ssh> -o BatchMode=yes -o ConnectTimeout=4 -o ControlMaster=no -o ControlPath=none [-p port]
+   [user@]hôte "sh -c '…df --output=avail,size,used -B1 -- <chemin> 2>/dev/null || df -P -k -- <chemin>'"` (`timeout 5 df` quand
+   `timeout 5 true` marche à distance ; un df bloqué sur NFS peut survivre au `timeout`, mais ssh est tué à 6 s, et avec borgHelper) — options placées juste après
+   l'exécutable ssh de `BORG_RSH` (qui ne peut pas les défaire), même utilisateur, hôte et port que `BORG_REPO` (tunnel : ceux de
+   sa cible), chemin cité pour le shell distant (relatif : dans le dossier personnel distant), repli `df -P` pour un df sans
+   `--output` (BusyBox, FreeBSD), 6 s au plus ; un serveur borg à clé forcée (`borg serve --restrict-to-path`) le refuse en ~1 s
+   (code 2) ;
+3. sinon **capacité déclarée** `STORAGE_SIZE` (clé de nick ou `[DEFAULT]`, `2T`, `500G` ; base 1000, `TiB` : 1024 ; une par
+   stockage — la plus petite de ses nicks — ; 0 ou illisible : `[WARN]`, écartée) : libre = capacité − taille mesurée des dépôts du
+   stockage, affichée « `~` » — jamais à la place d'un df de moins de 7 jours du même dépôt, quel que soit le nick qui l'a mesuré ;
+4. sinon **place inconnue**, avec la raison des sources écartées (« `df ssh : refusé (code 2 : clé à commande forcée, borg
+   serve ?)` », « `df ssh : pas de réponse en 6 s` », « `STORAGE_SIZE absent` »…). Une taille de système de fichiers nulle, ou
+   occupé + libre nuls (FUSE, rclone), compte comme inconnue.
+
+`% occupé` = occupé / (occupé + libre), comme `df`. Le quota borg (`storage_quota`) n'est lu que pour un dépôt de cette machine,
+dans son fichier `config` (`borg config` refuse un dépôt distant) : il borne la place (libre = min(libre, quota − taille du
+dépôt), taille = min(taille, quota)) et donc l'alerte. La mesure tient dans un budget de 10 s, tout compris (nom de la machine 1 s au
+plus, résolution de son propre dépôt 5 s au plus, ~1 s gardée pour Sentry) ; pire cas réel ~11 s (marque « Sentry envoyé »
+0,5 s, planchers de 0,1 s des attentes SQLite) :
+seules les bases des nicks du même stockage sont lues ; les autres nicks ne sont lus que par leur section du rc, leurs dépôts
+locaux résolus par un enfant borné (3 s au plus, sans ouverture — jamais d'accès disque non borné dans borgHelper : un NFS figé
+d'un autre nick ne bloque rien) ; `~` d'un dépôt LOCAL n'est jamais développé (borg non plus : `BORG_REPO=~/r` est le dossier
+`<dossier courant>/~/r`) ; `~` d'un dépôt ssh de cette machine est le dossier du compte de connexion ; la mesure est gardée sous
+l'identité résolue du dépôt (deux chemins vers le même dépôt par un lien : un seul dépôt ; mesure non résolue : la dernière
+identité résolue) et sous son chemin écrit, par lequel Storage et Report la retrouvent sans rien résoudre ; attentes et écriture bornées ; elle n'en change jamais le code (erreur : `[WARN] <nick>: place du stockage non mesurée (…)`). Le JSON du Bkp la donne dans `borgHelper_storage`.
+
+**Alerte** — par stockage, une seule pour plusieurs nicks : chaque dépôt est évalué sur sa dernière mesure avec les seuils de
+chacun de ses nicks ; le stockage est en alerte dès qu'un dépôt dépasse, réarmé quand aucun ne dépasse (un second disque sous le
+seuil ne réarme rien). Premier critère atteint :
+- `STORAGE_ALERT` : nombre seul de 1 à 100 = % occupé (défaut `90` ; « `90%` » ou « `90%%` » aussi), ou place libre minimale
+  avec unité (`50G`) ; `off` : éteint ; toute autre valeur : `[WARN]` et 90 % ;
+- `STORAGE_ALERT_DAYS` : jours restants = place libre du dépôt / croissance mensuelle du stockage — celle de ses seuls dépôts
+  mesurés depuis au moins 7 jours ; défaut 30 ; `0` ou `off` : éteint ; croissance nulle, négative ou inconnue : inactif.
+
+Un nick dont tous les critères sont éteints n'est ni cité ni notifié. L'alerte part **au franchissement** : `[WARN] Stockage
+backup@nas presque plein : 92 % occupé, 150.00 GB libres, ~12 j restants (df ssh, 2026-10-20 14:03) — nicks a, b` (nicks du dépôt
+trop plein) sur stderr du Bkp, Sentry si `SENTRY_ALERTS` contient `storage` (ou `all` ; étiquette Sentry = identité du stockage,
+jamais son étiquette ; budget de la mesure épuisé ou envoi raté : `[WARN]` une fois, envoyé à la mesure suivante ; Sentry
+inutilisable — `sentry_sdk` absent, initialisation ratée — : rien gardé dû) et push par borgHelperWWW
+(une fois par franchissement et par abonné, voir plus bas). Une place inconnue ne change rien ; le JSON du Bkp dit `alert` tant
+que le nick est cité. Tant qu'un dépôt dépasse, « ⚠ stockage presque plein » est affiché par Storage, l'UI et Report ; une mesure devenue
+inconnue montre « place inconnue depuis <date> » et la dernière mesure connue (Storage, UI, Report). État par stockage dans
+`CACHE_DIR/<préfixe du rc>-storage-alert.json` (partagé par les nicks du rc ; illisible : jamais réécrit, dit).
+
+**Report** : la colonne `reste` d'un dépôt distant (vide avant 1.0.209) donne la dernière place mesurée de son dépôt courant
+(« `~1.00 TB` » si déduite de la capacité déclarée ; mesure devenue inconnue : la dernière connue suivie de « `(place inconnue
+depuis <date>, dernière mesure connue du <date>)` » ; jamais mesurée ou `BORG_REPO` changé depuis : vide ; `STORAGE` renommé :
+gardée). Dépôt au-dessus de son
+seuil : « ` — ⚠ stockage presque plein` » dans `reste`, nick en alerte (`***`, ligne rouge en HTML) et **code 1** ; `-j` : champ
+`stockage` de la ligne (`storage`, `source`, `free`, `size`, `pct`, `measured_at`, `approx`, `quota`, `unknown_since`,
+`last_known`, `alert`).
 
 ### `IdxPurge`
 Supprime rétroactivement des entrées de `diff_index`, purge les snapshots anciens et compacte le `diff.db`.
@@ -2583,6 +2678,10 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    (dépôts, taille, croissance, par mois, depuis la première mesure et durée en jours) et une par dépôt (nicks, taille, date
    de mesure ou « aucune mesure »), erreurs par nick (ou par fichier de conf en échec, `préfixe:*`) dessous — `GET /storage`, seulement les nicks que l'appelant peut lire
    (mode dossier : une seule vue, noms `préfixe:nick`) ; masqué face à un serveur plus ancien. Voir [`Storage`](#storage).
+   UI ≥ 1.27.0 (borgHelperWWW ≥ 1.34.0, borgHelper ≥ 1.0.209) : « ⚠ stockage presque plein » sous un stockage en alerte et,
+   sous chaque dépôt mesuré, ligne « Place : 92 % occupé, 150.00 GB libres sur 1.88 TB, ~12 j restants — df ssh, 2026-10-20
+   12:03 UTC » (« ~ » : capacité déclarée ; place inconnue : « depuis », sa raison et la dernière mesure connue) ; la carte d'un
+   serveur montre `reste` tel que Report le donne (place mesurée d'un dépôt distant, ⚠ — carte en rouge).
    Bandeau **🧹 Nettoyage possible sur le serveur** (UI ≥ 1.19.5) quand la machine garde des restes de dépôts borg
    disparus ou de nicks retirés : nombres et tailles seulement, avec la commande `borgHelper -c BorgCleanup` —
    l'interface ne supprime rien. Source : champ `borg_cleanup` de `GET /access` (borgHelperWWW ≥ 1.28.5 ; `null` s'il
@@ -3263,6 +3362,21 @@ abonné aux échecs de ce host, l'alerte n'est pas consommée : un abonnement pr
 reçoit au passage suivant. Plusieurs workers uvicorn : un seul envoie (réservation atomique dans
 `push.db`, table `overdue_alerts`). « Dernière archive connue » = `archive_stats` (alimentée par chaque
 `Bkp` et par `Index`) : une archive créée hors borgHelper n'est vue qu'après un `Index`.
+
+**Stockage presque plein** (borgHelperWWW ≥ 1.34.0, borgHelper ≥ 1.0.209, Service Worker ≥ 1.4.0) : quand un Bkp fait
+franchir le seuil d'alerte de son stockage (`STORAGE_ALERT`, `STORAGE_ALERT_DAYS`, voir
+[Place libre et alertes](#place-libre-et-alertes-10209)), le watcher envoie **une** notification de type **Échec** par
+franchissement, par stockage et par abonné : « ⚠ Stockage presque plein — backup@nas / 92 % occupé, 150.00 GB libres, ~12 j
+restants. Nicks : a, b. », payload `{"event":"storage","result":"error","storage","storage_key","nicks","pct","free","size",
+"days_left","source","measured_at"}` (`storage_key` = `<préfixe du rc>|<identité du stockage>` : étiquette de la notification).
+Chaque abonnement au type Échec d'au moins un nick cité (dépôt trop plein) la reçoit une fois et n'y voit cités que les nicks
+qu'il suit, avec les chiffres du dépôt le plus plein parmi eux (aucun chiffre connu pour ses nicks : sans chiffres) ; un nick en pause (`PUSH_MUTE`) est écarté — son abonné la reçoit à la reprise si le stockage est
+toujours au-dessus, comme le retard ; sans abonné, l'alerte n'est pas consommée. Une nouvelle notification ne part qu'après un
+retour sous le seuil puis une nouvelle montée. Plusieurs workers : réservation atomique dans `push.db` (table `storage_alerts`,
+une ligne par stockage et par abonné, lue avant d'écrire, retirée avec l'abonnement ou quand le stockage n'est plus dans
+l'état d'alerte), abonné par abonné : un envoi en panne ne prive jamais les suivants ; un échec transitoire (5xx, 429, réseau) est retenté au passage suivant puis
+après 1, 2, 4 min, abandonné après 5 envois ; un refus (400, 403, 413…) n'est jamais retenté. Réservations d'un rc indisponible un
+instant (mode dossier) ou d'un `-C` sans nick lu : jamais purgées.
 
 Un abonnement mort côté navigateur (le service de push répond `404`/`410`) est désabonné
 automatiquement (même requête que `DELETE /push/subscribe`). Toute autre erreur (réseau, autre code

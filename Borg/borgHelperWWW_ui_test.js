@@ -1181,7 +1181,7 @@ async ${grab('downloadViaFetch')}
     const vm=src.indexOf('<section id="view-machines"'), sc=src.indexOf('id="storageCard"'), sv=src.indexOf('<h2 style="margin:0">Serveurs</h2>');
     eq('Stockages : bloc dans la vue des serveurs, au-dessus de la liste (masqué au départ)',
        [vm>0 && vm<sc && sc<sv,/<div class="card" id="storageCard" hidden>/.test(src)],[true,true]);
-    const sh=new Function(grab('escapeHtml')+'\n'+grab('escapeAttr')+'\n'+grab('_fmtBytes')+'\n'+grab('storageHtml')+'\nreturn storageHtml;')();
+    const sh=new Function(grab('escapeHtml')+'\n'+grab('escapeAttr')+'\n'+grab('_fmtBytes')+'\n'+grab('storageSpaceHtml')+'\n'+grab('storageHtml')+'\nreturn storageHtml;')();
     const text=h=>h.replace(/<br>/g,' | ').replace(/<\/tr>/g,' ¶ ').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
     const D={borghelper_version:'1.0.208',errors:{'web:x':'BORG_REPO absent du rc'},storages:[
       {storage:'backup@nas',nicks:['web:a','web:b','mail:c'],size:1440,growth:340,growth_per_month:115,first_at:'2026-01-01 00:00:00',
@@ -1206,8 +1206,40 @@ async ${grab('downloadViaFetch')}
         'baie1 1 — — — —',
         'u@h:/r — g — aucune mesure',
         '⚠ web:x : BORG_REPO absent du rc']);
+    // UI 1.27.0 (borgHelperWWW 1.34.0, story 87b) : ligne « place » sous CHAQUE dépôt mesuré (décision 8 : libre sur taille, % occupé,
+    // jours restants, source, date UTC ; « ~ » : capacité déclarée), « ⚠ stockage presque plein » sous le stockage et sous le dépôt
+    // qui dépasse ; décision 15 : place inconnue -> « depuis », raison, dernière mesure connue
+    const D2={storages:[
+      {storage:'backup@nas',nicks:['a','b','c'],size:1440,growth:340,growth_per_month:115,first_at:'2026-01-01 00:00:00',days:90,alert:true,
+       repos:[{repo:'backup@nas:/v1/r',nicks:['a','b'],size:1440,measured_at:'2026-10-20 12:03:09',alert:true,
+               space:{source:'df_ssh',source_text:'df ssh',free:150e9,size:1875e9,pct:92,days_left:12.2,measured_at:'2026-10-20 12:03:09',approx:false}},
+              {repo:'backup@nas:/v2/r',nicks:['c'],size:7,measured_at:'2026-10-20 12:03:09',alert:false,
+               space:{source:'df_ssh',source_text:'df ssh',free:900e9,size:1000e9,pct:10,days_left:null,measured_at:'2026-10-20 12:05:00',approx:false}}]},
+      {storage:'baie1',nicks:['g'],size:7,growth:0,growth_per_month:null,first_at:'2026-01-01 00:00:00',days:1,alert:false,
+       repos:[{repo:'u@h:/r',nicks:['g'],size:7,measured_at:'2026-10-20 12:00:00',alert:false,
+               space:{source:'declared',source_text:'capacité déclarée',free:1e12,size:1e12,pct:0,days_left:null,measured_at:'2026-10-20 12:00:00',approx:true}}]},
+      {storage:'u@srv',nicks:['k'],size:7,growth:0,growth_per_month:null,first_at:'2026-01-01 00:00:00',days:1,alert:true,
+       repos:[{repo:'u@srv:/r',nicks:['k'],size:7,measured_at:'2026-10-20 12:00:00',alert:true,
+               space:{source:'unknown',source_text:'place inconnue',free:null,size:null,pct:null,days_left:null,measured_at:'2026-10-20 12:00:00',
+                      unknown_since:'2026-10-19 08:00:00',reason:'df ssh : refusé (code 2)',
+                      last_known:{source:'df_ssh',source_text:'df ssh',free:5e9,size:100e9,pct:95,measured_at:'2026-10-18 08:00:00'}}}]},
+      {storage:'n',nicks:['z'],size:null,growth:null,growth_per_month:null,first_at:null,days:null,alert:false,
+       repos:[{repo:'z@n:/r',nicks:['z'],size:null,measured_at:null,space:null}]}],errors:{}};
+    const r2=text(sh(D2)).split(' ¶ ').map(x=>x.trim()).filter(Boolean);
+    eq('Stockages (87b) : place de chaque dépôt (libre sur taille, % occupé, jours restants, source, date UTC), « ~ » si déclarée, inconnue depuis + dernière connue, ⚠ du stockage et du dépôt qui dépasse',
+       r2.filter(x=>/Place|⚠/.test(x)),
+       ['⚠ stockage presque plein',
+        'Place : 92 % occupé, 150.00 GB libres sur 1.88 TB, ~12 j restants — df ssh, 2026-10-20 12:03 UTC ⚠ stockage presque plein',
+        'Place : 10 % occupé, 900.00 GB libres sur 1.00 TB — df ssh, 2026-10-20 12:05 UTC',
+        'Place : 0 % occupé, ~1.00 TB libres sur ~1.00 TB — capacité déclarée, 2026-10-20 12:00 UTC',
+        '⚠ stockage presque plein',
+        'Place inconnue depuis 2026-10-19 08:00 UTC (df ssh : refusé (code 2)) — dernière mesure connue : 95 % occupé, 5.00 GB libres sur 100.00 GB — df ssh, 2026-10-18 08:00 UTC ⚠ stockage presque plein']);
     eq('Stockages : aucun dépôt -> « Aucun dépôt. », sans tableau ni erreur',[sh({storages:[],errors:{}})],['<p class="hint">Aucun dépôt.</p>']);
     const HX=`<b>&"'`, eX='&lt;b&gt;&amp;&quot;&#39;';
+    const h3=sh({storages:[{storage:'s',size:1,growth:0,growth_per_month:null,first_at:null,days:null,alert:false,
+                            repos:[{repo:'r',nicks:['n'],size:1,measured_at:null,space:{source_text:'x'+HX,free:1,measured_at:HX,reason:'r'+HX}},
+                                   {repo:'r2',nicks:['n2'],size:1,measured_at:null,space:{free:null,unknown_since:HX,reason:'q'+HX,last_known:{source_text:'y'+HX,free:1}}}]}],errors:{}});
+    eq('Stockages (87b) : source et date hostiles échappées dans la ligne « place »',[/<b>|&"/.test(h3.replace(/<\/?(table|tr|th|td|strong|p|span)[^>]*>|<br>/g,'')),['x','q','y'].every(c=>h3.includes(c+eX))],[false,true]);
     // dates hostiles de moins de 10 caractères : jamais tronquées par l'affichage du jour (revue 87a, row 10)
     const h2=sh({storages:[{storage:'s'+HX,size:1,growth:0,growth_per_month:null,first_at:HX,days:1,
                             repos:[{repo:'r'+HX,nicks:['n'+HX],size:1,measured_at:HX}]}],errors:{['e'+HX]:'m'+HX}});
@@ -1228,6 +1260,7 @@ ${grab('escapeHtml')}
 ${grab('escapeAttr')}
 ${grab('respError')}
 ${grab('_fmtBytes')}
+${grab('storageSpaceHtml')}
 ${grab('storageHtml')}
       let storageLoadSeq=0;
 async ${grab('loadStorage')}

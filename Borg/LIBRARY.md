@@ -464,6 +464,14 @@ code = bh.storage('mon-serveur,autre', as_json=True)
 # ValueError sans BORG_REPO, ou forme à identifiants ou borg 2 sans STORAGE), _LocalResolver(marker=…) (chemin réel, montage et raison d'un
 # dépôt local ; df borné, df bloqué noté dans le fichier `marker`),
 # _storage_aggregate(dépôts), _storage_merge(sorties -j) — voir TECHNICAL.md.
+# 1.0.209 (story 87b) : chaque dépôt de la sortie porte `space` (sa dernière place mesurée à la fin d'un Bkp) et `alert` ; chaque
+# stockage, `alert` et `space` (dépôt le plus plein). Mesure faite par bh.backup() ; à la main : bh._storage_measure('mon-serveur',
+# bh.borg.cfgreaded('mon-serveur')) (méthode interne : vue ou None ; toute exception rattrapée sauf KeyboardInterrupt et SystemExit(130), relancés — backup() les absorbe ; écrit history.db et l'état d'alerte, peut
+# lancer ssh et Sentry ; `alert` = nick cité par l'état d'alerte). Lecture : bh.db.get_storage_space('mon-serveur'[, storage_id,
+# repo_key][, repo_wkey=…]) -> dernière ligne storage_space (dict ; mesure inconnue : last_known, unknown_since) ou None — Storage
+# et Report cherchent par nick et repo_wkey (chemin écrit, `_repo_key(_storage_of(…)['wkey'])`), l'état par le repo_key trouvé ; `space` exposé sans `label` ni `used` (_space_pub). Fonctions de module
+# _storage_alert_keys(section_rc), _space_hits(vue, jours, seuils), _space_pct(libre, occupé), _parse_bytes('2T'),
+# _storage_id(étiquette), _repo_key(repo_id), _growth7(dépôts), _state_cites(état, nick, repo_key).
 # 1.0.186 : base seule (une ligne d'un Bkp tué compte « en cours » jusqu'au délai). Comme la commande Status et Report
 # (marqueur de Bkp, borg create orphelin) : bh._status_one('mon-serveur', bkp_live=True) (méthode interne, forme du JSON de
 # Status) -> bkp_running {started_at, en_attente, orphelin, sans_suivi (1.0.196)}, bkp_interrupted {started_at, verifie}, bkp_stale ; sans

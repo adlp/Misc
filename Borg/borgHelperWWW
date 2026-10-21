@@ -77,17 +77,18 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE, RK_NOPASS,   # 1.31.15 : passphrase absente (story 77)
                          _ORPHAN_TXT,   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
                          _MIGR_PENDING_TXT,   # 1.31.16 : mesures d'avant 1.0.139 pas encore migrées (_never_cache), borgHelper 1.0.201
-                         _storage_merge)   # 1.33.0 (story 87a) : /storage multi-rc (mode dossier) — dépôts réunis, compté une fois
+                         _storage_merge,   # 1.33.0 (story 87a) : /storage multi-rc (mode dossier) — dépôts réunis, compté une fois
+                         _state_load, _storage_alert_path)   # 1.34.0 (story 87b) : état d'alerte des stockages (CACHE_DIR de chaque rc)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.33.0"
+WWW_VERSION="1.34.0"
 # Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
 # nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
 # selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
 _SCG_WL_WWW={'_push_conn':1}
-_SCG_SEEN_WWW=20   # 1.32.0 (story 86) : + _migrate_push_bare_nicks (marque, overdue_alerts)
+_SCG_SEEN_WWW=28   # 1.32.0 (story 86) : + _migrate_push_bare_nicks (marque, overdue_alerts) ; 1.34.0 (story 87b) : + _storage_claim (lecture, essai échu, réservation ; revue 87b rows 48, 71), _storage_alert_pass, _storage_claim_retry (rows 58, 71), _storage_claim_done (row 78), _storage_claims_stale (lecture, écriture ; row 63)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # Sous uvicorn (`uvicorn borgHelperWWW:app`), le module est importé : uvicorn possède seul
@@ -895,6 +896,7 @@ def _bkp_status_watcher_pass_1():
             print(f"[watcher] nick={nick} erreur : {'sortie borgHelper (voir message ci-dessus)' if isinstance(e,SystemExit) else e}",
                   file=sys.stderr,flush=True)
             continue
+    _storage_alert_pass()   # 1.34.0 (story 87b) : alerte « stockage presque plein », une par franchissement et par stockage
 
 _RECONCILE={}   # (nick, run_id) -> {'state': 'en_cours' | 'fait' | 'à refaire', 'next': monotonic} — par processus
 _RECONCILE_LOCK=threading.Lock()
@@ -1074,6 +1076,169 @@ def _check_overdue(nick,db_path):
     _send_bkp_push(nick,'overdue','error',{'age_hours':round(age,1),'max_age_hours':max_age,
                                            'last_backup':str(archive_date),'reminder':level>1})
 
+_STORAGE_PUSH_TRIES=5          # revue 87b (row 71) : envois d'un franchissement à un abonné au plus (échecs transitoires)
+_STORAGE_PUSH_BACKOFF=60       # s : attente avant le 3e essai, doublée ensuite (le 2e : passage suivant du watcher)
+_STORAGE_PUSH_LEASE=60         # s : `retry_at` posé AVANT l'envoi (revue 87b row 78) — envoi interrompu ou écriture d'après ratée :
+                               # renvoyé passé ce délai, jamais perdu
+
+def _storage_claim(key,crossing):
+    """1.34.0 (story 87b) : réserve l'envoi push d'une alerte « stockage presque plein » (comparer-et-échanger en une instruction,
+    sûr entre workers uvicorn) -> (réservé, essais déjà faits) : réservé seulement si ce franchissement (`crossing`, « <numéro>|<date> »
+    de l'état de borgHelper) n'a jamais été notifié à cet abonné pour ce stockage (`key` : `<préfixe>|<storage_id>|<endpoint>` —
+    décision 13 : suivi par stockage ET par abonné, comme le retard), ou s'il attend un nouvel essai échu (`retry_at`, row 71).
+    Revue 87b (row 48) : lu d'abord — déjà notifié, essai pas encore échu : rien écrit (passe du watcher)."""
+    conn=_push_conn('read')
+    try: r=conn.execute("SELECT crossing,attempts,retry_at FROM storage_alerts WHERE storage=?",(key,)).fetchone()
+    finally: conn.close()
+    if r is not None and r[0]==crossing:
+        if r[2] is None or r[2]>_utc_now_str(): return False,r[1]
+        conn=_push_conn('write')
+        try:
+            cur=conn.execute(f"UPDATE storage_alerts SET retry_at=datetime('now','+{int(_STORAGE_PUSH_LEASE)} seconds'),notified_at=datetime('now') "
+                             "WHERE storage=? AND crossing=? AND retry_at=?",(key,crossing,r[2]))
+            conn.commit()
+            return cur.rowcount==1,r[1]
+        finally: conn.close()
+    conn=_push_conn('write')
+    try:
+        cur=conn.execute(
+            f"INSERT INTO storage_alerts (storage,crossing,notified_at,attempts,retry_at) VALUES (?,?,datetime('now'),0,"
+            f"datetime('now','+{int(_STORAGE_PUSH_LEASE)} seconds')) "
+            "ON CONFLICT(storage) DO UPDATE SET crossing=excluded.crossing,notified_at=excluded.notified_at,attempts=0,retry_at=excluded.retry_at "
+            "WHERE storage_alerts.crossing!=excluded.crossing",(key,crossing))
+        conn.commit()
+        return cur.rowcount==1,0
+    finally:
+        conn.close()
+
+def _storage_claim_done(key,crossing):
+    """Revue 87b (row 78) : envoi parti (ou refusé pour de bon, ou abandonné) -> `retry_at` effacé (servi) ; seulement si la ligne
+    porte encore CE franchissement."""
+    conn=_push_conn('write')
+    try:
+        conn.execute("UPDATE storage_alerts SET retry_at=NULL WHERE storage=? AND crossing=?",(key,crossing)); conn.commit()
+    finally:
+        conn.close()
+
+def _storage_claim_retry(key,crossing,attempts):
+    """Revue 87b (rows 58, 71) : envoi push en échec transitoire (5xx, 429, réseau) -> nouvel essai programmé (comparer-et-échanger :
+    seulement si la ligne porte encore CE franchissement) : passage suivant, puis attente doublée depuis _STORAGE_PUSH_BACKOFF ;
+    abandon après _STORAGE_PUSH_TRIES envois. -> True si un essai reste programmé."""
+    n=attempts+1
+    if n>=_STORAGE_PUSH_TRIES: return False
+    wait=0 if n==1 else _STORAGE_PUSH_BACKOFF*2**(n-2)
+    conn=_push_conn('write')
+    try:
+        conn.execute(f"UPDATE storage_alerts SET attempts=?,retry_at=datetime('now','+{int(wait)} seconds') WHERE storage=? AND crossing=?",
+                     (n,key,crossing))
+        conn.commit(); return True
+    finally:
+        conn.close()
+
+def _storage_claims_purge(conn,endpoints):
+    """Revue 87b (row 48) : réservations d'alerte de stockage (clé `<préfixe>|<storage_id>|<endpoint>`) des abonnements retirés —
+    purgées avec eux (expirés, désabonnés, morts) ; `conn` : connexion d'écriture de push.db (commit à l'appelant)."""
+    conn.executemany("DELETE FROM storage_alerts WHERE length(storage)>length(?)+1 AND substr(storage,length(storage)-length(?)+1)=? "
+                     "AND substr(storage,length(storage)-length(?),1)='|'",[(ep,ep,ep,ep) for ep in endpoints])
+
+def _storage_rcs():
+    """(préfixe, BorgHelper, {nick nu: nick exposé}) de chaque rc servi : mode -C ('', BorgHelper du rc par _bhn, nicks du rc ; aucun
+    nick : rien) ; mode dossier : chaque rc disponible, préfixe suspendu (décision 10 de la story 86) écarté."""
+    if not DIR_MODE:
+        ns=_nick_list('ALL')
+        return [('',_bhn(ns[0])[0],{n:n for n in ns})] if ns else []
+    return [(e.prefix,e.bh,{b:f"{e.prefix}:{b}" for b in _rc_bare_nicks(e)}) for e in _rc_state().entries.values()
+            if e.prefix not in _RC['suspended']]
+
+def _storage_alert_pass():
+    """1.34.0 (story 87b, décisions 4 et 6 de l'utilisateur) : alerte push « stockage presque plein », UNE par franchissement et par
+    stockage (une seule pour plusieurs nicks, qui les cite). Source : état d'alerte écrit par borgHelper à la fin d'un Bkp
+    (CACHE_DIR/<préfixe>-storage-alert.json de chaque rc : 'triggered', `crossing`, `since`, `nicks` = nicks dont le dépôt dépasse
+    son seuil, décisions 8 et 11) ; jamais ssh ni borg. Pour chaque stockage déclenché et chaque abonnement au type « échec » d'au
+    moins un de ces nicks (hôte par hôte, comme le retard), nick en pause (PUSH_MUTE, préfixe réattribué) écarté : réservation CAS
+    par (stockage, abonné) (_storage_claim, décision 13) puis UN push, abonné par abonné (revue 87b row 48), qui ne cite que les
+    nicks de son périmètre (jamais un nick qu'il ne suit pas) avec les chiffres du dépôt le plus plein parmi eux (`views` de l'état,
+    row 31) et `storage_key` (`<préfixe>|<storage_id>`, étiquette de notification du SW, row 49). pywebpush absent, abonné sans nick actif (pause comprise), abonné venu ensuite : alerte NON consommée pour
+    lui — reçue au passage suivant si le stockage est toujours au-dessus (comme le retard). Sentry : envoyé par borgHelper au
+    franchissement (jamais ici). Erreur d'un rc : journalisée, les autres rc continuent."""
+    if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
+    served=set(); keep={p_ for p_ in (_RC.get('suspended') or ())} if DIR_MODE else set()
+    try: rcs=_storage_rcs()
+    except (Exception,SystemExit) as x: print(f"[watcher] alerte de stockage : rc servis : erreur {x}",file=sys.stderr,flush=True); return
+    if DIR_MODE:   # revue 87b (row 67) : rc listé mais indisponible (illisible, absent un instant) : ses réservations gardées
+        try: keep|=set(_rc_state().unavailable)
+        except (Exception,SystemExit): return
+    for pfx,bh,mp in rcs:
+        try:
+            st=_state_load(_storage_alert_path(bh.db),strict=True)
+            if st is None: keep.add(pfx); st={}   # illisible : rien envoyé, ses réservations gardées
+            served|={f"{pfx}|{sid}" for sid in st}
+            for sid,e in sorted(st.items()):
+                if e.get('state')!='triggered': continue
+                nicks=[mp[n] for n in (e.get('nicks') if isinstance(e.get('nicks'),list) else []) if isinstance(n,str) and n in mp]
+                if not nicks: continue
+                prefs=_push_prefs_load()['subscriptions']; now=_utc_now_str(); per={}
+                live=[n for n in nicks if not _push_muted(n)]
+                for ep,raw in prefs.items():
+                    p_=_prefs_entry(raw)
+                    if p_['expires_at'] is not None and p_['expires_at']<=now: continue
+                    seen=[n for n in live if p_['hosts'].get(n,{}).get('error')]
+                    if seen: per[ep]=seen
+                if not per: continue
+                crossing=f"{e.get('crossing')}|{e.get('since')}"
+                conn=_push_conn('read')
+                try: rows={r['endpoint']:r for r in conn.execute(f"SELECT * FROM push_subscriptions WHERE endpoint IN ({','.join('?'*len(per))})",list(per))}
+                finally: conn.close()
+                lab=e.get('label'); m_=re.fullmatch(r'tunnel non résolu \((.*)\)',lab) if isinstance(lab,str) else None
+                if m_ and m_.group(1) in mp: lab=f"tunnel non résolu ({mp[m_.group(1)]})"   # revue 87b row 44 : jamais un nick nu
+                views=e.get('views') if isinstance(e.get('views'),dict) else {}
+                inv={v:k for k,v in mp.items()}; n_sent=0
+                for ep,row in rows.items():   # revue 87b row 48 : réserver puis envoyer, abonné par abonné
+                    key=f"{pfx}|{sid}|{ep}"; got,tries=_storage_claim(key,crossing)
+                    if not got: continue   # décision 13 : par (stockage, abonné)
+                    # revue 87b row 31 : chiffres du dépôt le plus plein parmi les nicks de CET abonné (vue par nick de l'état) ;
+                    # row 59 : aucune vue de ses nicks -> chiffres omis (jamais ceux d'un nick hors de son périmètre)
+                    vs=[views[inv[n]] for n in per[ep] if isinstance(views.get(inv.get(n)),dict)]
+                    fig=max(vs,key=lambda v:(v.get('pct') or 0) if isinstance(v.get('pct'),(int,float)) else 0) if vs else {}
+                    data={'nick':per[ep][0],'event':'storage','result':'error','storage':lab,'storage_key':f"{pfx}|{sid}",'nicks':per[ep],
+                          'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                    data.update({k:fig.get(k) for k in ('pct','free','size','days_left','source','measured_at') if fig.get(k) is not None})
+                    try: res_=_push_deliver([row],json.dumps(data,ensure_ascii=False),per[ep][0],'storage')
+                    except (Exception,SystemExit) as x_:   # row 73 : panne de l'envoi d'UN abonné -> les suivants servis, lui retenté
+                        print(f"[watcher] push: erreur envoi stockage : {x_}",file=sys.stderr,flush=True); res_='retry'
+                    if res_ is True: n_sent+=1
+                    try:   # revue 87b (row 78) : écriture d'après dans son propre try — ratée : bail en place, renvoyé, jamais perdu
+                        if res_=='retry' and _storage_claim_retry(key,crossing,tries): pass   # rows 58, 71 : 5xx, 429, réseau
+                        else:
+                            if res_=='retry': print(f"[watcher] push: alerte de stockage abandonnée après {_STORAGE_PUSH_TRIES} essais",
+                                                    file=sys.stderr,flush=True)
+                            _storage_claim_done(key,crossing)
+                    except (Exception,SystemExit) as x_:
+                        print(f"[watcher] push: alerte de stockage : suivi non écrit ({x_}) — renvoyée après {_STORAGE_PUSH_LEASE} s",
+                              file=sys.stderr,flush=True)
+                if n_sent: print(f"[watcher] stockage presque plein : {lab} (nicks {', '.join(nicks)}, franchissement {e.get('crossing')}) "
+                                 f"— {n_sent} abonnement(s)",file=sys.stderr,flush=True)
+        except (Exception,SystemExit) as x:
+            keep.add(pfx)
+            print(f"[watcher] alerte de stockage{f' (rc {pfx})' if pfx else ''} : erreur {x}",file=sys.stderr,flush=True)
+    if not DIR_MODE and not rcs: return   # row 67 : -C sans nick lu (rc vide ou illisible un instant) : jamais de purge
+    try: _storage_claims_stale(served,keep)
+    except (Exception,SystemExit) as x: print(f"[watcher] alerte de stockage : purge des réservations : erreur {x}",file=sys.stderr,flush=True)
+
+def _storage_claims_stale(live,keep):
+    """Revue 87b (row 63) : réservations (`<préfixe>|<storage_id>|<endpoint>`) d'un stockage absent de tout état servi (entrée
+    purgée ou retirée par borgHelper, rc retiré) -> supprimées ; préfixes de `keep` (état illisible, rc en erreur ou suspendu)
+    gardés. Lecture d'abord : rien à retirer, rien écrit."""
+    conn=_push_conn('read')
+    try: keys=[r[0] for r in conn.execute("SELECT storage FROM storage_alerts")]
+    finally: conn.close()
+    stale=[k for k in keys for p_ in [k.split('|',2)] if len(p_)==3 and p_[0] not in keep and f"{p_[0]}|{p_[1]}" not in live]
+    if not stale: return 0
+    conn=_push_conn('write')
+    try: conn.executemany("DELETE FROM storage_alerts WHERE storage=?",[(k,) for k in stale]); conn.commit()
+    finally: conn.close()
+    return len(stale)
+
 def _push_purge_expired():
     """Abonnements push expirés (`expires_at` dépassé dans le fichier de préférences, qui fait foi) :
     retirés du fichier ET de push.db (1.26.3 — auparavant jamais nettoyés, seulement ignorés à l'envoi).
@@ -1088,7 +1253,8 @@ def _push_purge_expired():
     if gone:
         conn=_push_conn('write')
         try:
-            conn.executemany("DELETE FROM push_subscriptions WHERE endpoint=?",[(ep,) for ep in gone]); conn.commit()
+            conn.executemany("DELETE FROM push_subscriptions WHERE endpoint=?",[(ep,) for ep in gone])
+            _storage_claims_purge(conn,gone); conn.commit()   # 1.34.0 (revue 87b row 48)
         finally:
             conn.close()
     return len(gone)
@@ -2131,7 +2297,19 @@ def _external_fingerprint(cmd: str, nick: Optional[str]) -> str:
     fp='|repos:'+','.join(f"{n}:{_repo_presence(n)}" for n in _nick_list(nick))
     if cmd=='report':
         fp+='|bkp:'+_bkp_markers_state()+'|roster:'+','.join(f"{n}:{_repo_roster_state(n)}" for n in _nick_list(nick))
+        fp+='|storage:'+_storage_state_mtimes()   # 1.34.0 (revue 87b row 25) : ⚠ stockage changé par le Bkp d'un autre nick
     return fp
+
+def _storage_state_mtimes() -> str:
+    """1.34.0 (story 87b, revue row 25) : date de modification (ns) de l'état d'alerte des stockages de chaque rc servi
+    (CACHE_DIR/<préfixe>-storage-alert.json) — absent : « - » ; erreur : '?'."""
+    try:
+        dbs=[e.bh.db for e in _rc_state().entries.values()] if DIR_MODE else [_bh_paths.db]; out=[]
+        for db in dbs:
+            try: out.append(str(os.stat(_storage_alert_path(db)).st_mtime_ns))
+            except FileNotFoundError: out.append('-')
+        return ','.join(out)
+    except (Exception,SystemExit): return '?'
 
 def _response_fingerprint(cmd: str, nick: Optional[str]) -> str:
     """Empreinte d'une entrée de _RESPONSE_CACHE — MÊME fonction à la lecture et à l'écriture : mtimes des bases
@@ -2204,7 +2382,7 @@ ensure_scope_cache_db()
 # sqlite3.DatabaseError -> message + sys.exit(1)), appelé une fois au module-level au démarrage.
 PUSH_DB=os.environ.get('BORGHELPERWWW_PUSH_DB') or \
     os.path.join(_bh_paths.db.cache_dir,f"{_bh_paths.db.db_prefix}-push.db")
-PUSH_DB_SCHEMA_VERSION=2  # 2 (1.24.0) : table overdue_alerts (CREATE TABLE IF NOT EXISTS, sans migration)
+PUSH_DB_SCHEMA_VERSION=3  # 2 (1.24.0) : table overdue_alerts ; 3 (1.34.0, story 87b) : storage_alerts (CREATE TABLE IF NOT EXISTS, sans migration)
 PUSH_DB_BASE_SCHEMA_VERSION=1
 
 _PUSH_DB_SCHEMA_SCRIPT="""
@@ -2234,6 +2412,18 @@ _PUSH_DB_SCHEMA_SCRIPT="""
         level INTEGER NOT NULL,
         notified_at TEXT DEFAULT (datetime('now'))
     );
+    -- Alertes « stockage presque plein » déjà poussées (1.34.0, story 87b) : une ligne par stockage d'un rc et par abonné
+    -- (`<préfixe>|<storage_id>|<endpoint>`, préfixe vide en mode -C) ; `crossing` = franchissement de l'état d'alerte de borgHelper
+    -- (« <numéro>|<date> ») déjà notifié à cet abonné.
+    -- Revue 87b (row 71) : `attempts` (envois en échec transitoire de ce franchissement), `retry_at` (prochain essai, UTC ; NULL :
+    -- servi ou abandonné).
+    CREATE TABLE IF NOT EXISTS storage_alerts (
+        storage TEXT PRIMARY KEY,
+        crossing TEXT NOT NULL,
+        notified_at TEXT DEFAULT (datetime('now')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        retry_at TEXT
+    );
 """
 
 def ensure_push_db():
@@ -2252,6 +2442,23 @@ def ensure_push_db():
         except sqlite3.OperationalError as e: _db_open_fail(PUSH_DB,e)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_PUSH_DB_SCHEMA_SCRIPT)
+        # revue 87b (rows 71, 74) : table d'avant -> colonnes ajoutées sous verrou, relues sous lui (deux workers : un seul les
+        # ajoute ; « duplicate column » toléré)
+        _add=(('attempts','INTEGER NOT NULL DEFAULT 0'),('retry_at','TEXT'))
+        if not {c_ for c_,_t in _add}<={r[1] for r in conn.execute("PRAGMA table_info(storage_alerts)")}:
+            if conn.in_transaction: conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cols={r[1] for r in conn.execute("PRAGMA table_info(storage_alerts)")}
+                for c_,t_ in _add:
+                    if c_ in cols: continue
+                    try: conn.execute(f"ALTER TABLE storage_alerts ADD COLUMN {c_} {t_}")
+                    except sqlite3.OperationalError as e_:
+                        if 'duplicate column' not in str(e_): raise
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction: conn.rollback()
+                raise
         db._check_set_meta(conn,PUSH_DB_SCHEMA_VERSION,PUSH_DB,PUSH_DB_BASE_SCHEMA_VERSION)
         conn.commit(); conn.close()
     except sqlite3.DatabaseError as e:
@@ -2636,8 +2843,9 @@ def _push_delete_endpoint(endpoint):
     conn=_push_conn('write')
     try:
         cur=conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?",(endpoint,))
-        conn.commit()
         db_deleted=cur.rowcount>0
+        _storage_claims_purge(conn,[endpoint])   # 1.34.0 (revue 87b row 48)
+        conn.commit()
     finally:
         conn.close()
     prefs_deleted=_push_prefs_update(lambda subs: subs.pop(endpoint,None) is not None)
@@ -2692,7 +2900,14 @@ def _send_bkp_push(nick,event,result,warnings=None):
     data={'nick':nick,'event':event,'result':result,
           'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat()}
     if warnings: data.update({k:v for k,v in warnings.items() if v is not None})
-    payload=json.dumps(data)
+    _push_deliver(subs,json.dumps(data),nick,event)
+
+def _push_deliver(subs,payload,nick,event):
+    """Envoi d'un payload à des abonnements (lignes push.db) — boucle de _send_bkp_push (1.34.0 : commune à l'alerte de stockage) :
+    404/410 -> désabonnement, autre erreur journalisée, jamais de retry, jamais d'exception. Rend (revue 87b rows 58, 71) : True si
+    tout est parti (abonnement mort désabonné compris : rien à renvoyer), 'retry' si un envoi a échoué de façon transitoire (5xx,
+    429, réseau), False si un envoi a échoué pour de bon (400, 403, 413… : jamais retenté)."""
+    ok=True
     for row in subs:
         endpoint=row['endpoint']
         subscription_info={'endpoint':endpoint,'keys':{'p256dh':row['p256dh'],'auth':row['auth']}}
@@ -2714,11 +2929,15 @@ def _send_bkp_push(nick,event,result,warnings=None):
                     print(f"[watcher] push: échec désabonnement (status={e.status_code}) "
                           f"nick={nick} event={event} : {de}",file=sys.stderr,flush=True)
             else:
+                sc_=e.status_code
+                ok='retry' if (sc_ is None or sc_==429 or 500<=sc_<600) and ok is not False else False
                 print(f"[watcher] push: échec envoi (status={e.status_code}) nick={nick} "
                       f"event={event} : {e}",file=sys.stderr,flush=True)
         except Exception as e:
             # Réseau/autre — jamais de désabonnement, jamais de retry pour cet événement précis.
+            if ok is not False: ok='retry'
             print(f"[watcher] push: erreur envoi nick={nick} event={event} : {e}",file=sys.stderr,flush=True)
+    return ok
 
 def _scope_nicks_for_groups(user_groups,nick_cfgs):
     """Cœur pur de _current_scope_nicks, sans dépendance à Request ni à cfgread() — testable
@@ -3086,9 +3305,13 @@ def _expose_nom(nom,bare,exp):
     return (m.group(1) or '')+exp if m else nom
 
 def _expose_row(r,k,mp):
-    """Ligne de résumé de Report du nick nu `k` : `nom` exposé (« *** » gardé), `bkp_voisin.nick` (voisin du même dépôt, même rc)."""
+    """Ligne de résumé de Report du nick nu `k` : `nom` exposé (« *** » gardé), `bkp_voisin.nick` (voisin du même dépôt, même rc),
+    `stockage.storage` « tunnel non résolu (<nick nu>) » (1.34.0)."""
     if not isinstance(r,dict): return r
     if isinstance(r.get('nom'),str): r=dict(r,nom=_expose_nom(r['nom'],k,mp[k]))
+    s_=r.get('stockage')   # 1.34.0 (revue 87b row 44) : « tunnel non résolu (<nick nu>) » -> nom exposé, comme Storage
+    m_=re.fullmatch(r'tunnel non résolu \((.*)\)',s_.get('storage')) if isinstance(s_,dict) and isinstance(s_.get('storage'),str) else None
+    if m_ and m_.group(1) in mp: r=dict(r,stockage=dict(s_,storage=f"tunnel non résolu ({mp[m_.group(1)]})"))
     v=r.get('bkp_voisin')
     if isinstance(v,dict) and isinstance(v.get('nick'),str) and v['nick'] in mp: r=dict(r,bkp_voisin=dict(v,nick=mp[v['nick']]))
     return r
@@ -5595,6 +5818,259 @@ def push_selftest():
                         and again==[] and len(reminder)==1 and reminder[0]['reminder'] is True
                         and fresh==[] and running==[] and len(after)==1)
             check("retard : alerte (type échec), pas de doublon, rappel, silence si nouvelle archive ou Bkp en cours",_overdue_flow)
+            # ── Stockage presque plein (1.34.0, story 87b) ──
+            def _storage_push():
+                """Décisions 4 et 6 : état d'alerte écrit par borgHelper (CACHE_DIR du rc) -> UN push par franchissement et par stockage ;
+                abonnement qui suit deux nicks du stockage : un seul push qui les cite ; abonnement d'un seul nick (droits/groupes : son
+                périmètre figé) : seul ce nick cité, jamais l'autre ; sans abonné : alerte non consommée (reçue par un abonné venu
+                ensuite) ; même franchissement relu : rien ; réarmé : rien ; nouveau franchissement : 2e push ; nick en pause
+                (PUSH_MUTE) écarté ; mode dossier : noms exposés `préfixe:nick`, réservation par rc ; état illisible : rien."""
+                d=tempfile.mkdtemp(prefix='bh87b-')
+                try:
+                    class _Db: cache_dir=d; db_prefix='rc'
+                    class _Bh: db=_Db()
+                    path=_storage_alert_path(_Db())
+                    F={'pct':92.0,'free':150*10**9,'days_left':12.0,'source':'df_ssh','measured_at':'2026-10-20 12:00:00'}
+                    def put(state,crossing,since,nicks=('sa','sb'),**kw):
+                        with open(path,'w') as f:
+                            json.dump({'sid1':dict({'state':state,'crossing':crossing,'since':since,'label':'bk@nas','nicks':list(nicks),
+                                                    'views':{n:dict(F) for n in nicks},**F},**kw)},f)
+                    def sub(ep,nicks):
+                        conn.execute("INSERT OR IGNORE INTO push_subscriptions (endpoint,p256dh,auth,scope_nicks) VALUES (?,?,?,'[]')",(ep,'p256','auth'))
+                        conn.commit()
+                        _push_prefs_update(lambda s_: s_.__setitem__(ep,{'scope_nicks':list(nicks),'notify_start':False,'notify_end':True,'expires_at':None}))
+                    muted=set()
+                    def run(rcs=None):
+                        sent_to.clear(); er=io.StringIO()
+                        with mock.patch(f"{__name__}._storage_rcs",lambda: rcs if rcs is not None else [('',_Bh(),{'sa':'sa','sb':'sb','sc':'sc'})]), \
+                             mock.patch(f"{__name__}._push_muted",lambda n: 'PUSH_MUTE' if n in muted else None), \
+                             mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush), \
+                             mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True), \
+                             mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'), contextlib.redirect_stderr(er):
+                            _storage_alert_pass()
+                        return sorted((e,json.loads(dd)['nicks'],json.loads(dd)['event'],json.loads(dd)['storage']) for e,dd in sent_to if e.startswith('push-ep-st'))
+                    res={}
+                    put('triggered',1,'t1'); res['sans abonné']=run()==[]
+                    sub('push-ep-st-ab',['sa','sb']); sub('push-ep-st-a',['sa']); sub('push-ep-st-c',['sc'])
+                    r=run(); res['abonnés']=(r==[('push-ep-st-a',['sa'],'storage','bk@nas'),('push-ep-st-ab',['sa','sb'],'storage','bk@nas')],r)
+                    pl=[json.loads(dd) for e,dd in sent_to if e=='push-ep-st-ab']
+                    res['payload']=(pl and pl[0]['result']=='error' and pl[0]['pct']==92.0 and pl[0]['free']==150*10**9 and pl[0]['days_left']==12.0
+                                    and pl[0]['source']=='df_ssh' and pl[0]['nick']=='sa',pl)
+                    res['une fois']=run()==[]
+                    put('armed',1,'t1'); res['réarmé']=run()==[]
+                    muted.add('sa'); put('triggered',2,'t2')
+                    r=run(); res['pause']=(r==[('push-ep-st-ab',['sb'],'storage','bk@nas')],r)
+                    # décision 13 : suivi par abonné — l'abonné du seul nick en pause la reçoit à la reprise (toujours au-dessus)
+                    muted.clear(); r=run(); res['reprise']=(r==[('push-ep-st-a',['sa'],'storage','bk@nas')],r)
+                    res['2e franchissement consommé']=run()==[]
+                    put('triggered',3,'t3',nicks=('sa','zz')); r=run(); res['nick hors rc']=(r==[('push-ep-st-a',['sa'],'storage','bk@nas'),('push-ep-st-ab',['sa'],'storage','bk@nas')],r)
+                    # mode dossier : noms exposés, réservation par rc (même empreinte de stockage dans un autre rc : son propre push)
+                    sub('push-ep-st-web',['web:sa'])
+                    r=run([('web',_Bh(),{'sa':'web:sa'})]); res['mode dossier']=(r==[('push-ep-st-web',['web:sa'],'storage','bk@nas')],r)
+                    with open(path,'w') as f: f.write('{pas du json')
+                    res['illisible']=run([('web2',_Bh(),{'sa':'web:sa'})])==[]
+                    # vgap 2 : état écrit par le VRAI borgHelper (mesure de fin de Bkp, capacité déclarée à 95 %) -> push
+                    bhm=sys.modules[BorgHelper.__module__]
+                    rc=os.path.join(d,'rc'); os.makedirs(os.path.join(d,'c'),exist_ok=True)
+                    with open(rc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'c')}\nBORG_RSH=/nonexistent/ssh\nSTORAGE_SIZE=1000\n"
+                                                   "STORAGE_ALERT=90\nSTORAGE_ALERT_DAYS=0\n\n[sa]\nBORG_REPO=bk@nas:/r\n\n[sb]\nBORG_REPO=bk@nas:/r\n")
+                    os.chmod(rc,0o600); rb=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'c')); rb.db.store_repo_stats('sa','bkp',950,950,950)
+                    with mock.patch.object(bhm,'sentry_alert',lambda *a,**k: True),contextlib.redirect_stderr(io.StringIO()):
+                        v=rb._storage_measure('sa',rb.borg.cfgreaded('sa'))
+                    r=run([('',rb,{'sa':'sa','sb':'sb'})])
+                    pl=[json.loads(dd) for e,dd in sent_to if e=='push-ep-st-ab']
+                    res['état réel']=(v and v.get('alert_sent') is True and r==[('push-ep-st-a',['sa','sb'][:1],'storage','bk@nas'),
+                                                                                 ('push-ep-st-ab',['sa','sb'],'storage','bk@nas')]
+                                      and pl and pl[0]['pct']==95.0 and pl[0]['free']==50 and pl[0]['source']=='declared',v,r)
+                    # revue 87b row 31 : chiffres du dépôt le plus plein parmi les nicks de CHAQUE abonné (vue par nick de l'état) ;
+                    # row 49 : storage_key (préfixe|identité) ; row 44 : « tunnel non résolu (<nick nu>) » réécrit en mode dossier
+                    V=lambda pct,free: {'pct':pct,'free':free,'size':1000,'days_left':None,'source':'df_ssh','measured_at':'2026-10-20 12:00:00'}
+                    put('triggered',4,'t4',pct=97.0,free=30,views={'sa':V(91.0,90),'sb':V(97.0,30)}); r=run()
+                    pl={e:json.loads(dd) for e,dd in sent_to if e.startswith('push-ep-st')}
+                    res['vue par abonné']=(pl.get('push-ep-st-a',{}).get('pct')==91.0 and pl['push-ep-st-a'].get('free')==90
+                                           and pl.get('push-ep-st-ab',{}).get('pct')==97.0 and pl['push-ep-st-ab'].get('storage_key')=='|sid1',pl)
+                    put('triggered',5,'t5',label='tunnel non résolu (sa)',nicks=('sa',))
+                    r=run([('web3',_Bh(),{'sa':'web:sa'})]); pw=[json.loads(dd) for e,dd in sent_to if e=='push-ep-st-web']
+                    res['tunnel exposé']=(pw and pw[0]['storage']=='tunnel non résolu (web:sa)' and pw[0]['storage_key']=='web3|sid1',pw)
+                    # row 48 : lecture avant écriture (franchissement déjà noté : aucune écriture) ; panne d'envoi d'un abonné : les
+                    # suivants jamais réservés, servis au passage suivant ; purge avec l'abonnement
+                    wr=[]; real_c=_push_conn
+                    with mock.patch(f"{__name__}._push_conn",lambda m='read': (wr.append(m) if m=='write' else None) or real_c(m)):
+                        r=run([('web3',_Bh(),{'sa':'web:sa'})])
+                    res['relu sans écriture']=(r==[] and wr==[],r,wr)
+                    put('triggered',6,'t6'); boom=[]; real_pd=_push_deliver
+                    def bad(rows,payload,nick,event):   # revue 87b row 73 : panne de l'envoi du PREMIER abonné seul
+                        if not boom: boom.append(rows[0]['endpoint']); raise RuntimeError('panne envoi')
+                        return real_pd(rows,payload,nick,event)
+                    with mock.patch(f"{__name__}._push_deliver",bad): r0=run()
+                    r=run(); got=sorted(e for e,_n,_e,_s in r); r2=run()
+                    res['panne : suivants servis']=(len(boom)==1 and len(r0)==1 and boom[0] not in [e for e,*_ in r0] and got==[boom[0]] and r2==[],
+                                                   boom,r0,got,r2)
+                    cn=real_c('read')
+                    try: k0=[x[0] for x in cn.execute("SELECT storage FROM storage_alerts")]
+                    finally: cn.close()
+                    _push_delete_endpoint('push-ep-st-ab')
+                    cn=real_c('read')
+                    try: k1=[x[0] for x in cn.execute("SELECT storage FROM storage_alerts")]
+                    finally: cn.close()
+                    res['purge avec l\'abonnement']=('|sid1|push-ep-st-ab' in k0 and sorted(k1)==sorted(k for k in k0 if not k.endswith('|push-ep-st-ab')) and bool(k1),k0,k1)
+                    sw=(_SW_FILE.read_text(encoding='utf-8') if _SW_FILE.exists() else '')
+                    res['tag SW']=('`storage-${d.storage_key || d.storage' in sw)
+                    # row 59 : aucune vue des nicks de l'abonné -> chiffres omis (jamais ceux d'un nick hors de son périmètre)
+                    sub('push-ep-st-ab',['sa','sb']); put('triggered',7,'t7',views={'sb':dict(F,pct=99.0)}); run()
+                    pa=[json.loads(dd) for e,dd in sent_to if e=='push-ep-st-a']
+                    res['sans vue : chiffres omis']=(pa and not any(k in pa[0] for k in ('pct','free','size','days_left')),pa)
+                    # rows 58, 71 : échec transitoire (5xx, 429, réseau) -> renvoyé au passage suivant ; échec définitif (400, 403…) :
+                    # jamais renvoyé ; transitoire répété : abandon après _STORAGE_PUSH_TRIES envois (attente croissante, ici nulle)
+                    put('triggered',8,'t8')
+                    with mock.patch(f"{__name__}._push_deliver",lambda *a,**k: 'retry'): r_f=run()
+                    r_n=run(); r_n2=run()
+                    res['échec transitoire : renvoyé']=(r_f==[] and sorted(e for e,_n,_e,_s in r_n)==['push-ep-st-a','push-ep-st-ab'] and r_n2==[],r_n,r_n2)
+                    put('triggered',9,'t9')
+                    with mock.patch(f"{__name__}._push_deliver",lambda *a,**k: False): run()
+                    res['échec définitif : jamais renvoyé']=(run()==[])
+                    put('triggered',10,'t10'); tries=[]
+                    with mock.patch(f"{__name__}._push_deliver",lambda rows,*a,**k: tries.append(rows[0]['endpoint']) or 'retry'), \
+                         mock.patch(f"{__name__}._STORAGE_PUSH_BACKOFF",0):
+                        for _i in range(_STORAGE_PUSH_TRIES+2): run()
+                    res['abandon après N essais']=(tries.count('push-ep-st-a')==_STORAGE_PUSH_TRIES and run()==[],tries.count('push-ep-st-a'))
+                    def kind(code):
+                        with mock.patch(f"{__name__}.webpush",side_effect=WebPushException('x',response=_FakeResp(code))), contextlib.redirect_stderr(io.StringIO()):
+                            return _push_deliver([{'endpoint':'ep-k','p256dh':'p','auth':'a'}],'{}','sa','storage')
+                    def net():
+                        with mock.patch(f"{__name__}.webpush",side_effect=ConnectionError('réseau')), contextlib.redirect_stderr(io.StringIO()):
+                            return _push_deliver([{'endpoint':'ep-k','p256dh':'p','auth':'a'}],'{}','sa','storage')
+                    res['classes d\'échec']=([kind(500),kind(503),kind(429),kind(400),kind(403),kind(413),net()]==['retry','retry','retry',False,False,False,'retry'],
+                                             [kind(500),kind(429),kind(400),net()])
+                    # row 63 : réservations d'un stockage absent de tout état servi -> purgées ; état illisible : gardées ; entrées
+                    # d'état d'un autre type (repos, nicks) : pas de plantage
+                    def keys_():
+                        cn=real_c('read')
+                        try: return sorted(x[0] for x in cn.execute("SELECT storage FROM storage_alerts"))
+                        finally: cn.close()
+                    with open(path,'w') as f: f.write('{pas du json')
+                    run(); kk1=keys_()
+                    with open(path,'w') as f: json.dump({'sid2':{'state':'triggered','crossing':1,'since':'x','nicks':'sa','repos':[1],'views':[]}},f)
+                    run(); kk2=keys_()   # une exception dans la passe garderait le préfixe : sid1 resterait
+                    res['purge des stockages disparus']=(any(k.startswith('|sid1|') for k in kk1) and not any(k.startswith('|sid1|') for k in kk2),kk1,kk2)
+                    # row 67 : mode dossier — rc listé mais indisponible : ses réservations gardées (rc retiré de la liste : purgées) ;
+                    # -C sans nick lu (aucun rc servi) : aucune purge
+                    cn=real_c('write')
+                    try:
+                        cn.executemany("INSERT OR REPLACE INTO storage_alerts (storage,crossing) VALUES (?,?)",
+                                       [('webU|sidU|ep1','1|x'),('parti|sidP|ep1','1|x')]); cn.commit()
+                    finally: cn.close()
+                    stU=type('S',(),{'entries':{},'unavailable':{'webU':'illisible'}})()
+                    with mock.patch(f"{__name__}.DIR_MODE",True),mock.patch(f"{__name__}._rc_state",lambda: stU), \
+                         mock.patch.dict(_RC,{'suspended':set()}):
+                        run([('web4',_Bh(),{'sa':'web:sa'})])
+                    kk3=keys_()
+                    cn=real_c('write')
+                    try: cn.execute("INSERT OR REPLACE INTO storage_alerts (storage,crossing) VALUES ('|sid2|ep1','1|x')"); cn.commit()
+                    finally: cn.close()
+                    kk3=keys_(); run([]); kk4=keys_()
+                    res['rc indisponible, -C vide : gardées']=('webU|sidU|ep1' in kk3 and 'parti|sidP|ep1' not in kk3 and kk4==kk3
+                                                               and '|sid2|ep1' in kk4,kk3,kk4)
+                    # row 78 : suivi d'après l'envoi non écrit (base occupée) -> bail posé AVANT l'envoi : renvoyé passé ce délai,
+                    # jamais perdu ; bail en cours : jamais un second envoi
+                    put('triggered',11,'t11')
+                    def boom_w(*a,**k): raise sqlite3.OperationalError('database is locked')
+                    with mock.patch(f"{__name__}._storage_claim_done",boom_w): r_a=run()
+                    r_b=run()
+                    with mock.patch(f"{__name__}._STORAGE_PUSH_LEASE",0):
+                        cn=real_c('write')
+                        try: cn.execute("UPDATE storage_alerts SET retry_at=datetime('now','-1 seconds') WHERE retry_at IS NOT NULL"); cn.commit()
+                        finally: cn.close()
+                        r_c=run()
+                    r_d=run()
+                    res['suivi non écrit : renvoyé après le bail']=(len(r_a)==2 and r_b==[] and len(r_c)==2 and r_d==[],r_a,r_b,r_c,r_d)
+                    ok=all((v[0] if isinstance(v,tuple) else v) is True for v in res.values())
+                    if not ok: print(f"  {res}")
+                    return ok
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("stockage presque plein : un push par franchissement et par stockage, nicks du périmètre de chaque abonnement seuls cités, "
+                  "sans abonné non consommé, réarmé/relu : rien, pause écartée puis reçue à la reprise (par abonné), mode dossier (noms "
+                  "exposés, réservation par rc), état écrit par le vrai borgHelper ; chiffres du dépôt le plus plein de l'abonné, storage_key "
+                  "(tag SW), tunnel exposé, réservation lue avant écriture, panne d'un envoi : suivants servis puis lui, purge avec "
+                  "l'abonnement, échecs transitoire/définitif, abandon après N essais, purges (stockage disparu, rc indisponible, -C vide), suivi non "
+                  "écrit renvoyé après le bail",_storage_push)
+            def _storage_alerts_migration():
+                """Revue 87b (rows 71, 74) : storage_alerts d'une version de travail d'avant (sans attempts ni retry_at) -> colonnes
+                ajoutées par ensure_push_db sous BEGIN IMMEDIATE ; deuxième ouverture (autre worker) : rien à faire, aucune erreur ;
+                colonne déjà ajoutée entre la lecture et l'ALTER (« duplicate column ») : tolérée."""
+                global PUSH_DB
+                d=tempfile.mkdtemp(prefix='bh87b-mig-'); old=PUSH_DB
+                try:
+                    PUSH_DB=os.path.join(d,'push.db')
+                    c_=sqlite3.connect(PUSH_DB)
+                    try: c_.execute("CREATE TABLE storage_alerts (storage TEXT PRIMARY KEY, crossing TEXT NOT NULL, notified_at TEXT)"); c_.commit()
+                    finally: c_.close()
+                    ensure_push_db(); ensure_push_db()
+                    c_=sqlite3.connect(PUSH_DB)
+                    try: cols=[r[1] for r in c_.execute("PRAGMA table_info(storage_alerts)")]
+                    finally: c_.close()
+                    # course simulée : la colonne apparaît entre la relecture et l'ALTER (autre worker) -> tolérée
+                    PUSH_DB=os.path.join(d,'push2.db')
+                    c_=sqlite3.connect(PUSH_DB)
+                    try: c_.execute("CREATE TABLE storage_alerts (storage TEXT PRIMARY KEY, crossing TEXT NOT NULL, notified_at TEXT)"); c_.commit()
+                    finally: c_.close()
+                    real_o=_open_db; calls=[]
+                    class _C:
+                        def __init__(s_,c): s_.c=c
+                        def __getattr__(s_,k): return getattr(s_.c,k)
+                        def execute(s_,q,*a):
+                            if q.startswith('ALTER TABLE storage_alerts ADD COLUMN attempts') and not calls:
+                                calls.append(1); s_.c.execute(q,*a)   # l'« autre worker » l'ajoute d'abord
+                            return s_.c.execute(q,*a)
+                    with mock.patch(f"{__name__}._open_db",lambda *a,**k: _C(real_o(*a,**k))): ensure_push_db()
+                    c_=sqlite3.connect(PUSH_DB)
+                    try: cols2=[r[1] for r in c_.execute("PRAGMA table_info(storage_alerts)")]
+                    finally: c_.close()
+                    ok='attempts' in cols and 'retry_at' in cols and calls==[1] and 'retry_at' in cols2
+                    if not ok: print(f"  {cols} {cols2} {calls}")
+                    return ok
+                finally: PUSH_DB=old; shutil.rmtree(d,ignore_errors=True)
+            check("stockage presque plein : migration de storage_alerts (colonnes ajoutées sous verrou, deux ouvertures, colonne dupliquée tolérée)",
+                  _storage_alerts_migration)
+            def _storage_cache_fp():
+                """Revue 87b (rows 25, 50) : l'empreinte de Report -o en cache suit l'état d'alerte des stockages — absent, écrit,
+                réécrit (mtime) : trois empreintes différentes ; ⚠ d'un autre nick jamais servi périmé."""
+                d=tempfile.mkdtemp(prefix='bh87b-fp-')
+                try:
+                    class _Db: cache_dir=d; db_prefix='rc'
+                    p_=_storage_alert_path(_Db()); fps=[]
+                    with mock.patch.object(_bh_paths,'db',_Db()),mock.patch(f"{__name__}.DIR_MODE",False):
+                        fps.append(_external_fingerprint('report',None))
+                        with open(p_,'w') as f: f.write('{}')
+                        os.utime(p_,ns=(10**18,10**18)); fps.append(_external_fingerprint('report',None))
+                        os.utime(p_,ns=(10**18+1,10**18+1)); fps.append(_external_fingerprint('report',None))
+                        st_=_external_fingerprint('stats',None) if 'stats' in _CACHE_TTL else ''
+                    ok=len(set(fps))==3 and fps[0].endswith('|storage:-') and fps[1].endswith(f'|storage:{10**18}') and '|storage:' not in st_
+                    if not ok: print(f"  {fps} {st_!r}")
+                    return ok
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("stockage presque plein : empreinte du Report -o en cache suivie de l'état d'alerte (absent, écrit, réécrit)",_storage_cache_fp)
+            def _storage_watcher_wired():
+                """Vgap 3 : chaque passage du watcher lance l'alerte de stockage, même quand un nick est en erreur."""
+                calls=[]
+                def _ensure(p,create=True): raise SystemExit(1)
+                with mock.patch(f"{__name__}._nick_list",lambda x:['nBad']), \
+                     mock.patch.object(_bh_paths.db,'ensure_diff_db',_ensure), \
+                     mock.patch(f"{__name__}._storage_alert_pass",lambda: calls.append(1)), contextlib.redirect_stderr(io.StringIO()):
+                    _bkp_status_watcher_pass()
+                return calls==[1]
+            check("stockage presque plein : alerte lancée à chaque passage du watcher (nick en erreur compris)",_storage_watcher_wired)
+            def _storage_rcs_ok():
+                """_storage_rcs : mode -C -> ('', _bh_paths, nicks du rc) ; mode dossier -> chaque rc, préfixe suspendu écarté."""
+                a=_storage_rcs()
+                E=lambda p,ns: type('E',(),{'prefix':p,'bh':'bh-'+p,'_ns':ns})()
+                st=type('S',(),{'entries':{'web':E('web',['x']),'mail':E('mail',['y'])}})()
+                with mock.patch(f"{__name__}.DIR_MODE",True),mock.patch(f"{__name__}._rc_state",lambda: st), \
+                     mock.patch(f"{__name__}._rc_bare_nicks",lambda e: e._ns),mock.patch.dict(_RC,{'suspended':{'mail'}}):
+                    b=_storage_rcs()
+                return (a[0][0]=='' and a[0][1] is _bh_paths and set(a[0][2])==set(_nick_list('ALL'))
+                        and b==[('web','bh-web',{'x':'web:x'})])
+            check("stockage presque plein : rc servis (mode -C ; mode dossier sans préfixe suspendu)",_storage_rcs_ok)
             def _reconcile_flow():
                 """1.31.8 (story 63, A118, décisions de l'utilisateur ; revue) : Bkp tué (interrompu, dépôt local) -> BkpReconcile dans
                 un fil, une fois par run et par processus, jamais après la fin notifiée ; chaque run vérifié sans archive -> fin
@@ -8765,7 +9241,8 @@ def push_selftest():
                 return seen
             got=uses(src)
             want={'_bh_paths':{'_bhn','_cfgread','_nick_list','_cache_db_paths','_bkp_markers_state','ensure_scope_cache_db',
-                               'ensure_push_db','_borg_cleanup_summary','<module>'},
+                               'ensure_push_db','_borg_cleanup_summary','<module>',
+                               '_storage_state_mtimes'},   # 1.34.0 (story 87b) : mode -C seulement, comme _bkp_markers_state
                   'CFGFILE':{'_default_section_groups','_capture_fingerprints','_build_borghelper_argv_env','_borg_cfg','_stats_sections','<module>',
                              '_storage_nicks'}}   # revue 87a (row 55) : ouvert en mode -C seulement (`if not DIR_MODE`), jamais le maître
             wit=uses("def ailleurs(n):\n    return _bh_paths.db.get_diff_db(n)\n")['_bh_paths']=={'ailleurs'}

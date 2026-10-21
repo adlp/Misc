@@ -1,4 +1,4 @@
-// SW_VERSION: 1.3.0
+// SW_VERSION: 1.4.0
 // borgHelperWWW — Service Worker des notifications push (spec-push-ui-prefs-json).
 // Servi par borgHelperWWW sur /sw.js (portée : toute l'origine). Ne fait qu'afficher les notifications
 // envoyées par le serveur (watcher bkp_status ou POST /push/test) et, au clic, amener l'onglet
@@ -25,6 +25,14 @@ function hours(h) {
   return r >= 48 ? `${Math.floor(r / 24)} j${r % 24 ? ` ${r % 24} h` : ''}` : `${r} h`;
 }
 
+// 150000000000 -> « 150.00 GB » (base 1000, comme borgHelper)
+function bytes(n) {
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0, v = n;
+  while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+  return `${v.toFixed(2)} ${u[i]}`;
+}
+
 function describe(d) {
   // Payload serveur : {nick, event: 'start'|'end'|'test', result: 'success'|'error'|null, timestamp,
   //                    changed_during_backup?, read_errors?}  (compteurs : fin de sauvegarde, SW >= 1.1.0)
@@ -36,6 +44,17 @@ function describe(d) {
     const age = hours(d.age_hours), max = hours(d.max_age_hours);
     return {title: `⏰ ${d.reminder ? 'Toujours aucune sauvegarde' : 'Sauvegarde en retard'} — ${nick}`,
             body: `Dernière sauvegarde il y a ${age} (seuil : ${max}). Vérifier la planification des sauvegardes.`};
+  }
+  if (d.event === 'storage') {
+    // Stockage presque plein (SW >= 1.4.0, borgHelperWWW >= 1.34.0) : une notification par franchissement du seuil, qui cite les
+    // nicks suivis par cet abonnement.
+    const parts = [];
+    if (typeof d.pct === 'number') parts.push(`${Math.round(d.pct)} % occupé`);
+    if (typeof d.free === 'number') parts.push(`${bytes(d.free)} libres`);
+    if (typeof d.days_left === 'number') parts.push(`~${Math.round(d.days_left)} j restants`);
+    const ns = Array.isArray(d.nicks) && d.nicks.length ? d.nicks.join(', ') : nick;
+    return {title: `⚠ Stockage presque plein — ${d.storage || '?'}`,
+            body: (parts.length ? parts.join(', ') + '. ' : '') + `Nicks : ${ns}.`};
   }
   const w = warningsText(d);
   if (d.event === 'end' && d.result === 'success') {
@@ -57,8 +76,9 @@ self.addEventListener('push', e => {
   if (d.timestamp) { const t = Date.parse(d.timestamp); if (!isNaN(t)) when = t; }
   e.waitUntil(self.registration.showNotification(title, {
     body,
-    // Même tag par nick : une fin de sauvegarde remplace la notif de début au lieu de s'empiler.
-    tag: d.nick ? `bkp-${d.nick}` : 'bkp-test',
+    // Même tag par nick : une fin de sauvegarde remplace la notif de début au lieu de s'empiler ; stockage : son propre tag.
+    // Stockage : tag par rc et identité de stockage (storage_key, revue 87b row 49) — deux rc au même nom de stockage distincts.
+    tag: d.event === 'storage' ? `storage-${d.storage_key || d.storage || '?'}` : (d.nick ? `bkp-${d.nick}` : 'bkp-test'),
     renotify: true,
     timestamp: when,
     data: d,

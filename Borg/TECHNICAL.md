@@ -518,7 +518,7 @@ erDiagram
 
 Mesures prises au Bkp (ou au Prune) qu'aucun appel borg ne redonne ensuite — chantier « reconstruction progressive »,
 story 2, spine AD-7/AD-8. Une base par nick (`<conf>-<nick>-history.db`, même nom que `diff.db`), en clair (aucune
-colonne de chemin, jamais d'`enc_header`), `0600`, WAL, ouverte sans nick (`_open_db(..., nick=None)` : ni codec ni
+colonne de chemin d'archive — 1.0.209 : `storage_space.label` peut porter le point de montage d'un dépôt local —, jamais d'`enc_header`), `0600`, WAL, ouverte sans nick (`_open_db(..., nick=None)` : ni codec ni
 avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chemin, jamais chiffrée)`.
 
 | Table | Contenu | Écrivains | Rétention |
@@ -527,6 +527,11 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
 | `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
 | `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E ; `borg_version`, `borg_server_version` (1.0.165 : colonnes ajoutées par introspection dans `ensure_history_db`, ajout pur ; un lecteur d'une base pas encore rouverte en écriture lit `NULL`) ; `reconciled` INTEGER (1.0.187, même ajout : 1 = archive d'un Bkp tué rapprochée, ligne SANS mesure — ni taille ni C/E —, `archive_date=''`) | Bkp ; `reconciled` : rapprochement d'un Bkp tué (`_reconcile_killed_bkp`, Index ou début du Bkp suivant) | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
 | `archive_chart` (1.0.140) | par `(nick, archive, archive_date)` : ligne de graphique figée (`_CHART_FIELDS` + `gone`) | rapprochement de la base servie, `DIFF_KEEP` | `STATS_RETENTION_MONTHS`, que l'archive existe ou non |
+| `storage_space` (1.0.209) | place du DÉPÔT du nick à la fin d'un Bkp : `storage_id` (sha256 de l'étiquette fusionnée, 24 car.), `label` (cette étiquette : `user@hôte`, nom `STORAGE`, `local <montage>` — jamais un chemin d'archive), `repo_key` (sha256 du repo_id : chemin résolu, sinon écrit), `repo_wkey` (sha256 du chemin ÉCRIT, `~` non développé : Storage et Report retrouvent la mesure sans résoudre), `source` (`df_local`, `df_ssh`, `declared`, `unknown`), `free`, `size`, `used` (système de fichiers ou `STORAGE_SIZE`, bornés par le quota), `used_repos` (taille des dépôts du stockage), `growth_per_month` (jamais exposée), `quota` (dépôt de cette machine), `reason` (sources écartées, sans chemin), `measured_at` UTC | Bkp (`_storage_measure`) | `STATS_RETENTION_MONTHS` (la plus récente gardée) |
+
+Schéma : `storage_space` (1.0.209) est un ajout pur (`CREATE TABLE IF NOT EXISTS`, créée sur une base existante à sa prochaine
+ouverture par `ensure_history_db`) — `HISTORY_DB_SCHEMA_VERSION` reste 1 (comme `archive_chart`) ; lecteurs : table absente =
+aucune mesure (`_sqlite_missing`).
 
 - **Lecture** : `history_path(nick)` / `_hist(nick)` ouvrent d'abord `diff.db` (`ensure_diff_db`, sans la créer), ce
   qui migre une base antérieure ; une lecture ne crée jamais `history.db` (fichier absent = aucune mesure : `[]`,
@@ -4408,7 +4413,7 @@ le multi-nick).
 ## `Storage` — vue par hôte de stockage (`borgHelper` 1.0.208 / `borgHelperWWW` 1.33.0 / UI 1.26.0, story 87a)
 
 Lecture seule : `history.db` (`repo_stats`) et `df` pour un dépôt local ; jamais borg ni ssh (place libre et alertes :
-story 87b). Fonctions de module de `borgHelper` :
+1.0.209, section suivante). Fonctions de module de `borgHelper` :
 
 - `_storage_of(cfg, nick, resolve)` -> `{storage, named, kind, repo, repo_id, warn}` pour une section rc. `kind` = accès au dépôt
   (`ssh`, `tunnel`, `local`, `autre`) ; `storage` = étiquette, qui est aussi la clé de regroupement. `_secret_form` (liste
@@ -4509,6 +4514,142 @@ bloc masqué ; code 1 (HTTP 400) : vue et erreurs affichées.
 
 Vérifié : CodecSelfTest (15 contrôles « Storage »), push selftest (`/storage` modes `-C` et dossier, vue comparée aux sorties
 CLI de chaque rc), test UI.
+
+## Place libre des stockages et alertes (`borgHelper` 1.0.209 / `borgHelperWWW` 1.34.0 / UI 1.27.0 / SW 1.4.0, story 87b)
+
+**Mesure** (par dépôt, décision 8) : `BorgHelper._storage_measure(nick, cfg, budget=10)`, appelée une fois par Bkp par `_space()`
+de `backup()` (revue 87b rows 30, 53, 54) — APRÈS l'Index de fin (`index-running` rendu par son `finally`), `priority.lock`
+relâché par `_space()`, APRÈS `store_bkp_status_finish` (et l'alerte `bkp_error` d'un échec), AVANT le JSON de sortie (`borgHelper_storage` ;
+un `borg create` en échec n'imprime d'ordinaire aucun JSON, rien n'est alors imprimé) et `sys.exit`. Un Restore, un Prune ou un Index en pause n'attend jamais la mesure, ni le
+push de fin. `(Exception, SystemExit)` rattrapés (`[WARN] … non mesurée`) ; `KeyboardInterrupt` et `SystemExit(130)` relancés par
+`_storage_measure`, absorbés par `_space()` (`[WARN] … mesure de place interrompue`, Bkp déjà fini : résultat et code inchangés).
+SIGTERM pendant la mesure (aucun gestionnaire : arrêt systemd, délai de borgHelperWWW) : Bkp déjà enregistré « success », sortie
+143 sans JSON — fenêtre connue (row 70) ; l'attente de `store_bkp_status_finish` (verrou, jusqu'à 300 s) précède le JSON, comme le
+résultat. Budget unique (rows 55, 68) : `budget` (10 s) couvre tout — `_fqdn_bounded(1 s)`, résolution du nick, autres nicks
+(sections lues sous l'échéance), df, bases ; seuls la marque Sentry (0,5 s) et les planchers des attentes SQLite (0,1 s) le
+dépassent : pire cas ~11 s. Aucun accès disque non borné dans ce processus (row 52). Étapes :
+1. dépôt du nick : `_storage_of(cfg, resolve=_LocalResolver(budget=per_path=max(1, min(_STORAGE_OWN_RESOLVE=5 s, budget/2)),
+   marqueur de 87a, `reread`=`lock_wait`=0,5 s))`, dans le budget ; délai plein (tolérance de 0,05 s sur `capped`, calculé avant le temps de `_hit`, rows 68, 77) :
+   montage marqué ; `ValueError` (borg 2 sans `STORAGE`) -> `_storage_measure_unplaced` (ligne `unknown`, identité `?|<nick>`, `[WARN]`
+   seulement si la raison change). Clés (rows 40, 52, 66, 72) : `rkey` = `repo_id` (dépôt local :
+   chemin résolu par l'enfant, sinon écrit) -> `storage_space.repo_key`, état d'alerte ; `wkey` = chemin ÉCRIT (`_norm_local` :
+   `normpath(abspath)` — row 76 : borg ne développe JAMAIS `~` dans un dépôt local, mesuré ; aucun accès disque ni annuaire) ->
+   `storage_space.repo_wkey`, retrouvé par Storage et Report sans rien résoudre ; mesure non résolue (`resolved` faux) : `repo_key`
+   de la dernière mesure du même `repo_wkey` (row 75). Dépôt ssh de cette machine : `_here_path` -> `~<utilisateur du dépôt>/…`
+   (`~/…` compris), développé par `_SPACE_PY` avec l'annuaire (`_child_env` : jamais HOME, row 76) ; `~` qui reste : code 7,
+   « utilisateur du dépôt inconnu ici ». Étiquette de repli (`local ? (…)`, `warn`, non nommé) : mesure écrite avec `label` NULL (row 44 :
+   jamais un chemin en base), état non touché.
+2. `_storage_merged({nick: entrée}, deadline=fin du budget)` (marques de df bloqué des autres nicks : verrou 0,5 s, sautées à moins
+   de 3 s de la fin, row 77) : autres nicks du rc par leur section seule (sautés à moins de 2 s de
+   la fin) ; leurs chemins locaux collectés sans accès disque, puis résolus par UN enfant `_realpaths_bounded` (`python -I -c
+   _REALPATH_PY`, `expanduser` puis `realpath` — lstat, jamais d'ouverture —, PDEATHSIG, session à part, min(3 s, reste − 3 s) ;
+   résultats lus jusqu'au délai) — chemin couvert par une marque de df bloqué ou non résolu : chemin écrit ; montage = plus long
+   préfixe de `/proc/self/mounts` (row 52 ; mémorisé par instance avec les sections lues et la liste des nicks), fusion 87a
+   (`_storage_aggregate`) -> étiquette M du stockage fusionné, `storage_id` = sha256(M)[:24], `repo_key` = sha256('repo|'+repo_id)[:24],
+   taille, croissance, capacités : nicks de M seuls (row 60) ; pairs de l'alerte = nicks de M ∪ nicks cités par l'état de M (row
+   32 ; section absente d'un rc LU — le nick mesuré figure dans `cfgreadnicks()` — : écarté, row 64 ; illisible : inconnu). Bases
+   lues : `get_storage_measures(pair, timeout=min(2 s, reste))` des nicks de M -> taille du stockage, croissance mensuelle ; jours
+   restants : `_growth7` — somme des rythmes des SEULS dépôts mesurés sur au moins `_STORAGE_DAYS_WINDOW` (7) jours (row 36).
+3. `target` de `_storage_of` : ssh/tunnel `{user, host, port, path, here}` — `here` = `_this_host(hôte) and port ∈ {absent, 22}`
+   (row 3) ; local `{here, path réel, warn}`, `None` si `_borg_runs_elsewhere(cfg)` (SSH_REPO/SSH_REMFO, même prédicat que
+   `_repo_local_path`) ; `None` aussi pour un tunnel non résolu ou une forme borg 2. Source :
+   - `here` : `_df_local_space(chemin, min(reste − 1, 5 s))` — enfant `python -I -c _SPACE_PY` (`PR_SET_PDEATHSIG`, PID du parent
+     vérifié, `~u` développé par lui — code 7 si inconnu, row 45 —, dossier seul ouvert puis `fchdir`, `config` du dépôt lu —
+     `[repository] storage_quota` — écrit `Q:<valeur>\0`, puis `exec df --output=avail,size,used -B1 -- .`), `PATH`/`LC_ALL=C`, cwd
+     `/`, repli `df -P -k` dans l'enfant si `--output` échoue (row 61) ; ssh de cette machine : `_here_path` (absolu ; relatif -> `~<user du dépôt>/…` ; `~u/…` tel quel — jamais `pwd` dans
+     borgHelper) ; montage marqué ou non lu : « df local : montage qui ne répond pas (df bloqué) » (jamais le chemin). Dépôt ssh de
+     cette machine dont le df local échoue sur « dossier du dépôt inaccessible » ou « utilisateur du dépôt inconnu ici » : df par
+     ssh (row 43 — dossier d'un autre compte) ; « dépôt absent » : jamais ;
+   - sinon `_ssh_df_argv` : `shlex.split(BORG_RSH or 'ssh')`, options `-o BatchMode=yes -o ConnectTimeout=<1..4> -o
+     ControlMaster=no -o ControlPath=none` insérées juste après le premier élément de nom `ssh` (row 16), `[-p port]`,
+     `[user@]hôte`, `_remote_df_cmd` = `sh -c '<script>'` cité, script `P=<Q>; if command -v timeout …; then T='timeout 5'; else T=;
+     fi; $T df --output=avail,size,used -B1 -- "$P" 2>/dev/null || $T df -P -k -- "$P"` (Q = `shlex.quote` ; `~u` non cité,
+     `[A-Za-z_][A-Za-z0-9_.-]*$?`, développé par l'affectation ; POSIX quel que soit le shell de connexion ; rows 35, 61 : sonde
+     `timeout 5 true` — BusyBox ancien à `timeout -t` : sans ; un df en état D peut survivre à `timeout`, ssh reste tué à 6 s) ; `ValueError` avant lancement : utilisateur hors `_SSH_USER_OK`, hôte hors `_SSH_HOST_OK` (`(?!-)…`, IPv6 permis),
+     port non numérique, caractère de contrôle ; `_run_bounded` (session à part, `preexec_fn=_pdeathsig_fn()` — tué avec borgHelper ;
+     `prctl` résolu une fois dans le parent, row 62 ; enveloppe `BORG_RSH` qui lance ssh en petit-enfant : couverte par la seule
+     mise à mort du groupe au délai —,
+     entrée fermée, délai min(reste − 1, 6 s), `killpg(9)`, relecture 0,5 s) ; `_df_pair` : ligne de trois entiers (GNU) ou ligne
+     `-P -k` (blocs 1 Kio) ; taille ≤ 0 ou occupé + libre ≤ 0 : « taille du système de fichiers nulle » (rows 2, 37) ; raisons sans
+     sortie distante ;
+   - sinon capacité déclarée : `min` des `STORAGE_SIZE` valides des pairs (`_cfg_raw`, `_parse_bytes` ; ≤ 0, illisible ou
+     `OverflowError` : `[WARN]`, écartée), `used = taille du stockage`, `free = max(0, capacité − used)`, `declared` — sauf si le
+     dernier df connu de CE dépôt (`get_storage_space(n, None, repo_key)` de chaque nick du stockage sur ce dépôt, row 41) a moins de
+     `_STORAGE_DF_RECENT_DAYS` (7) jours : `unknown` + raison ;
+   - sinon `unknown`. Quota (row 14) : `free = min(free, quota − taille du dépôt)`, `size = min(size, quota)`, `used = size − free`.
+   ~1 s du budget reste toujours pour Sentry (row 33).
+4. `store_storage_space(nick, row, timeout=min(2 s, reste))` : une tentative, base jamais créée (garantie au début du Bkp) ; `False`
+   -> état non touché (row 34).
+5. `_storage_alert_state(nick, sid, M, pairs, entrées, cfgs, row, dg, reste)` -> `(alert, alert_sent)` ; `alert` = nick cité par
+   l'état (row 42, aussi pour une mesure inconnue ou de repli).
+
+**Seuils** : `_storage_alert_keys(cfg)` -> `(pct, qty, days, raisons)` — décision 10 : `STORAGE_ALERT` « N », « N% » ou « N%% » (row
+38 : `%%` -> `%`) (1 ≤ N ≤ 100), quantité **avec unité** (`_parse_bytes(unit=True)`), `_OFF_WORDS` (off, none…) éteint, sinon
+raison + 90 ; `STORAGE_ALERT_DAYS` (0/off éteint, défaut 30) ; lus par `_cfg_raw` (`raw=True`). `_keys_off` : nick tout à off
+(décision 11). `_space_pct` : occupé / (occupé + libre) (décision 14). `_space_hits(vue, jours, seuils)` : critères atteints.
+
+**État d'alerte** : `CACHE_DIR/<préfixe>-storage-alert.json` (`_storage_alert_path`) `{storage_id: {state 'triggered'|'armed',
+crossing, since, label, nicks (nus, cités : dépôt au-dessus de leur seuil), views {nick cité: {pct, free, size, days_left, source,
+measured_at}} (row 31), repos {repo_key: {measured_at}}, measured_at, source, free, size, pct, days_left, why, rearmed_at,
+sentry_sent, sentry_claim}}`. `_storage_alert_state` : dernière mesure de chaque dépôt du stockage (la sienne, celles des pairs non
+éteints par `get_storage_space(pair, sid, repo_key, timeout borné)`), critères de chaque nick (section illisible : inconnu) ; sous
+`_state_update` (verrou `.lock` `LOCK_EX|LOCK_NB` réessayé ≤ 2 s ; `_state_load(strict=True)` : fichier présent mais illisible ->
+`None`, jamais réécrit ; entrées non mesurées depuis 180 jours retirées ; entrée d'une AUTRE identité qui suit ce `repo_key` :
+ce dépôt et ses nicks seuls retirés (plus aucun dépôt : entrée retirée ; plus aucun nick : `armed`) — rows 47, 60 ; `repos`,
+`nicks`, `views` d'un autre type écartés (`_state_reps`, `_state_list`, row 63) ; mesure plus ancienne : `entry` rendu (row 60) ;
+dépôts des pairs évalués sur une mesure connue ajoutés à `repos` ; mesure plus ancienne que `repos[rk].measured_at` ignorée ; row 32 : dépôt d'un pair dont `repos[...].measured_at` est
+plus récent que la ligne lue -> inconnu) : cités = nicks atteints ∪ nicks inconnus déjà cités dont le dépôt est suivi par l'entrée ou inconnu (row 60) ; cités et état absent/`armed` ->
+`triggered`, `crossing` + 1, `since`, `sentry_sent` faux ; cités et `triggered` -> mise à jour ; aucun et `triggered` -> `armed`.
+Chiffres de l'entrée : vue du nick cité le plus plein, sinon ceux d'avant (row 46). Sentry (row 33) : `sentry_sent` faux ->
+réservé SOUS le verrou (`sentry_claim`, repris après `_STORAGE_SENTRY_CLAIM` = 120 s ; horloge reculée — delta négatif jusqu'à
+un jour — : tenue, row 56 ; deux Bkp ensemble n'envoient qu'une fois) ;
+budget restant ≤ 0,5 s : `[WARN] … reportée`, envoyé à la mesure suivante ; aucun nick cité avec `storage` dans `SENTRY_ALERTS` :
+`sentry_sent` vrai sans envoi. Envoi : `sentry_alert('storage', storage_id, _storage_alert_text(…), flush_timeout=reste)` (row 4 :
+étiquette et empreinte Sentry = `storage_id`), puis (row 56) `sentry_sent` vrai si l'événement est parti ou sans DSN
+(`_sentry_dsn()`) ou Sentry inutilisable (`_sentry_unusable` : `sentry_sdk` absent ou aucun client actif, row 69), sinon
+`[WARN] … non envoyée` une fois par franchissement (`sentry_warned`) et `sentry_claim` rendu ; envoi borné à reste − 0,5 s, marque
+attendue max(0,5 s, reste) (row 68), `[WARN]` si non écrite. Franchissement :
+`[WARN]` au texte de la décision 7.
+
+**Lecteurs** (jamais ssh ni borg) : `_storage_collect` (Storage) — par nick et chemin écrit du dépôt (rows 40, 52, 72 : `wkey`,
+sans accès disque ; jamais l'étiquette re-résolue) -> `get_storage_space(nick, repo_wkey=…)` (base déjà en erreur sautée ; dernière mesure,
+`last_known` et `unknown_since` pour une mesure inconnue, décision 15), `_space_pub` (row 44 : sans `label` ni `used`) ; `alert` =
+`_state_cites(état, nick, repo_key de cette mesure)` (nick cité par une entrée `triggered` qui suit ce dépôt) ; `_storage_aggregate` : `space` du
+dépôt (`_space_rank`), `days_left` = libre / croissance des nicks de l'appel (≥ 7 jours, row 19), stockage : `alert` d'un dépôt,
+`space` du dépôt le plus plein ; `_storage_text` / `_space_line`. Report (jumelles `report`/`report_offline`, ligne de dépôt vide,
+lignes de message) : `_report_space` avant la mise en forme (même recherche par nick et chemin écrit — `_storage_of` avec un
+résolveur nul : aucun accès disque, aucun autre nick (row 52) ; ⚠ par le `repo_key` de la mesure trouvée ; dépôt
+distant à `reste` vide : `free` de la dernière mesure ou de la dernière connue ; dépôt local à quota : `reste` borné),
+`_report_space_mark` après « ⚠ dépôt absent » (« ~ », « (place inconnue depuis …, dernière mesure connue du …) » — row 39,
+décision 15 —, « — ⚠ stockage presque plein » + `***`/`errhost` + code 1 — décision 12 —, `-j` : `stockage` sans croissance,
+`last_known` par `_space_pub`).
+
+**borgHelperWWW** : `_storage_alert_pass()` à la fin de chaque passage du watcher — pour chaque rc (`_storage_rcs` : mode `-C` par
+`_bhn`, ou chaque rc servi hors préfixe suspendu), chaque entrée `triggered` : nicks cités -> exposés (hors rc : écartés) ; pour
+chaque abonnement non expiré au type `error` d'un de ces nicks non en pause (`_push_muted`), UN par UN (row 48) :
+`_storage_claim('<préfixe>|<storage_id>|<endpoint>', '<crossing>|<since>')` -> (réservé, essais faits)
+(`push.db.storage_alerts` : lue d'abord — déjà notée sans essai échu : aucune écriture —, puis `ON CONFLICT … WHERE crossing !=
+excluded.crossing`, ou reprise d'un essai échu (`retry_at` ≤ maintenant, comparer-et-échanger) ; décision 13 : par abonné) puis
+`_push_deliver` (rend True, 'retry' — 5xx, 429, réseau — ou False — 400, 403, 413… : jamais renvoyé ; panne de l'appel : 'retry',
+les abonnés suivants servis) ; 'retry' : `_storage_claim_retry` (`attempts` + 1, `retry_at` = passage suivant puis 60 s doublés,
+abandon après `_STORAGE_PUSH_TRIES` = 5 envois ; rows 58, 71, 73 ; colonnes ajoutées par `ensure_push_db` à une table d'avant,
+sous `BEGIN IMMEDIATE` avec relecture de `table_info`, « duplicate column » toléré — row 74). Row 78 : `retry_at` posé AVANT l'envoi
+(bail `_STORAGE_PUSH_LEASE` = 60 s : un autre worker n'envoie pas en même temps ; envoi interrompu : renvoyé) ; suivi d'après
+(`_storage_claim_done` : servi, refusé ou abandonné ; `_storage_claim_retry`) dans son propre `try` — raté : le bail renvoie,
+jamais perdu ; garde SQLite : 28 ouvertures
+(payload `event: 'storage'`, `nicks` = ceux de son périmètre, chiffres du dépôt le plus plein parmi eux par `views` — row 31 —,
+`storage_key` = `<préfixe>|<storage_id>` — row 49 —, aucune vue de ses nicks : chiffres omis — row 59 —, `storage` « tunnel non résolu (<nick>) » exposé — row 44). Réservations
+purgées avec l'abonnement (`_storage_claims_purge` : `_push_purge_expired`, `_push_delete_endpoint`) et, à chaque passe, celles
+d'un stockage absent de tout état servi (`_storage_claims_stale`, rows 63, 67 ; état illisible, rc en erreur, suspendu ou indisponible —
+`_rc_state().unavailable` — : gardées ; mode `-C` sans rc servi : aucune purge ;
+lecture d'abord, rien à retirer : rien écrit). Abonné sans nick actif : rien
+réclamé (reçu à la reprise si toujours `triggered`). `PUSH_DB_SCHEMA_VERSION` 3, version écrite 1. Report `-o` en cache :
+`_external_fingerprint` ajoute `_storage_state_mtimes()` (row 25) ; `_expose_row` réécrit `stockage.storage` d'un tunnel non
+résolu. `/storage` : `space`/`alert` relayés (`_storage_merge`). SW 1.4.0 : `describe` d'un `event: 'storage'`, tag
+`storage-<storage_key>`. UI : ⚠ sous le stockage, `storageSpaceHtml(space, alert)` sous chaque dépôt.
+
+Vérifié : CodecSelfTest (12 contrôles « Stockage, … », df factice, Sentry neutralisé ; contrôles à vrai borg et à Bkp sur dépôt
+local avec `STORAGE_ALERT=off`), push selftest (5 contrôles), test UI.
 
 ## `push.db` — clés VAPID et abonnements push (`borgHelperWWW` 1.17.0 Story 2a / 1.18.0 Story 2b de `spec-notifications-push`)
 

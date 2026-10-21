@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.26.0 -->
+<!-- UI_VERSION: 1.27.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -97,6 +97,9 @@
   .storage-table td.num{text-align:right;white-space:nowrap}
   .storage-table tr.storage-repo td{font-size:12px;color:var(--muted);border-top:none;padding-top:0}
   .storage-table tr.storage-repo td:first-child{padding-left:22px;word-break:break-all}
+  /* UI 1.27.0 (story 87b) : place libre du stockage (dernière mesure de fin de Bkp) et alerte */
+  .storage-table tr.storage-space td{font-size:12px;border-top:none;padding-top:0;padding-left:22px}
+  .storage-table .storage-alert{color:var(--danger);font-weight:600}
   .spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--border);
     border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;
     vertical-align:middle;margin-right:6px}
@@ -144,7 +147,7 @@
          connaît pas /storage -->
     <div class="card" id="storageCard" hidden>
       <h2 style="margin:0 0 10px">Stockages</h2>
-      <p class="hint">Dépôts regroupés par hôte de stockage : taille = dernières mesures des dépôts distincts, croissance depuis la première mesure (history.db, aucun accès au dépôt).</p>
+      <p class="hint">Dépôts regroupés par hôte de stockage : taille = dernières mesures des dépôts distincts, croissance depuis la première mesure, place libre mesurée à la fin du dernier Bkp (history.db, aucun accès au dépôt ; « ~ » : déduite de la capacité déclarée).</p>
       <div id="storageError" class="error"></div>
       <div id="storageList"></div>
     </div>
@@ -704,17 +707,40 @@ function storageHtml(d){
       h+=`<tr class="storage-row"><td><strong>${escapeHtml(s.storage)}</strong></td><td class="num">${repos.length}</td>`
         +`<td class="num">${escapeHtml(sz(s.size))}</td><td class="num">${escapeHtml(s.size==null?'—':sg(s.growth))}</td>`
         +`<td class="num">${escapeHtml(s.growth_per_month==null?'—':sg(s.growth_per_month)+'/mois')}</td><td>${since}</td></tr>`;
+      if(s.alert===true) h+='<tr class="storage-space"><td colspan="6"><span class="storage-alert">⚠ stockage presque plein</span></td></tr>';   // UI 1.27.0
       repos.forEach(rp=>{
         const ns=Array.isArray(rp.nicks)?rp.nicks:[];
         h+=`<tr class="storage-repo"><td colspan="2">${escapeHtml(rp.repo)} — ${ns.map(n=>escapeHtml(n)).join(', ')}</td>`
           +`<td class="num">${escapeHtml(sz(rp.size))}</td>`
           +`<td colspan="3">${rp.size==null?'aucune mesure':'mesurée le '+escapeHtml(day(rp.measured_at))}</td></tr>`;
+        h+=storageSpaceHtml(rp.space,rp.alert===true);   // UI 1.27.0 (story 87b, décision 8) : place de chaque dépôt
       });
     });
     h+='</table>';
   }
   if(errs.length) h+='<p class="error">'+errs.map(([n,e])=>'⚠ '+escapeHtml(n)+' : '+escapeHtml(e)).join('<br>')+'</p>';
   return h;
+}
+
+// UI 1.27.0 (borgHelperWWW 1.34.0, borgHelper 1.0.209, story 87b) : ligne « place » d'un DÉPÔT (décision 8) — dernière mesure de
+// fin de Bkp (place libre, % occupé, jours restants, source, date UTC) et « ⚠ stockage presque plein » tant qu'il dépasse son seuil ;
+// décision 15 : place inconnue -> « depuis » et dernière mesure connue ; rien si le serveur ne la donne pas.
+function storageSpaceHtml(sp,alert){
+  sp=(sp && typeof sp==='object')?sp:null;
+  const al=alert?' <span class="storage-alert">⚠ stockage presque plein</span>':'';
+  if(!sp) return al?`<tr class="storage-space"><td colspan="6">${al.trim()}</td></tr>`:'';
+  const utc=v=>v?String(v).slice(0,16)+' UTC':'?';
+  const phrase=x=>{
+    const parts=[];
+    if(typeof x.pct==='number') parts.push(`${Math.round(x.pct)} % occupé`);
+    if(typeof x.free==='number') parts.push(`${x.approx?'~':''}${_fmtBytes(x.free)} libres`+(typeof x.size==='number'?` sur ${x.approx?'~':''}${_fmtBytes(x.size)}`:''));
+    if(typeof x.days_left==='number') parts.push(`~${Math.round(x.days_left)} j restants`);
+    return `${parts.join(', ')} — ${x.source_text||x.source||'?'}, ${utc(x.measured_at)}`;
+  };
+  const lk=(sp.last_known && typeof sp.last_known==='object')?sp.last_known:null;
+  const txt=typeof sp.free==='number'?`Place : ${phrase(sp)}`
+    :`Place inconnue depuis ${utc(sp.unknown_since||sp.measured_at)}`+(sp.reason?` (${sp.reason})`:'')+(lk?` — dernière mesure connue : ${phrase(lk)}`:'');
+  return `<tr class="storage-space"><td colspan="6">${escapeHtml(txt)}${al}</td></tr>`;
 }
 
 let machinesLoadSeq=0;
