@@ -352,7 +352,13 @@ dit une fois dans son propre journal, à sa première alerte. Depuis 1.0.132, Se
 
 - les **erreurs logicielles** (exception non prévue, bug) — plus aucune trace de performance (auparavant une par
   invocation, donc une par clic de l'interface web) ; les erreurs de données ou de configuration (passphrase fausse,
-  base altérée…) affichent un message et ne partent pas ;
+  base altérée…) affichent un message et ne partent pas ; fichier de conf illisible (1.0.212) : un message masqué
+  `rc illisible, ligne N : nature` (voir « Codes de sortie de l'aide et des arguments »). Filet (1.0.212) : dans tout texte
+  envoyé, une ligne de fichier ou une valeur recopiée par `configparser` (`[line 3]: …`, `line: 1` puis la ligne, `found: …`,
+  `variable reference …`, `interpolation key …`, `Raw value: …`) est masquée jusqu'à la fin de la ligne (`'[redacted]'` — sentry_sdk
+  tronque les longs textes avant le filtre : jamais un guillemet fermant attendu) ; la ligne de commande jointe par sentry_sdk
+  (`sys.argv`, CLI et borgHelperWWW) ne garde que les noms d'options : toute valeur (passphrase de `-P` ou de Login `-p`, clé
+  d'API `-K`/`--api-key`, chemin de `-C`, nom de commande) devient `[redacted]`, même une valeur qui commence par `-` ;
 - les **alertes opérationnelles** demandées par `SENTRY_ALERTS` (par serveur ou dans `[DEFAULT]`) : `bkp_error` —
   sauvegarde en échec, envoyée par borgHelper à la fin du `Bkp`, ou sauvegarde bloquée constatée par borgHelperWWW ;
   `overdue` — dernière sauvegarde plus vieille que `MAX_AGE_BKP`, constatée par le watcher de borgHelperWWW (qui doit
@@ -399,6 +405,49 @@ Codes de sortie de l'aide et des arguments : `-h`, `-H <commande connue>` -> 0 ;
 <nom>` + liste des fiches), erreur d'arguments, `-c` inconnu (`[ERREUR] commande inconnue : <nom>`, renvoi vers `-h`) ou
 absent (aide globale) -> 2. Avant 1.0.206, toute aide et toute erreur d'arguments sortaient en 1 (getopt invalide et
 argument parasite compris). CodecSelfTest et PerfBench refusent aussi les options qui ne sont pas les leurs.
+
+Fichier de conf illisible (1.0.212) : lu une fois avant toute commande (après les arguments ; CodecSelfTest et PerfBench, qui
+ne le lisent pas, exceptés) — ligne sans `=`, clé avant la première section, section en double, clé en double dans une section
+(la CLI compare les clés sans tenir compte de la casse : `BORG_REPO` et `borg_repo` sont la même clé), encodage invalide, BOM,
+fichier sans droit de lecture, dossier, dossier parent non traversable : une seule ligne, code 2 (la commande n'a rien fait) :
+
+```
+[ERREUR] ~/.borghelperrc illisible, ligne 3 : « clé = valeur » attendu  [borgHelper v1.0.212]
+[ERREUR] /etc/borg/rc illisible : permission refusée  [borgHelper v1.0.212]
+```
+
+Jamais le contenu de la ligne fautive (une ligne `BORG_PASSPHRASE secret` sans `=` en est une), ni la valeur, ni une clé, ni un
+nom de section. Natures : `« clé = valeur » attendu`, `« [section] » attendu avant la première clé`, `section en double`, `clé en
+double dans sa section`, `ligne indentée après une clé sans valeur` (Python 3.13+), `BOM UTF-8 en tête du fichier (l'enregistrer
+sans BOM)`, `encodage invalide (<encodage> attendu)` (encodage de lecture de configparser, celui de la locale : `utf-8` en
+général), `permission refusée`, `est un dossier`, `opération non permise`, `erreur d'entrée-sortie` ; autre cas : le message du
+système ou le nom de l'erreur. Un fichier rendu illisible pendant une longue commande (Bkp, Index, `-n ALL`) par une erreur de
+syntaxe arrête la commande avec la même ligne ; s'il devient indécodable et que l'erreur remonte à la CLI, de même (le rc est
+relu pour le vérifier ; une boucle de Bkp la dit comme une autre erreur du nick) ; s'il perd ses droits
+de lecture, configparser le lit vide (les lectures suivantes disent « Ce serveur est inconnu ») ; une erreur de syntaxe rencontrée
+à l'ouverture d'une base chiffrée vaut « passphrase absente » (limites connues).
+
+Valeur à `%` mal formée (`BORG_PASSPHRASE=ab%cd`, `%(x)s`, `%(` ouvert ; référence circulaire `%(BORG_PASSPHRASE)s`) : elle ne se voit
+qu'à la lecture de cette valeur et ne concerne qu'**un** nick (décision de l'utilisateur du 2026-10-22) — `[ERREUR] n2 : rc illisible
+: « % » à doubler dans BORG_PASSPHRASE` (ou `référence %(…)s circulaire dans BORG_PASSPHRASE`), les autres nicks sont traités
+(Bkp, Index, Prune, Report et Report -o — ligne du nick « ⚠ rc illisible : … » —, DbEncrypt, DbDecrypt, DbRekey, DbStatus, Key,
+CacheClean, IdxPurge, Status — `Erreur :` du nick, `error` en `-j` —, lecteurs multi-nicks), code de la commande = le pire (2 pour
+ces commandes ; 1 pour Status et les lecteurs, comme leurs autres erreurs par nick, même si tous leurs nicks échouent). Jamais la valeur ni le fragment que configparser cite (`found: '%cd'`, `Raw value: '…'`). Sentry (DSN configuré) :
+**un** message par exécution, `rc illisible, ligne 3 : « clé = valeur » attendu` ou `rc illisible, « % » à doubler dans
+BORG_PASSPHRASE` (niveau error, empreinte `borghelper-rc-illisible`), jamais le chemin ni le contenu d'une ligne — un Bkp de cron
+arrêté par un rc illisible ne passe pas inaperçu. Lancée par borgHelperWWW, la CLI n'en envoie pas (sinon un par requête) :
+borgHelperWWW écrit la ligne une fois dans son journal (`[WARN] borgHelper lancé : [ERREUR] …`). Avant : trace Python, code 1, dont la dernière ligne recopiait la ligne brute du rc ou la valeur
+(sur stderr, donc dans les journaux cron, et vers Sentry) ; un rc sans droit de lecture, un dossier ou un rc derrière un dossier
+non traversable était lu vide (« Ce serveur est inconnu », code 3 ; Status, DbStatus, Storage, IdxTop en code 0 ou 1 sur un rc
+vide). Un rc absent reste traité comme avant.
+
+borgHelperWWW (1.34.1) sur un fichier de conf illisible : au démarrage (`-C`, `--conf`, valeur à `%` d'un réglage de
+`borghelperwww.conf` ou de `[_borgHelperWWW]` comprise), même ligne `[ERREUR] <fichier> illisible…` et arrêt ; rc devenu illisible pendant que le serveur tourne : les routes qui lancent borgHelper relaient sa ligne `[ERREUR]`,
+une action (`/bkp`, `/prune`, `/init`, `/restore`, `/delbkp`) répond `500` « `<nick> : configuration illisible (ligne N : nature)
+— action refusée` », une lecture du rc dans le serveur répond `500` « Internal Server Error » (inchangé) avec une seule ligne au
+journal (`[ERREUR] rc illisible pendant GET /api/lstbkp (<rc>) : ligne 5 : …`) ; le watcher et le mode dossier (maître ou rc listé
+illisible) disent « ligne N : nature ». Jamais la ligne du rc dans une réponse ni au journal ; avant : texte de configparser ou
+trace complète.
 
 borgHelperWWW (inchangé) : quatre routes peuvent tomber dans une erreur d'arguments — `DELETE /delbkp` (`bid=last`, ou
 `bid` vide : avant, `borg delete ::` visait le dépôt entier, arrêté par la seule question de borg), `/diffbkp` avec une
@@ -1654,7 +1703,9 @@ ajoute « — ⚠ stockage presque plein » à la ligne du stockage et, sous cha
 nick est en erreur — inconnu du rc (`DEFAULT` et les sections `_…` compris), `BORG_REPO` absent ou de forme borg 2 sans
 `STORAGE` (nick non placé), rc illisible (`*` : « `Fichier <rc> absent` », ou le type de l'erreur de lecture — `ParsingError`,
 `DuplicateOptionError (clé X)`, `PermissionError (Permission denied)` —, jamais la ligne ni la valeur fautive ; aucun nick lu ;
-`-n ALL` de même : développé par Storage après ce contrôle), montage qui ne répond pas ou non lu, `history.db` ou `diff.db` illisible (corrompue,
+`-n ALL` de même : développé par Storage après ce contrôle ; en CLI, depuis 1.0.212, un rc illisible arrête la commande avant
+Storage — `[ERREUR] <rc> illisible, …`, code 2, voir « Codes de sortie de l'aide et des arguments » —, `*` reste la forme de la
+bibliothèque), montage qui ne répond pas ou non lu, `history.db` ou `diff.db` illisible (corrompue,
 verrouillée au-delà de 2 s : nick placé, sans mesure, « `diff.db illisible` » pour la seconde ; une base partagée par `DB_NAME`
 n'est attendue qu'une fois par appel), mesures d'avant 1.0.139 encore dans la
 `diff.db` (Storage ne migre jamais : « mesures d'avant 1.0.139 pas encore migrées … `borgHelper -c Status -n <nick>` », une
@@ -1855,7 +1906,19 @@ n'a pas ce contrôle `DB_ENCRYPT` : déchiffrer reste toujours permis. Une migra
 reprend automatiquement au point où elle s'est arrêtée au prochain lancement de la **même** commande sur le
 même nick — la DEK n'est jamais régénérée, aucune ligne n'est perdue ni dupliquée. Avant le tout dernier
 commit, un échantillon de lignes migrées est relu et son aller-retour vérifié ; le commit final n'a lieu
-qu'après cette validation.
+qu'après cette validation. Erreur SQLite pendant la migration (1.0.212 : verrou tenu par un autre processus au-delà du délai,
+disque plein, E/S), code 2 comme les autres arrêts de DbEncrypt/DbDecrypt — avant : trace Python, code 1 :
+
+- pendant les lots (diff.db tenue au-delà de 60 s entre deux lots) : `[ERREUR] <nick>: OperationalError: database is locked —
+  DbEncrypt interrompu, aucun lot partiel écrit : relancer DbEncrypt -y pour reprendre au dernier lot validé` ; chaque lot
+  (lignes et curseur) est une transaction, la relance reprend au curseur ;
+- diff.db tenue **avant** le départ (au-delà de 60 s) : `[ERREUR] <nick>: DbModeError: <nick>: en-tête verrouillé (database is
+  locked) — relancer`, rien changé (comme avant 1.0.212) ; autre erreur SQLite à l'ouverture, à la lecture de l'en-tête ou aux
+  comptes avant le départ : `[ERREUR] <nick>: OperationalError: … — DbEncrypt non commencé, rien changé : relancer DbEncrypt` ;
+  base corrompue ou occupée trouvée par le contrôle de schéma : message `DB corrompue` / `DB occupée`, **code 1** (inchangé) ;
+- phase cache.db (diff.db déjà dans le mode cible, cache.db tenue au-delà de 5 s, aussi sur les relances « déjà chiffrée » et
+  diff.db absente) : `[ERREUR] <nick>: OperationalError: database is locked — DbEncrypt interrompu, diff.db déjà chiffrée (siv1),
+  cache.db pas encore dans le mode cible : relancer DbEncrypt -y pour reprendre`.
 
 ### `DbRekey`
 
@@ -2243,7 +2306,9 @@ clients/c1.rc = c1
 - **Chemin d'un rc jamais exposé** : borgHelper le cite parfois (droits du rc, « pas trouvé dans … ») —
   remplacé par `<rc préfixe>` dans `stderr`, dans le seul message de `stdout` qui le cite (« … pas trouvé
   dans <rc> » ; jamais les données : un chemin d'archive reste intact) et dans le détail d'une erreur de
-  configuration (rc devenu illisible : `500` « configuration illisible », comme en mode `-C`). Les
+  configuration (rc devenu illisible : `500` « configuration illisible », comme en mode `-C` ; depuis 1.34.1 le détail dit
+  « ligne N : nature », jamais le texte de `configparser` qui recopiait la ligne brute du rc ; de même pour les lignes du journal
+  — maître ou rc listé illisible, watcher, démarrage). Les
   conseils de commande de `stderr` (« borgHelper -c Index -n db », « … DbEncrypt … ») deviennent
   « borgHelper -C <rc préfixe> -c … » ; badge « base non chiffrée » de l'UI (1.24.3) : même forme, nick nu.
 - **Nick inconnu** : `web:zzz` (préfixe servi) -> réponse de borgHelper pour un nick inconnu de ce rc, comme
@@ -3535,7 +3600,7 @@ commande `borg` tourne sur un **leurre** garanti inexistant (jamais sur le fichi
 |------|---------------|
 | 0 | Succès |
 | 1 | Avertissement (rapport : sauvegarde trop ancienne) |
-| 2 | Erreur borg |
+| 2 | Erreur borg ; erreur d'arguments (1.0.206) ; fichier de conf illisible (1.0.212) |
 | 3 | État incohérent (déjà monté, serveur inconnu, `MOUNTPOINT`/`GLOB_ARCH` absent…) |
 | 4 | Opération non permise sur ce nick (dépôt externe, `EXTERNAL_OPS`) — aucun borg lancé |
 

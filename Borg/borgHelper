@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.211"
+Version="1.0.212"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -993,6 +993,118 @@ def _storage_err(e):
     if isinstance(e,OSError): return f"{type(e).__name__} ({e.strerror})" if e.strerror else type(e).__name__
     return f"{type(e).__name__}: {e}"
 
+import errno as _errno
+_RC_OSERR={_errno.EACCES:'permission refusée',_errno.EPERM:'opération non permise',_errno.EISDIR:'est un dossier',
+           _errno.EIO:"erreur d'entrée-sortie",_errno.ENOENT:'absent'}   # revue 96 (row 26) : jamais de « / » (masque de chemins)
+
+def _rc_err_text(e,line=None):
+    """1.0.212 (story 96) : erreur de lecture du rc -> « ligne N : nature » (ou « nature » sans numéro) — JAMAIS le contenu d'une
+    ligne (ni valeur, ni clé, ni nom de section : une ligne sans « = » peut être une passphrase). `line` : numéro déjà calculé
+    (UnicodeDecodeError, qui n'en porte pas). Le texte de configparser recopie la ligne brute (« [line 3]: 'BORG_PASSPHRASE
+    hunter2' ») ou la valeur (« found: '%cd' », « Raw value: '…' ») : jamais repris ici. Revue 96 : interpolation (« % » d'une
+    valeur, levée à la lecture de la valeur, sans numéro de ligne), MultilineContinuationError (3.13+), clé en double sans
+    mention de casse (les lecteurs à casse gardée de borgHelperWWW passent aussi ici)."""
+    ln=getattr(e,'lineno',None) if line is None else line
+    _mce=getattr(configparser,'MultilineContinuationError',None)
+    if isinstance(e,configparser.MissingSectionHeaderError): nat="« [section] » attendu avant la première clé"
+    elif isinstance(e,configparser.DuplicateSectionError): nat="section en double"
+    elif isinstance(e,configparser.DuplicateOptionError): nat="clé en double dans sa section"
+    elif _mce is not None and isinstance(e,_mce): nat="ligne indentée après une clé sans valeur"
+    elif isinstance(e,configparser.ParsingError):
+        if ln is None and getattr(e,'errors',None): ln=e.errors[0][0]
+        nat="« clé = valeur » attendu"
+    elif isinstance(e,configparser.InterpolationError):   # revue 2 (row 20) : la clé fautive, jamais sa valeur ; auto-référence nommée
+        ln=None; opt=getattr(e,'option',None)
+        depth=getattr(e,'_rc_depth',isinstance(e,configparser.InterpolationDepthError))
+        nat=(f"référence %(…)s circulaire dans {opt}" if depth else f"« % » à doubler dans {opt}") if opt else "« % » à doubler (écrire %%)"
+    elif isinstance(e,UnicodeDecodeError): nat=f"encodage invalide ({e.encoding} attendu)"
+    elif isinstance(e,OSError):
+        ln=None; nat=_RC_OSERR.get(e.errno) or (e.strerror or type(e).__name__)
+    elif isinstance(e,configparser.Error): nat=type(e).__name__
+    else: ln=None; nat=type(e).__name__
+    return (f"ligne {ln} : " if isinstance(ln,int) and ln>0 else '')+nat
+
+class _RcValueError(configparser.InterpolationError):
+    """Revue 96, 2 (row 22) : erreur d'interpolation assainie (_resolve_passphrase) — même famille (InterpolationError : traitée
+    par nick), message = _rc_err_text, jamais « found: '…' » ni « Raw value: '…' » (levée `from None` : pas de cause chaînée)."""
+    def __init__(self,e):
+        self._rc_depth=isinstance(e,configparser.InterpolationDepthError) or getattr(e,'_rc_depth',False)
+        configparser.InterpolationError.__init__(self,getattr(e,'option',None),getattr(e,'section',None),'')
+        self.message=_rc_err_text(self); self.args=(self.message,)
+
+def _rc_sentry_once(txt):
+    """Revue 96 (décision de l'utilisateur du 2026-10-22) : rc illisible -> UN message Sentry masqué par exécution (« rc illisible,
+    <nature> »), seulement si sentry_sdk est déjà chargé ET qu'un client est actif (DSN configuré, initialisé au démarrage de la CLI ;
+    revue 2 row 25 : jamais d'import sans DSN), flush court (1 s : jamais 5 s par requête de borgHelperWWW si Sentry est injoignable)."""
+    if _RC_SENTRY_SENT[0] or 'sentry_sdk' not in sys.modules or _via_www(): return   # revue 96, 3 (row 34) : sous WWW, son journal le dit
+    _RC_SENTRY_SENT[0]=True
+    try:
+        sdk=sys.modules['sentry_sdk']
+        if _sentry_client(sdk) is None: return
+        with _sentry_scope(sdk) as scope:
+            scope.fingerprint=['borghelper-rc-illisible']
+            sdk.capture_message(txt,level='error')
+        sdk.flush(timeout=1)
+    except Exception: pass
+
+def _rc_nick_err(nick,e):
+    """Revue 96, 2 (row 20, décision de l'utilisateur du 2026-10-22) : erreur d'interpolation (valeur à « % » mal formée) d'UN nick ->
+    `[ERREUR] <nick> : rc illisible : « % » à doubler dans <CLÉ>`, message Sentry masqué (une fois par exécution) ; l'appelant
+    continue avec les nicks suivants, code 2 pour ce nick."""
+    t=_rc_err_text(e)
+    printer(f"[ERREUR] {nick} : rc illisible : {t}")
+    _rc_sentry_once(f"rc illisible, {t}")
+    return 2
+
+def _rc_text_scrub(text):
+    """Revue 96, 2 (row 28) : texte déjà écrit (index-last.json d'avant 1.0.212) — ligne ou valeur recopiée par configparser masquée
+    jusqu'à la fin de la ligne, comme pour Sentry."""
+    return _SENTRY_RC_LINE_RE.sub(lambda m: m.group(1)+"'[redacted]'",text) if isinstance(text,str) and text else text
+
+def _etn(e,sep=': '):
+    """Revue 96, 3 (row 36) : « Type<sep>message » d'une exception pour un message — erreur de lecture du rc : « rc illisible<sep>nature »
+    (jamais le nom de classe privé _RcValueError ni le texte de configparser)."""
+    return f"rc illisible{sep}{_rc_err_text(e)}" if isinstance(e,configparser.Error) else f"{type(e).__name__}{sep}{e}"
+
+def _etxt(e):
+    """Revue 96 : texte d'une exception pour un message — erreur de configparser (rc devenu illisible pendant la commande) par
+    _rc_err_text, jamais son str() qui recopie la ligne ou la valeur du rc ; autre : str(e), comme avant."""
+    return _rc_err_text(e) if isinstance(e,configparser.Error) else str(e)
+
+_RC_BOM_TXT="ligne 1 : BOM UTF-8 en tête du fichier (l'enregistrer sans BOM)"
+
+def _rc_check(path):
+    """1.0.212 (story 96, reports 87a et 84) : rc lu une fois, comme BorgHelper() le lit (ConfigParser par défaut, clés sans casse ;
+    encodage de configparser.read), avant toute commande de la CLI -> None si lisible ou absent (absent : comportement d'avant,
+    chaque commande le dit), sinon (exception, texte de _rc_err_text). configparser.read avale l'OSError (rc 000 lu vide : « Ce
+    serveur est inconnu », Status d'un nick à 0, cache par défaut) : ouvert ici directement. Revue 96 : seuls FileNotFoundError
+    et NotADirectoryError valent « absent » (dossier parent non traversable : « permission refusée », jamais un rc lu vide) ;
+    BOM UTF-8 en tête : nature dite. Pas d'interpolation ici (STORAGE_ALERT=90% est lu brut exprès) : une valeur à « % » lève à
+    sa lecture, prise par _cli_entry."""
+    import io as _io
+    enc=_io.text_encoding(None)
+    try:
+        with open(path,'rb') as f: raw=f.read()
+    except (FileNotFoundError,NotADirectoryError): return None
+    except OSError as e: return e,_rc_err_text(e)
+    try:
+        with open(path,encoding=enc) as f: configparser.ConfigParser().read_file(f,source=path)
+    except (FileNotFoundError,NotADirectoryError): return None   # retiré entre les deux lectures : absent, comme avant
+    except UnicodeDecodeError as e:   # numéro de ligne : première ligne indécodable (octets relus, jamais affichés)
+        ln=None
+        try:
+            codec=e.encoding or 'utf-8'
+            for i,l in enumerate(raw.split(b'\n'),1):
+                try: l.decode(codec)
+                except UnicodeDecodeError: ln=i; break
+        except LookupError: pass
+        return e,_rc_err_text(e,line=ln)
+    except configparser.Error as e:
+        if raw.startswith(b'\xef\xbb\xbf') and isinstance(e,configparser.MissingSectionHeaderError) and e.lineno==1: return e,_RC_BOM_TXT
+        return e,_rc_err_text(e)
+    except OSError as e: return e,_rc_err_text(e)
+    return None
+
 def _storage_text(d):
     """Lignes de Storage en texte (sans -j) depuis la sortie JSON."""
     sz=lambda v: '—' if v is None else convert_octets_readable(v)
@@ -1881,7 +1993,7 @@ def _hl_store_pass(db_path,nick,budget=_HL_STORE_BUDGET,stop=None,target=None,re
                 if conn.in_transaction:
                     try: conn.rollback()
                     except sqlite3.Error: pass
-                printer(f"[WARN] {nick}: comptes par inode de {a} non gardés ({type(e).__name__} : {e}) — calculés à la lecture")
+                printer(f"[WARN] {nick}: comptes par inode de {a} non gardés ({_etn(e,' : ')}) — calculés à la lecture")
             if time.monotonic()-t0>budget: break   # budget vérifié après chaque archive (une au moins : progression)
         return done,sum(1 for _o,n in todo if n not in seen)
     except _HlBaseChanged:   # row 51 : rien écrit dans la base nouvelle ; le prochain Index la calcule
@@ -1891,7 +2003,7 @@ def _hl_store_pass(db_path,nick,budget=_HL_STORE_BUDGET,stop=None,target=None,re
         if conn is not None and conn.in_transaction:
             try: conn.rollback()
             except sqlite3.Error: pass
-        printer(f"[WARN] {nick}: comptes par inode non gardés ({type(e).__name__} : {e}) — calculés à la lecture")
+        printer(f"[WARN] {nick}: comptes par inode non gardés ({_etn(e,' : ')}) — calculés à la lecture")
         return done,-1
     finally: _close_quiet(conn)
 
@@ -2230,7 +2342,8 @@ def _borg_child_env(cfg,force=None):
     sonde de version) : clés borg du rc (_BORG_RC_ENV_KEYS), puis `force` (forceEnv de boex), puis PATH, LC_ALL et
     BORG_EXIT_CODES=legacy. Ni HOME ni BORG_BASE_DIR (voir le harnais « vrai borg »). PATH absent ou vide : os.defpath (jamais
     le dossier courant)."""
-    env={k:cfg[k] for k in cfg.keys() if k in _BORG_RC_ENV_KEYS}
+    try: env={k:cfg[k] for k in cfg.keys() if k in _BORG_RC_ENV_KEYS}
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None   # revue 96, 3 (row 29) : tout site boex, jamais la valeur
     if force is not None: env.update(force)
     env['PATH']=os.environ.get('PATH') or os.defpath; env['LC_ALL']='fr_FR.UTF-8'; env.update(_BORG_EXIT_CODES_ENV)
     return env
@@ -3690,7 +3803,8 @@ def _resolve_passphrase(nick,db_path=None):
     if rd is None or nick is None: return None
     try: cfg=rd(nick)
     except (Exception,SystemExit): return None
-    return cfg.get('BORG_PASSPHRASE') if cfg is not None else None
+    try: return cfg.get('BORG_PASSPHRASE') if cfg is not None else None
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None   # revue 96, 2 (row 22) : erreur assainie
 
 class BhConnection(sqlite3.Connection):
     """sqlite3.Connection portant .codec (None si plain), .mode, .role et .nick."""
@@ -4275,7 +4389,7 @@ def _codec_fail(label,e,conn=None):
 
 # 1.0.167 (story 30, A47) : arrêts d'UN nick qu'une commande de lecture multi-nicks isole (les autres nicks gardent leur
 # résultat) ; Ctrl-C (KeyboardInterrupt, sys.exit(130) de boex) n'en fait jamais partie. Nick seul : relancés (inchangé).
-_NICK_STOP=(SystemExit,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError)
+_NICK_STOP=(SystemExit,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError,configparser.InterpolationError)   # revue 96, 2 (row 20)
 
 def _nick_stop_msg(e,mark,multi):
     """Message réel de l'arrêt d'un nick dans une commande multi-nicks (décision de l'utilisateur), ou None : l'appelant
@@ -4284,6 +4398,10 @@ def _nick_stop_msg(e,mark,multi):
     `[ERREUR] SchemaVersionError : …`) ; sys.exit (DB corrompue, occupée…) : son message est
     déjà affiché, on reprend la dernière ligne [ERREUR] depuis `mark` et son détail indenté."""
     if not multi: return None
+    if isinstance(e,configparser.InterpolationError):   # revue 96, 2 (row 20, décision de l'utilisateur) : par nick, jamais son texte
+        t=_rc_err_text(e); printer(f"[ERREUR] {getattr(e,'section',None) or '?'} : rc illisible : {t}"); _rc_sentry_once(f"rc illisible, {t}")
+        e._rc_said=True   # revue 96, 3 (row 32) : déjà dite — _PerNick.done() (tous en échec) la relance, _cli_entry ne la redit pas
+        return f"rc illisible : {t}"
     if isinstance(e,SystemExit):
         if e.code in (0,None,130): return None
         return _stop_text(e,mark)
@@ -4664,7 +4782,11 @@ class BorgHelperDB:
         try:
             with open(self.index_last_path(nick),encoding='utf-8') as f: rec=json.load(f)
         except (OSError,ValueError): return None
-        return rec if isinstance(rec,dict) else None
+        if not isinstance(rec,dict): return None
+        # revue 96, 2 (row 28) : message écrit avant 1.0.212 (texte de configparser : found: '…', Raw value: '…') masqué à la lecture
+        for r_ in (rec,rec.get('last_failure')):
+            if isinstance(r_,dict) and isinstance(r_.get('message'),str): r_['message']=_rc_text_scrub(r_['message'])
+        return rec
 
     def _report_running_lock_path(self,nick): return self._pid_lock_path(nick,'report-running')
     def set_report_running_lock(self,nick): self._set_pid_lock(self._report_running_lock_path(nick))
@@ -5952,7 +6074,7 @@ class BorgHelperDB:
             d['failed']=d['result']=='error' or (d['finished_at'] is None and d['run_id'] not in self.bkp_markers(nick))
             return d
         except Exception as e:
-            printer(f"[WARN] {nick}: Bkp précédent illisible ({type(e).__name__}: {e}) — règle « précédent en erreur » non appliquée")
+            printer(f"[WARN] {nick}: Bkp précédent illisible ({_etn(e)}) — règle « précédent en erreur » non appliquée")
             return None
         finally:
             if conn is not None: conn.close()
@@ -7381,6 +7503,19 @@ class BorgRunner:
 
 # ── BorgHelper — high-level service layer (DB + Borg combined) ────────────────
 
+def _migrate_sqlerr(nick,verb,direction,e,phase):
+    """1.0.212 (story 96, report 84 ; revue 96 rows 7, 8) : erreur SQLite de DbEncrypt/DbDecrypt -> [ERREUR] avec l'état reprenable
+    de la phase, code 2. 'lots' : diff.db (chaque lot, lignes et curseur, est une transaction : rien de partiel, la relance reprend
+    au curseur) ; 'cache' : diff.db déjà dans le mode cible, cache.db pas encore purgée ni recréée (la relance la traite)."""
+    if phase=='cache':
+        st=f"diff.db déjà {'chiffrée (siv1)' if direction=='encrypt' else 'en clair'}, cache.db pas encore dans le mode cible"
+    elif phase=='cache0': st="diff.db absente, cache.db pas encore dans le mode cible"
+    elif phase=='avant':   # revue 96, 2 (row 24) : ouverture, en-tête, comptes avant le départ
+        printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e} — {verb} non commencé, rien changé : relancer {verb}"); return 2
+    else: st="aucun lot partiel écrit"
+    printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e} — {verb} interrompu, {st} : relancer {verb} -y pour reprendre"
+            +(" au dernier lot validé" if phase=='lots' else '')); return 2
+
 class BorgHelper:
     """High-level borgbackup service layer. Combines BorgHelperDB and BorgRunner.
 
@@ -7854,6 +7989,7 @@ class BorgHelper:
                 try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
                 except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
                     printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+                except sqlite3.Error as e: return _migrate_sqlerr(nick,verb,direction,e,'cache0')   # revue 96 (row 8)
             return 0
         # sans nick : schéma courant requis avant migration (migrations legacy d'abord, AD-7) ; 1.0.171 (story 34, décision de
         # l'utilisateur) : seulement avec -y sans -D — un dry-run (ou un refus « ajouter -y ») n'écrit rien, pas même une migration
@@ -7869,33 +8005,36 @@ class BorgHelper:
         passphrase=cfg.get('BORG_PASSPHRASE') if cfg else None
         if not passphrase:
             printer(f"  [ERREUR] {nick}: passphrase absente — {verb} impossible"); return 2
-        conn=_open_db(db_path,nick=None,role='admin')
-        try:
-            raw=_enc_header_read(conn)
-            cur_mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
-            if (direction=='encrypt' and cur_mode=='siv1') or (direction=='decrypt' and cur_mode=='plain'):
-                printer(f"  {nick}: "+("déjà chiffrée (siv1)" if direction=='encrypt' else "déjà en clair")); conn.close()
-                # 1.0.168 (revue story 31, décision de l'utilisateur) : diff.db née chiffrée (A48) à côté d'une cache.db en clair
-                # (ou l'inverse) — la cache.db est quand même mise dans le mode cible (-y seulement : purge du cache)
-                if confirm and not dryrun:
-                    try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
-                    except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
-                        printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
-                return 0
-            if cur_mode=='migrating':
-                migrating_dir=_enc_header_parse(raw).get('migrating_dir')
-                if migrating_dir not in (None,direction):
-                    other='DbDecrypt' if direction=='encrypt' else 'DbEncrypt'
-                    printer(f"  [ERREUR] {nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer"); conn.close(); return 2
-            if not _check_disk_space(db_path):
-                printer(f"  [ERREUR] {nick}: espace disque insuffisant pour {verb} (marge {_DB_SPACE_MARGIN:.0%} de {os.path.getsize(db_path):,} octets)"); conn.close(); return 2
-            def _count(t):   # 1.0.171 : base non migrée en -D — une table d'un schéma plus récent peut manquer (« ? »)
-                try: return f"{conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]:,}"
-                except sqlite3.OperationalError: return '?'
-            counts={t:_count(t) for t in ('snapshot_file','diff_index')}
-            size=os.path.getsize(db_path)
-            conn.close()
-        finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises (sorties anticipées, erreurs)
+        try:   # revue 96, 2 (row 24) : erreur SQLite avant le départ (ouverture, en-tête, comptes) -> une ligne, code 2, jamais une trace
+            conn=_open_db(db_path,nick=None,role='admin')
+            try:
+                raw=_enc_header_read(conn)
+                cur_mode='plain' if raw is None else _enc_header_parse(raw)['path_enc']
+                if (direction=='encrypt' and cur_mode=='siv1') or (direction=='decrypt' and cur_mode=='plain'):
+                    printer(f"  {nick}: "+("déjà chiffrée (siv1)" if direction=='encrypt' else "déjà en clair")); conn.close()
+                    # 1.0.168 (revue story 31, décision de l'utilisateur) : diff.db née chiffrée (A48) à côté d'une cache.db en clair
+                    # (ou l'inverse) — la cache.db est quand même mise dans le mode cible (-y seulement : purge du cache)
+                    if confirm and not dryrun:
+                        try: self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
+                        except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
+                            printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+                        except sqlite3.Error as e: return _migrate_sqlerr(nick,verb,direction,e,'cache')   # revue 96 (row 8)
+                    return 0
+                if cur_mode=='migrating':
+                    migrating_dir=_enc_header_parse(raw).get('migrating_dir')
+                    if migrating_dir not in (None,direction):
+                        other='DbDecrypt' if direction=='encrypt' else 'DbEncrypt'
+                        printer(f"  [ERREUR] {nick}: migration en cours dans l'autre sens — relancer {other} pour la terminer"); conn.close(); return 2
+                if not _check_disk_space(db_path):
+                    printer(f"  [ERREUR] {nick}: espace disque insuffisant pour {verb} (marge {_DB_SPACE_MARGIN:.0%} de {os.path.getsize(db_path):,} octets)"); conn.close(); return 2
+                def _count(t):   # 1.0.171 : base non migrée en -D — une table d'un schéma plus récent peut manquer (« ? »)
+                    try: return f"{conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]:,}"
+                    except sqlite3.OperationalError: return '?'
+                counts={t:_count(t) for t in ('snapshot_file','diff_index')}
+                size=os.path.getsize(db_path)
+                conn.close()
+            finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises (sorties anticipées, erreurs)
+        except sqlite3.Error as e: return _migrate_sqlerr(nick,verb,direction,e,'avant')
         if dryrun and confirm:
             printer(f"  {nick}: -D et -y sont exclusifs"); return 2
         if dryrun:
@@ -7904,11 +8043,18 @@ class BorgHelper:
             return 0
         if not confirm:
             printer(f"  {nick}: exécution réelle -> ajouter -y (ou -D pour un aperçu sans rien changer)"); return 2
+        phase='lots'
         try:
             self._db_migrate_run(nick,db_path,direction,passphrase,cfg,debug=debug)
+            phase='cache'
             self._db_migrate_cache(nick,direction,passphrase,cfg,debug=debug)
         except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
             printer(f"  [ERREUR] {nick}: {type(e).__name__}: {e}"); return 2
+        except sqlite3.Error as e:
+            # 1.0.212 (story 96, report 84) : erreur SQLite de la boucle par lots, des transitions finales (verrou tenu au-delà du
+            # délai de 60 s, disque plein, E/S) ou de la purge de cache.db -> [ERREUR] avec l'état reprenable ; avant : trace brute
+            # (seules les Db*Error étaient prises). Revue 96 (décision de l'utilisateur du 2026-10-22) : code 2, comme les Db*Error.
+            return _migrate_sqlerr(nick,verb,direction,e,phase)
         printer(f"  {nick}: {verb} terminé ({'siv1' if direction=='encrypt' else 'plain'})")
         return 0
 
@@ -8441,6 +8587,7 @@ class BorgHelper:
         rien affiché, code 0. Retour : le pire code des nicks."""
         worst=0
         for nick in nicks.split(','):
+          try:   # revue 96, 3 (row 31) : erreur d'interpolation de ce nick seul
             cfg=self.borg.cfgreaded(nick,debug=debug)
             if self.borg.repoLocalAbsent(nick): printer(self._borg_fail_msg(nick,'borg key export')); worst=2; continue
             rb=self.borg.boex(nick,['key','export','--paper'],debug=debug)
@@ -8450,6 +8597,7 @@ class BorgHelper:
                 if rb['exitcode']==1: _print_boex_stderr(rb)
             else:
                 printer(self._borg_fail_msg(nick,'borg key export',_rb_errmsg(rb,'borg key export'))); worst=2
+          except configparser.InterpolationError as e: worst=max(worst,_rc_nick_err(nick,e))
         return worst
 
     def cache_info(self,nick=None,debug=0):
@@ -8473,8 +8621,9 @@ class BorgHelper:
 
     def cache_clean(self,nick=None,debug=0):
         nicks_to_clean=nick.split(',') if nick and nick!='ALL' else self.borg.cfgreadnicks(debug).split(',')
-        total=0
+        total=0; worst=0
         for n in nicks_to_clean:
+          try:   # revue 96, 3 (row 31) : erreur d'interpolation de ce nick seul -> ligne, suivants traités, rendu 2
             db_path=self.db.get_cache_db(n)
             self.db.ensure_cache_db(db_path,create=False)
             cfg=self.borg.cfgread(n,debug=debug)
@@ -8489,9 +8638,12 @@ class BorgHelper:
                 if deleted: print(f"  {n}: {deleted} entrée(s) périmée(s) supprimée(s)")
                 else: print(f"  {n}: cache à jour")
                 total+=deleted
+            except configparser.InterpolationError: raise   # revue 96, 3 (row 31) : dite par nick ci-dessous (« rc illisible »)
             except Exception:
                 printer(f"  {n}: erreur lors de la vérification")
+          except configparser.InterpolationError as e: worst=_rc_nick_err(n,e)
         print(f"Total supprimé : {total}")
+        return worst
 
     def diffbkp(self,nick,bidun=None,bideux=None,debug=0,db_path=None,as_json=False):
         if db_path is None: db_path=self.db.get_diff_db(nick)
@@ -8737,7 +8889,7 @@ class BorgHelper:
             # après Prune — plus d'attente du prochain Index.
             try: self._cleanup_index_after_prune(nick,debug=debug)
             except (Exception,SystemExit) as e:   # archive déjà supprimée : jamais un échec de DelBkp
-                printer(f"[WARN] {nick}: rapprochement des bases reporté au prochain Index ({e})")
+                printer(f"[WARN] {nick}: rapprochement des bases reporté au prochain Index ({_etxt(e)})")
             sys.exit(0)   # 1.0.176 (A77, décision de l'utilisateur) : code 1 de borg delete = avertissement (dit), DelBkp réussi
         finally:
             self.db.clear_priority_lock(nick)
@@ -9018,7 +9170,7 @@ class BorgHelper:
                     finally:
                         if idx_turn: self.db.release_index_running_lock(nick)
                 except Exception as e:
-                    printer(f"[WARN] indexation post-backup échouée : {e}")
+                    printer(f"[WARN] indexation post-backup échouée : {_etxt(e)}")   # revue 96 : jamais le texte de configparser
             self.db.store_bkp_status_finish(nick,run_id,'success' if newretC==0 else 'error',bkp_status_db,
                 changed_during_backup=len(warn['changed_during_backup']),read_errors=len(warn['read_errors']))
             if newretC!=0:  # même règle que la notification push d'échec ; SENTRY_ALERTS=bkp_error requis
@@ -9594,7 +9746,8 @@ class BorgHelper:
         elif isinstance(exc,KeyboardInterrupt): code=130   # revue story 40 : Ctrl-C hors boex, comme sa sortie
         elif exc is not None:
             code=2 if isinstance(exc,(DbKeyError,DbModeError,DbTamperError,DbCodecError)) else 1
-            msg=f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            msg=_etn(exc) if str(exc) else type(exc).__name__   # revue 96 : rc illisible sans son texte (ni nom de classe privé)
+            if isinstance(exc,configparser.Error): code=2
         if not isinstance(code,int): code=0   # index() rend toujours un entier (défensif)
         if exc is None and out: outcome=out
         else: outcome='ok' if code==0 else 'refused' if code==3 else 'error'
@@ -9618,7 +9771,7 @@ class BorgHelper:
                 if isinstance(lf,dict) and lf.get('outcome') in ('error','refused'):
                     rec['last_failure']={k:lf.get(k) for k in ('finished_at','outcome','code','via','message')}
             self.db.write_index_last(nick,rec)
-        except Exception as e: printer(f"[WARN] {nick}: résultat d'Index non enregistré ({e})")
+        except Exception as e: printer(f"[WARN] {nick}: résultat d'Index non enregistré ({_etxt(e)})")   # revue 96
 
     @staticmethod
     def _period_bounds(period,archives):
@@ -9681,7 +9834,7 @@ class BorgHelper:
             finally: conn.close()
         try: n=_do()
         except (Exception,SystemExit) as e:
-            printer(f"[WARN] {nick}: révision des paires de diff vides reportée ({e})"); return 0
+            printer(f"[WARN] {nick}: révision des paires de diff vides reportée ({_etxt(e)})"); return 0
         if n: printer(f"{nick}: {n} paire(s) de diff vide(s) à refaire (1.0.153)")
         return n
 
@@ -10022,7 +10175,7 @@ class BorgHelper:
                                     mode_changed=True
                                     self.db.set_index_pending_lock(nick)
                                     printer(f"  {nick}: mode de la base changé pendant l'indexation — paires restantes reportées")
-                            except Exception as e: printer(f"[WARN] borg diff échoué : {e}")
+                            except Exception as e: printer(f"[WARN] borg diff échoué : {_etxt(e)}")   # revue 96
                     finally:
                         # Jamais interrupted_event ici : le tester plus bas ferait passer TOUT Index ayant
                         # traité au moins une paire pour « interrompu » (index_pending posé, statistiques/
@@ -11544,11 +11697,13 @@ class BorgHelper:
             try:
                 results.append(self._status_one(n,debug=debug,bkp_live=True))
             except Exception as e:
+                if isinstance(e,configparser.Error) and not isinstance(e,configparser.InterpolationError): raise   # revue 96, 3 (row 33)
                 # Isolation par nick : une anomalie sur UN nick (base chiffrée sans passphrase, base
                 # 'migrating' AD-11, erreur SQLite non prévue…) ne doit jamais faire échouer tout
                 # l'appel -n ALL/multi-nick — c'est précisément le cas d'usage principal de Status.
                 results.append({'nick':n,'last_backup':None,'bkp_running':None,'bkp_interrupted':None,'bkp_stale':None,
-                                 'priority_op_running':False,'build':None,'rebuild':None,'error':str(e)})
+                                 'priority_op_running':False,'build':None,'rebuild':None,'error':_etxt(e)})   # revue 96, 2 (row 18)
+                if isinstance(e,configparser.Error): _rc_sentry_once(f"rc illisible, {_rc_err_text(e)}")
         if as_json:
             # Toujours une liste (même à un seul nick) : Status supporte nativement ALL/multi-nick,
             # forme homogène pour les consommateurs machine (contrairement à RepoHistory/ArchiveHistory
@@ -11605,7 +11760,9 @@ class BorgHelper:
                 if cfg is None: errors[n]="nick inconnu du rc"; continue
                 ent=_storage_of(cfg,nick=n,resolve=resolve)
                 hp=self.db.get_history_db(n); dp=self.db.get_diff_db(n)   # row 34 : rc illisible -> erreur du nick
-            except configparser.Error as e: errors[n]=_storage_err(e); continue   # row 54 : jamais la valeur brute
+            except configparser.Error as e:   # row 54 : jamais la valeur brute
+                if not isinstance(e,configparser.InterpolationError): raise   # revue 96, 3 (row 33) : tout le fichier illisible en cours
+                errors[n]=_storage_err(e); continue
             except ValueError as e: errors[n]=str(e); continue
             except Exception as e: errors[n]=_storage_err(e); continue
             warn=ent.pop('warn',None)
@@ -11621,7 +11778,7 @@ class BorgHelper:
             else:
                 try: first,last=self.db.get_storage_measures(n)
                 except sqlite3.Error as e: bad[hp]=f"SQLite error ({hp}): {e}"; errors.setdefault(n,bad[hp])
-                except Exception as e: errors.setdefault(n,f"{type(e).__name__}: {e}")
+                except Exception as e: errors.setdefault(n,_etn(e))
             if last is None and hp not in bad:
                 if dp in bad: errors.setdefault(n,bad[dp])
                 else:
@@ -11638,7 +11795,7 @@ class BorgHelper:
                     m_=self.db.get_storage_space(n,None,None,repo_wkey=rks[n][0]); sp=_space_pub(_space_view(m_))
                     if m_ and m_.get('repo_key'): rkn_=m_['repo_key']   # identité résolue à la mesure : celle de l'état d'alerte
                 except sqlite3.Error as e: bad[hp]=f"SQLite error ({hp}): {e}"; errors.setdefault(n,bad[hp])
-                except Exception as e: errors.setdefault(n,f"{type(e).__name__}: {e}")
+                except Exception as e: errors.setdefault(n,_etn(e))
             # décision 8 : ⚠ du dépôt si le nick est cité par un état déclenché qui suit ce dépôt (son dépôt dépasse son seuil)
             al=space and _state_cites(alerts,n,rkn_)
             repos.append(dict(ent,nicks=[n],size=last[0] if last else None,measured_at=last[1] if last else None,
@@ -11820,7 +11977,7 @@ class BorgHelper:
             return _bsr(dict(sp,storage=M,alert=alert,alert_sent=sent))
         except (Exception,SystemExit) as e:   # jamais un échec du Bkp (revue 87b row 18 : SystemExit compris, sauf Ctrl-C)
             if isinstance(e,SystemExit) and e.code==130: raise
-            printer(f"[WARN] {nick}: place du stockage non mesurée ({type(e).__name__}: {e})"); return None
+            printer(f"[WARN] {nick}: place du stockage non mesurée ({_etn(e)})"); return None
 
     def _storage_measure_unplaced(self,nick,why,budget):
         """Revue 87b (row 24) : BORG_REPO de forme borg 2 ou à identifiants sans STORAGE — ligne « place inconnue » + raison (schéma
@@ -12762,7 +12919,7 @@ class BorgHelper:
                 for r in cand: rep['runs'][r]=RK_UNVERIFIED
                 return 0
         except Exception as e:   # base illisible : la suite de la commande le dira (BkpReconcile : rep['error'], dit en [WARN])
-            rep['error']=f"base illisible ({str(e)[:120] or type(e).__name__})"; return 0
+            rep['error']=f"base illisible ({_etxt(e)[:120] or type(e).__name__})"; return 0   # revue 96, 2 (row 22)
         try:
             cfg=self.borg.cfgreaded(nick,debug=debug)
             rb=self.borg.boex(nick,['list','--json','--format','{comment}{end}']+glob_args(cfg),debug=debug,
@@ -12779,7 +12936,7 @@ class BorgHelper:
             arch=rb['stdout'][0]['archives']
         except (Exception,SystemExit) as e:
             if isinstance(e,SystemExit) and e.code==130: raise
-            printer(f"[WARN] {nick} : rapprochement impossible (borg list : {str(e)[:120] or type(e).__name__}) — réessayé {retry}")
+            printer(f"[WARN] {nick} : rapprochement impossible (borg list : {_etxt(e)[:120] or type(e).__name__}) — réessayé {retry}")   # revue 96, 3
             for r in cand: rep['runs'][r]=RK_UNVERIFIED
             return 0
         by={a.get('comment'):a for a in arch if isinstance(a,dict) and a.get('comment')
@@ -13084,7 +13241,10 @@ class BorgHelper:
                 # 1.0.166 (story 29) : base illisible (« DB corrompue » + sys.exit des ensure_*) : ligne du nick en erreur,
                 # les autres hôtes affichés ; Ctrl-C (code 130) : arrêt. 1.0.168 (A51) : message réel (_stop_text), complet
                 if isinstance(e,SystemExit) and e.code==130: raise
-                errcode=2; err_msg=_stop_text(e,mk) if isinstance(e,SystemExit) else str(e)[:80]
+                if isinstance(e,configparser.Error) and not isinstance(e,configparser.InterpolationError): raise   # revue 96 : tout le fichier
+                errcode=2
+                if isinstance(e,configparser.InterpolationError): _rc_nick_err(nick,e); err_msg=f"rc illisible : {_rc_err_text(e)}"[:80]   # revue 96, 2 (row 20)
+                else: err_msg=_stop_text(e,mk) if isinstance(e,SystemExit) else str(e)[:80]
                 if htrep:
                     errhost.append(nick)
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'—','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {_html_esc(err_msg)}"}
@@ -13165,16 +13325,23 @@ class BorgHelper:
         reshos={}; resbck={}; reshosto={}; errcode=0; errhost=[]
         self._storage_light_memo=None   # 1.0.209 : sections du rc relues pour ce Report
         for i in ['duree','derniere','taille','recuperable']: reshosto[i]=0
-        reshosto['nom']='Totaux'; _orph=False
+        reshosto['nom']='Totaux'; _orph=False; cfg={}
         for nick in nicks.split(','):
             if _orph: _orph=False; _release_orphan_connections()   # 1.0.182 (story 48) : nick précédent en erreur -> connexions orphelines libérées
-            cfg=self.borg.cfgreaded(nick,debug=debug)
-            live=self._bkp_live(nick,debug=debug) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : Bkp vivant (ou du nick voisin) -> base seule, ni borg ni attente
-            if not live:
-                if self.db.check_priority_lock(nick):
-                    printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
-                self.db.set_report_running_lock(nick)
-                self.db.wait_index_idle(nick,timeout=30)
+            try:   # revue 96, 3 (row 30) : valeur à « % » (BORG_REPO lu par les verrous) avant le rapport du nick -> ce nick seul
+                cfg=self.borg.cfgreaded(nick,debug=debug)
+                live=self._bkp_live(nick,debug=debug) or self._bkp_neighbor(nick)   # 1.0.183 (story 50) : Bkp vivant (ou du nick voisin) -> base seule, ni borg ni attente
+                if not live:
+                    if self.db.check_priority_lock(nick):
+                        printer(f"  {nick}: Bkp/Restore en cours — borg info sera mis en attente du verrou")
+                    self.db.set_report_running_lock(nick)
+                    self.db.wait_index_idle(nick,timeout=30)
+            except configparser.InterpolationError as e:
+                errcode=2; _rc_nick_err(nick,e); err_msg=f"rc illisible : {_rc_err_text(e)}"[:80]
+                if htrep: errhost.append(nick)
+                reshos[nick]={'nom':nick if htrep else f"*** ERREUR {nick}",'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—',
+                              'recuperable':'—','reste':f"⚠ {_html_esc(err_msg) if htrep else err_msg}"}
+                resbck[nick]={}; continue
             mk=_print_mark()
             try:
                 (tcmpl,tbkps)=self.prep_report_from_db(nick,maxp=maxp) if live else self.prep_report(nick,debug=debug,maxp=maxp)
@@ -13182,11 +13349,14 @@ class BorgHelper:
                 _orph=True   # 1.0.182 (story 48) : libérées au nick suivant ou après la boucle, hors de l'except
                 if not live: self.db.clear_report_running_lock(nick)
                 if isinstance(e,SystemExit) and e.code==130: raise   # Ctrl-C pendant borg (boex -> sys.exit(130)) : arrêt
+                if isinstance(e,configparser.Error) and not isinstance(e,configparser.InterpolationError): raise   # revue 96 (jumelle de report_offline)
                 if isinstance(e,SystemExit):   # 1.0.166 (story 29) : jumelle de report_offline (bases, config)
                     errcode=2; err_msg=_stop_text(e,mk)   # 1.0.168 (A51) : message réel, déjà affiché (pas de doublon)
+                elif isinstance(e,configparser.InterpolationError):   # revue 96, 2 (row 20, jumelle de report_offline) : ce nick seul
+                    errcode=2; _rc_nick_err(nick,e); err_msg=f"rc illisible : {_rc_err_text(e)}"[:80]
                 else:
                     errcode=2; printer(f"[ERREUR] {nick}: {e}"); err_msg=str(e)[:80]
-                if self.borg.repoLocalAbsent(nick): err_msg="dépôt absent"   # 1.0.167 : borg info échoue, cause lisible
+                if not isinstance(e,configparser.InterpolationError) and self.borg.repoLocalAbsent(nick): err_msg="dépôt absent"   # 1.0.167 ; revue 96, 3 (row 30) : jamais relu pour un rc illisible
                 if htrep:
                     errhost.append(nick)
                     reshos[nick]={'nom':nick,'duree':'—','depuis':'ERREUR','derniere':'—','taille':'—','recuperable':'—','reste':f"⚠ {_html_esc(err_msg)}"}
@@ -13539,6 +13709,7 @@ _FOG_WL={'borgHelper':{
     '_state_load|os.open':(1,'fichier d\'état JSON'), '_state_update|os.open':(2,'état JSON : .lock et temporaire'),
     '_db_create_file|os.open':(2,'création d\'une base : O_CREAT|O_EXCL, et un O_CREAT sans O_EXCL dans except FileExistsError (lien pendant, 1.0.209) — vérifié'),
     '_atomic_write_rc|os.open':(1,'dossier du rc (fsync)'),
+    '_rc_check|open':(2,'rc de la CLI : octets puis texte (story 96, jamais une base)'),
     'BorgHelperDB._set_pid_lock|open':(1,'verrou PID (temporaire)'), 'BorgHelperDB._lock_holder|open':(1,'verrou PID'),
     'BorgHelperDB.write_index_last|os.open':(1,'index-last.json (temporaire)'), 'BorgHelperDB.read_index_last|open':(1,'index-last.json'),
     'BorgHelperDB._acquire_pid_lock_excl|open':(1,'verrou PID (temporaire)'), 'BorgHelperDB._acquire_pid_lock_excl|os.open':(1,'verrou PID'),
@@ -15044,10 +15215,10 @@ def codec_selftest(pattern=None,list_only=False):
             return ok
         check("Storage : sans -n (CLI) et ALL (bibliothèque) -> tous les nicks du fichier de conf",_st_all)
         def _st_badrc():
-            """Row 51 : rc illisible -> erreur « * » (message de configparser ou d'ouverture, comme les autres commandes), code 1 —
-            jamais « nick inconnu » ni « Aucun dépôt. » en code 0. Droits (hors root) : par la CLI (HOME du décor : le dossier de
-            cache par défaut n'est jamais celui de l'utilisateur) ; syntaxe : par la bibliothèque (la CLI s'arrête avant, à la
-            lecture de CACHE_DIR, comme toute commande)."""
+            """Row 51 : bibliothèque (storage()) — rc illisible -> erreur « * » (type de l'erreur de configparser ou d'ouverture), code 1,
+            jamais « nick inconnu » ni « Aucun dépôt. » en code 0 : syntaxe et droits (revue 96 : contrat des droits revérifié). CLI
+            (droits, hors root ; HOME du décor) : depuis 1.0.212 (story 96) elle s'arrête avant Storage, comme toute commande —
+            [ERREUR] « illisible : permission refusée » exacte, code 2, stdout vide."""
             bd=os.path.join(tmp,'st-badrc'); os.makedirs(os.path.join(bd,'c'),exist_ok=True); brc=os.path.join(bd,'rc')
             with open(brc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(bd,'c')}\n[x]\nBORG_REPO=/r\n")
             os.chmod(brc,0o600); res={}
@@ -15061,22 +15232,25 @@ def codec_selftest(pattern=None,list_only=False):
                 with open(brc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(bd,'c')}\n[x]\nBORG_REPO=/r\n")
                 os.chmod(brc,0)
                 try:
+                    o=io.StringIO()
+                    with contextlib.redirect_stdout(o): rc=bhb.storage('ALL',as_json=True)
+                    d=json.loads(o.getvalue())
+                    res['droits (bibliothèque)']=(rc==1 and d['storages']==[] and d['errors']=={'*':'PermissionError (Permission denied)'},rc,d)
                     for k_,xa in (('droits',[]),('droits -n ALL',['-n','ALL'])):   # row 62 : -n ALL de même
                         saved=sys.argv[:]; out=io.StringIO(); err=io.StringIO(); code=0
                         try:
                             sys.argv=['borgHelper','-C',brc,'-c','Storage','-j']+xa
                             with mock.patch.dict(os.environ,{'HOME':bd}),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
-                                try: _cli_main()
+                                try: _cli_entry()
                                 except SystemExit as x: code=x.code
                         finally: sys.argv=saved
-                        d=json.loads(out.getvalue()) if out.getvalue().strip().startswith('{') else {}
-                        res[k_]=(code==1 and d.get('storages')==[] and list(d.get('errors',{}))==['*']
-                                 and d['errors']['*']=='PermissionError (Permission denied)' and brc not in out.getvalue(),code,d)
+                        res[k_]=(code==2 and out.getvalue()=='' and err.getvalue()==f"[ERREUR] {brc} illisible : permission refusée  [borgHelper v{Version}]\n",
+                                 code,out.getvalue(),err.getvalue())
                 finally: os.chmod(brc,0o600)
             ok=all(v[0] for v in res.values())
             if not ok: print(f"  {res}")
             return ok
-        check("Storage : rc illisible (syntaxe, droits) -> erreur « * », code 1",_st_badrc)
+        check("Storage : rc illisible -> erreur « * », code 1 (bibliothèque : syntaxe, droits) ; CLI : [ERREUR], code 2 (1.0.212)",_st_badrc)
         def _st_bsr():
             """Row 32 : chemin ou étiquette non UTF-8 (surrogates de fsdecode) -> échappé, jamais un UnicodeEncodeError."""
             x=_bsr({'k\udcff':['local ? (/a\udcfe)',{'r':'b\udcff'}],'n':3})
@@ -19322,7 +19496,12 @@ def codec_selftest(pattern=None,list_only=False):
             finally: m.close()
             if old!=(True,True,True,0): print(f"  base sans colonne mode : {old}")
             return ok and old==(True,True,True,0)
-        check("Liens physiques : comptes par inode (snapshot), DiffTop = IdxTop = Report -o, snapshot absent -> « ~ » (plain et chiffré)",_hl_counts_twins)
+        def _hl_counts_twins_restored():
+            """Revue 96, 3 (row 37) : _hl_counts_twins reconstruit qp/qe (archives h-x1…h-w2) — décor d'origine remis à la fin, succès
+            ou échec (un run filtré enchaînait « Status : dernier backup présent… » sur ce décor : FAIL d'ordre, préexistant)."""
+            try: return _hl_counts_twins()
+            finally: _q_build('qp',False); _q_build('qe',True)
+        check("Liens physiques : comptes par inode (snapshot), DiffTop = IdxTop = Report -o, snapshot absent -> « ~ » (plain et chiffré)",_hl_counts_twins_restored)
         def _chart_old_column():
             """1.0.211 (revue 88-2 row 28 B) : history.db d'avant 1.0.211 (archive_chart sans files_approx) — un lecteur la lit
             (files_approx None, colonne non ajoutée), un figeage ajoute la colonne sous verrou et l'écrit, la ligne d'avant
@@ -20259,6 +20438,39 @@ def codec_selftest(pattern=None,list_only=False):
                 if saved is None: os.environ.pop('BORG_PASSPHRASE',None)
                 else: os.environ['BORG_PASSPHRASE']=saved
         check("Sentry before_send : chemins et passphrase masqués aussi dans le texte libre (exception, message, logentry, fils d'Ariane)",_sentry_text_ok)
+        def _sentry_rc_line_ok():
+            """1.0.212 (story 96) : ligne de fichier recopiée par configparser (rc à ligne sans « = », sans section, ligne continuée)
+            masquée dans le texte envoyé à Sentry — la passphrase d'une telle ligne n'est pas celle de l'environnement. Textes réels
+            de l'interpréteur courant (str de l'exception) et forme littérale de la story ; guillemets doubles (ligne avec « ' »).
+            Revue 96 : texte tronqué (sentry_sdk coupe AVANT before_send : repr sans guillemet fermant), valeurs citées par les
+            erreurs d'interpolation (found:, variable reference, interpolation key, Raw value:) — masqué jusqu'à la fin de la ligne ;
+            ligne de commande (extra sys.argv de sentry_sdk) : valeur de -P et chemin de -C masqués."""
+            S='s96-hunter2'; vals=["Source contains parsing errors: '/r/rc'\n\t[line  3]: 'BORG_PASSPHRASE x'"]
+            for t in (f"[D]\nA=1\nBORG_PASSPHRASE {S}\n",f"BORG_PASSPHRASE={S}\n[a]\n",f"[a]\nk\n  {S}\n",f"[a]\nk=1\nit's {S}\n"):
+                try: configparser.ConfigParser().read_file(io.StringIO(t),source='/r/rc')
+                except configparser.Error as e: vals.append(str(e))
+                else: return False
+            for v in (f"{S}%cd",f"{S}%(x)scd",f"{S}%(x",f"%({S})s"):   # erreurs d'interpolation réelles (lecture de la valeur)
+                cp=configparser.ConfigParser(); cp.read_string(f"[a]\nk={v}\n")
+                try: cp['a']['k']
+                except configparser.InterpolationError as e: vals.append(str(e))
+                else: return False
+            vals.append(vals[1][:vals[1].index(S)+5])   # tronqué au milieu du repr : « …'BORG_PASSPHRASE s96-h » sans guillemet
+            event={'exception':{'values':[{'value':v} for v in vals]},'message':vals[1],
+                   'breadcrumbs':{'values':[{'message':vals[2]}]},
+                   'extra':{'sys.argv':['/usr/bin/bh','-C','rel.rc','-c','Login','-p',S,'-P',S,'-dP'+S,'--api-key='+S,'-K',S,'--cfgfile',S,
+                                        '-P','--'+S,'-P','-x'+S,'-nx','-d']}}
+            out=_sentry_before_send(event,None)
+            txt=json.dumps(out)
+            got=[x['value'] for x in out['exception']['values']]
+            ok=(len(vals)==10 and out['extra']['sys.argv']==['bh','-C','[redacted]','-c','[redacted]','-p','[redacted]','-P','[redacted]',
+                                                              '-dP[redacted]','--api-key=[redacted]','-K','[redacted]','--cfgfile','[redacted]',
+                                                              '-P','[redacted]','-P','[redacted]','-n[redacted]','-d'] and 's96' not in txt and 'BORG_PASSPHRASE' not in txt and txt.count("[redacted]")>=11
+                and got[0]=="Source contains parsing errors: '<chemin>'\n\t[line  3]: '[redacted]'"
+                and got[2].endswith("line: 1\n'[redacted]'") and got[9].endswith("[line  3]: '[redacted]'"))
+            if not ok: print(f"  {got} / {out.get('message')!r}")
+            return ok
+        check("Sentry before_send : ligne de fichier recopiée par configparser ([line N]: '…', line: N) masquée (1.0.212)",_sentry_rc_line_ok)
         check("SENTRY_ALERTS : analyse (liste, 'all', casse, valeurs inconnues ignorées, absent = aucune)",
               lambda: _sentry_alert_kinds({'SENTRY_ALERTS':'bkp_error'})=={'bkp_error'}
                       and _sentry_alert_kinds({'SENTRY_ALERTS':' Overdue , BKP_ERROR x'})=={'overdue','bkp_error'}
@@ -20685,6 +20897,301 @@ def codec_selftest(pattern=None,list_only=False):
             cli_ok=('undA' in txt and 'undB' in txt and '_borgHelperWWW' not in txt)
             return direct_ok and cli_ok
         check("cfgreadnicks/-n ALL ignorent silencieusement une section '_*' (réservée, ex. [_borgHelperWWW])",_cfgreadnicks_ignores_underscore_sections)
+        def _cli_rc_unreadable():
+            """1.0.212 (story 96, reports 87a et 84, Q96-1/Q96-2) : rc illisible -> une seule ligne [ERREUR] « <rc> illisible, ligne N :
+            nature » (ou « illisible : nature »), égalité exacte, code 2, stdout vide, jamais le contenu de la ligne (secret absent de
+            toute sortie), avant toute commande (CACHE_DIR du rc jamais créé : BorgHelper() pas atteint ; ALL de -j compris). Revue 96 :
+            rc par défaut (sans -C, HOME du décor : texte Q96-2 exact), dossier (EISDIR), dossier parent non traversable, BOM, valeur à
+            « % » (levée à la lecture de la valeur, prise par _cli_entry), CodecSelfTest exempté (sous-processus) ; Sentry neutralisé
+            ici même (jamais celui du poste). Rc valide de même forme et rc absent : jamais refusés (comportement d'avant)."""
+            S='s96-secret-hunter2'; res={}
+            d=os.path.join(tmp,'cli-rc96'); os.makedirs(d,exist_ok=True); cd=os.path.join(d,'cache')
+            nodsn=os.path.join(d,'nodsn'); open(nodsn,'w').close()
+            enc=None; ep=os.path.join(d,'enc-probe')   # encodage de la lecture du rc (celui de configparser.read), lu comme _rc_check
+            with open(ep,'wb') as f: f.write(b'\xff\n')
+            try:
+                with open(ep,encoding=io.text_encoding(None)) as f: f.read()
+            except UnicodeDecodeError as x: enc=x.encoding
+            cases=[('sans =',f"[DEFAULT]\nCACHE_DIR={cd}\nBORG_PASSPHRASE {S}\n[n1]\nBORG_REPO=/r\n","ligne 3 : « clé = valeur » attendu"),
+                   ('sans section',f"BORG_PASSPHRASE={S}\n[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_REPO=/r\n",
+                    "ligne 1 : « [section] » attendu avant la première clé"),
+                   ('section en double',f"[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_REPO=/r\n[n1]\nBORG_PASSPHRASE={S}\n","ligne 5 : section en double"),
+                   ('clé en double (casse)',f"[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_PASSPHRASE={S}\nborg_passphrase={S}2\n",
+                    "ligne 5 : clé en double dans sa section"),
+                   ('BOM',b'\xef\xbb\xbf'+f"[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_PASSPHRASE={S}\n".encode(),
+                    "ligne 1 : BOM UTF-8 en tête du fichier (l'enregistrer sans BOM)")]
+            if enc: cases.append(('encodage',f"[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_PASSPHRASE={S}".encode()+b"\xff\n",
+                                  f"ligne 4 : encodage invalide ({enc} attendu)"))
+            else: res['encodage']='décor : aucun encodage de locale ne refuse 0xff'
+            if os.geteuid()!=0: cases.append(('droits',f"[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_PASSPHRASE={S}\n","illisible : permission refusée"))
+            inits=[]; _bh_init=BorgHelper.__init__
+            def _init_spy(self,*a,**k): inits.append(1); return _bh_init(self,*a,**k)
+            def run(rc,argv,home=d):
+                saved=sys.argv[:]; out=io.StringIO(); err=io.StringIO(); code=0; del inits[:]
+                try:
+                    sys.argv=['borgHelper']+(['-C',rc] if rc else [])+argv
+                    with mock.patch.dict(os.environ,{'HOME':home,'BORGHELPERC_SENTRY_FILE':nodsn}),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err), \
+                         mock.patch.object(BorgHelper,'__init__',_init_spy):
+                        os.environ.pop('BORGHELPERC_SENTRY_DSN',None)
+                        try: _cli_entry()
+                        except SystemExit as x: code=x.code
+                finally: sys.argv=saved
+                return code,out.getvalue(),err.getvalue()
+            def exact(lbl,rc,argv,shown,want,home=d):
+                code,o,e=run(rc,argv,home)
+                sep=' : ' if not want.startswith('ligne ') else ', '
+                line=f"[ERREUR] {shown} illisible{sep}{want}  [borgHelper v{Version}]\n"
+                # revue 96, 2 (row 23) : « avant toute commande » prouvé — BorgHelper() jamais construit
+                if not (code==2 and o=='' and e==line and S not in o+e and 'BORG_PASSPHRASE' not in e and not os.path.exists(cd) and inits==[]):
+                    res[f"{lbl} {' '.join(argv[:2])}"]=(code,o[-200:],e[-300:],line,len(inits))
+            for i,(lbl,txt,want) in enumerate(cases):
+                rc=os.path.join(d,f'rc{i}')
+                with open(rc,'wb') as f: f.write(txt if isinstance(txt,bytes) else txt.encode())
+                os.chmod(rc,0 if lbl=='droits' else 0o600)
+                try:
+                    for argv in (['-c','Status','-n','n1'],['-c','Report','-n','ALL'],['-c','IdxTop','-n','ALL','-j'],['-c','Bkp','-n','n1']):
+                        exact(lbl,rc,argv,rc,want.replace('illisible : ',''))
+                finally: os.chmod(rc,0o600)
+            # rc par défaut, sans -C : texte Q96-2 exact (HOME du décor)
+            hd=os.path.join(d,'home'); os.makedirs(hd,exist_ok=True)
+            with open(os.path.join(hd,'.borghelperrc'),'w') as f: f.write(cases[0][1])
+            os.chmod(os.path.join(hd,'.borghelperrc'),0o600)
+            exact('défaut',None,['-c','Status','-n','n1'],'~/.borghelperrc',"ligne 3 : « clé = valeur » attendu",home=hd)
+            # dossier ; dossier parent non traversable (hors root)
+            dr=os.path.join(d,'rc-dir'); os.makedirs(dr,exist_ok=True)
+            exact('dossier',dr,['-c','Status','-n','n1'],dr,"est un dossier")
+            if os.geteuid()!=0:
+                pd=os.path.join(d,'ferme'); os.makedirs(pd,exist_ok=True); prc=os.path.join(pd,'rc')
+                with open(prc,'w') as f: f.write(f"[n1]\nBORG_REPO=/r\n")
+                os.chmod(pd,0)
+                try: exact('parent fermé',prc,['-c','Status','-n','n1'],prc,"permission refusée")
+                finally: os.chmod(pd,0o700)
+            # valeur à « % » : lue par la commande (DbEncrypt lit BORG_PASSPHRASE même sans diff.db), prise par _cli_entry — par nick
+            # (revue 96, 2 row 20) : ligne du nick et de la clé, jamais le fragment cité par configparser (« %cd », « %(x)scd », « %(x »)
+            for k,val,nat in (('% seul','ab%cd',"« % » à doubler dans BORG_PASSPHRASE"),('%(x)s','ab%(x)scd',"« % » à doubler dans BORG_PASSPHRASE"),
+                              ('%( ouvert','ab%(x',"« % » à doubler dans BORG_PASSPHRASE"),
+                              ('auto-référence','%(BORG_PASSPHRASE)s',"référence %(…)s circulaire dans BORG_PASSPHRASE")):
+                ic=os.path.join(d,'cache-i'); irc=os.path.join(d,f'rc-interp'); shutil.rmtree(ic,ignore_errors=True)
+                with open(irc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={ic}\n[n1]\nBORG_REPO=/r\nBORG_PASSPHRASE={S}{val}\n")
+                os.chmod(irc,0o600)
+                code,o,e=run(irc,['-c','DbEncrypt','-n','n1','-D'])
+                line=f"[ERREUR] n1 : rc illisible : {nat}  [borgHelper v{Version}]\n"
+                frag=val[val.index('%'):]
+                if not (code==2 and line in e and e.count('[ERREUR]')==1 and S not in o+e and 'Traceback' not in e and frag not in o+e
+                        and 'found' not in o+e and 'Raw value' not in o+e):
+                    res[f"interpolation {k}"]=(code,o[-200:],e[-300:])
+            rc=os.path.join(d,'rc-ok')   # même forme, valide : jamais refusé
+            with open(rc,'w') as f: f.write(f"[DEFAULT]\nCACHE_DIR={cd}\n[n1]\nBORG_REPO=/r\nBORG_PASSPHRASE={S}\n")
+            os.chmod(rc,0o600)
+            code,o,e=run(rc,['-c','Status','-n','n1'])
+            if code not in (0,None) or 'illisible' in o+e or 'n1' not in o+e: res['valide']=(code,o[-200:],e[-300:])
+            code,o,e=run(os.path.join(d,'rc-absent'),['-c','Status','-n','n1'])
+            if 'illisible' in o+e: res['absent']=(code,o[-200:],e[-300:])
+            # CodecSelfTest exempté (ne lit pas le rc) : sous-processus, rc invalide, -l d'un seul contrôle
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn,HOME=d,TMPDIR=tmp); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',os.path.join(d,'rc0'),'-c','CodecSelfTest','-l','-f','^HMAC-SHA256 \\(RFC 4231 cas 1\\)$'],
+                             capture_output=True,text=True,env=env,timeout=300,stdin=subprocess.DEVNULL)
+            if not (r.returncode==0 and 'LIST HMAC-SHA256 (RFC 4231 cas 1)' in r.stdout and 'illisible' not in r.stdout+r.stderr):
+                res['CodecSelfTest']=(r.returncode,r.stdout[-200:],r.stderr[-300:])
+            if res: print(f"  {res}")
+            return not res
+        check("CLI rc illisible : une ligne [ERREUR] (rc, ligne, nature), jamais le contenu de la ligne, code 2, avant toute commande (1.0.212)",_cli_rc_unreadable)
+        def _cli_rc_sentry():
+            """Revue 96 (décision de l'utilisateur du 2026-10-22) : DSN configuré -> rc illisible = UN message Sentry « rc illisible,
+            ligne N : nature » (niveau error, empreinte fixe), jamais le chemin ni le contenu de la ligne — rc à ligne sans « = »
+            (_rc_check) et valeur à « % » (_cli_entry). Faux transport : rien ne part ; client d'origine remis."""
+            import sentry_sdk
+            S='s96-sentry-hunter2'; d=os.path.join(tmp,'cli-rc96s'); os.makedirs(d,exist_ok=True)
+            v2=hasattr(sentry_sdk,'get_client')
+            old_client=sentry_sdk.get_client() if v2 else sentry_sdk.Hub.current.client
+            def bind(c):
+                if v2: sentry_sdk.get_global_scope().set_client(c)
+                else: sentry_sdk.Hub.current.bind_client(c)
+            got=[]; res={}
+            from sentry_sdk.transport import Transport as _Tb
+            class _T(_Tb):
+                def capture_event(self,event): got.append(event)
+                def capture_envelope(self,envelope):
+                    ev=envelope.get_event()
+                    if ev is not None: got.append(ev)
+            _orig=sentry_sdk.init
+            def _init(**kw): kw['transport']=_T(dict(kw)); return _orig(**kw)
+            cases=[('sans =',f"[DEFAULT]\nCACHE_DIR={d}/c\nBORG_PASSPHRASE {S}\n[n1]\nBORG_REPO=/r\n",['-c','Bkp','-n','n1'],
+                    "rc illisible, ligne 3 : « clé = valeur » attendu"),
+                   ('%',f"[DEFAULT]\nCACHE_DIR={d}/c\n[n1]\nBORG_REPO=/r\nBORG_PASSPHRASE={S}%cd\n",['-c','DbEncrypt','-n','n1','-D'],
+                    "rc illisible, « % » à doubler dans BORG_PASSPHRASE"),
+                   # revue 96, 2 (row 19) : Login -p (lancé par POST /login) sur un rc illisible — passphrase de -p jamais dans sys.argv
+                   ('Login -p',f"[DEFAULT]\nCACHE_DIR={d}/c\nBORG_PASSPHRASE x\n",['-c','Login','-n','n1','-p',S+'-login','-r','/r'],
+                    "rc illisible, ligne 3 : « clé = valeur » attendu"),
+                   # mutations (row 38) : DEUX erreurs dans la même exécution (deux nicks à « % ») -> UN seul message
+                   ('deux nicks',f"[DEFAULT]\nCACHE_DIR={d}/c\n[n1]\nBORG_REPO=/r\nBORG_PASSPHRASE={S}%cd\n[n2]\nBORG_REPO=/r2\nBORG_PASSPHRASE={S}%ef\n",
+                    ['-c','DbEncrypt','-n','ALL','-D'],"rc illisible, « % » à doubler dans BORG_PASSPHRASE"),
+                   # revue 3 (row 34) : CLI lancée par borgHelperWWW -> aucun message (WWW le dit dans son journal)
+                   ('sous WWW',f"[DEFAULT]\nCACHE_DIR={d}/c\nBORG_PASSPHRASE {S}\n[n1]\nBORG_REPO=/r\n",['-c','Status','-n','n1'],None)]
+            try:
+                sentry_sdk.init=_init
+                for lbl,txt,argv,want in cases:
+                    rc=os.path.join(d,'rc')
+                    with open(rc,'w') as f: f.write(txt)
+                    os.chmod(rc,0o600); del got[:]; bind(None)
+                    saved=sys.argv[:]; out=io.StringIO(); code=None
+                    try:
+                        sys.argv=['borgHelper','-C',rc]+argv
+                        with mock.patch.dict(os.environ,{'HOME':d,'BORGHELPERC_SENTRY_DSN':'https://cle@o0.ingest.sentry.io/0',
+                                                         **({'BORGHELPERC_NO_CLEANUP_NOTICE':'1'} if want is None else {})}), \
+                             contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                            try: _cli_entry()
+                            except SystemExit as x: code=x.code
+                    finally: sys.argv=saved
+                    ev=got[0] if got else {}
+                    msg=(ev.get('logentry') or {}).get('message') or ev.get('message')
+                    av=(ev.get('extra') or {}).get('sys.argv')
+                    if want is None:
+                        if not (code==2 and got==[]): res[lbl]=(code,len(got),out.getvalue()[-200:])
+                        continue
+                    if lbl=='deux nicks' and not all(f"[ERREUR] {n_} : rc illisible : « % » à doubler dans BORG_PASSPHRASE" in out.getvalue() for n_ in ('n1','n2')):
+                        res[lbl+' (lignes)']=out.getvalue()[-400:]
+                    if not (code==2 and len(got)==1 and msg==want and ev.get('level')=='error' and S not in json.dumps(got,default=str)
+                            and rc not in json.dumps(got,default=str) and ev.get('fingerprint')==['borghelper-rc-illisible']
+                            and (av is None or all(x=='[redacted]' or x.startswith('-') or x=='borgHelper' for x in av))):
+                        js=json.dumps(got,default=str)
+                        res[lbl]=(code,len(got),msg,ev.get('level'),ev.get('fingerprint'),S in js,rc in js,js[:1500],out.getvalue()[-200:])
+            finally:
+                sentry_sdk.init=_orig; bind(old_client)
+            if res: print(f"  {res}")
+            return not res
+        _n96="CLI rc illisible : DSN configuré -> un message Sentry masqué « rc illisible, ligne N : nature » (revue 96)"
+        if importlib.util.find_spec('sentry_sdk') is None: skip(_n96,"sentry_sdk absent de cet interpréteur")
+        else: check(_n96,_cli_rc_sentry)
+        def _rc_interp_per_nick():
+            """Revue 96, 2 (row 20, décision de l'utilisateur du 2026-10-22 ; rows 18, 23) : valeur à « % » mal formée dans UN nick
+            (n2) -> `[ERREUR] n2 : rc illisible : « % » à doubler dans BORG_PASSPHRASE` (égalité de ligne), les autres nicks traités,
+            code = le pire (2), jamais le fragment cité par configparser ni la passphrase — à chaque site : Bkp -n ALL et Index -n ALL
+            (boucles de main, Bkp/Index factices qui lisent la passphrase comme le vrai), Report -n ALL (report, prep_report factice
+            délégué à prep_report_from_db), Report -o -n ALL (report_offline), Status -n ALL et -j (nick indexé : passphrase lue par
+            l'ouverture de sa diff.db), IdxTop -n ALL (_PerNick). Sentry neutralisé ; HOME du décor."""
+            S='s96-pernick-hunter2'; d=os.path.join(tmp,'rc96-pernick'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d)
+            nodsn=os.path.join(d,'nodsn'); open(nodsn,'w').close(); rc=os.path.join(d,'rc')
+            def wr(p2,repo2='',path=None,nicks=('n1','n2','n3')):
+                with open(path or rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={d}/c\nGLOB_ARCH=h-*\n")
+                    for n_ in nicks:
+                        pw=p2 if n_ in ('n2','n4') else f'pw-{n_}'
+                        os.makedirs(os.path.join(d,f'r-{n_}'),exist_ok=True)   # dépôt local présent : Report passe son contrôle « dépôt absent »
+                        f.write(f"[{n_}]\nBORG_REPO={d}/r-{n_}{repo2 if n_=='n2' else ''}\nBORG_PASSPHRASE={pw}\n")
+                os.chmod(path or rc,0o600)
+            wr(S); b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'c'))
+            p2=b.db.get_diff_db('n2'); b.db.ensure_diff_db(p2)   # n2 « indexé » : sa diff.db existe (Status, IdxTop l'ouvrent)
+            wr(S+'%cd'); del b
+            res={}; line=f"[ERREUR] n2 : rc illisible : « % » à doubler dans BORG_PASSPHRASE  [borgHelper v{Version}]\n"
+            def run(argv,patches=()):
+                saved=sys.argv[:]; out=io.StringIO(); err=io.StringIO(); code=0
+                try:
+                    sys.argv=['borgHelper','-C',rc]+argv
+                    with contextlib.ExitStack() as st_:
+                        st_.enter_context(mock.patch.dict(os.environ,{'HOME':d,'BORGHELPERC_SENTRY_FILE':nodsn}))
+                        os.environ.pop('BORGHELPERC_SENTRY_DSN',None)
+                        for pt in patches: st_.enter_context(pt)
+                        st_.enter_context(contextlib.redirect_stdout(out)); st_.enter_context(contextlib.redirect_stderr(err))
+                        try: _cli_entry()
+                        except SystemExit as x: code=x.code
+                finally: sys.argv=saved
+                return code,out.getvalue(),err.getvalue()
+            def clean(o,e): return S not in o+e and '%cd' not in o+e and 'found' not in o+e and 'Traceback' not in e
+            seen=[]
+            def fake_bkp(self,nick,no_index=False,debug=0):
+                seen.append(nick); self.borg.cfgread(nick).get('BORG_PASSPHRASE'); sys.exit(0)
+            code,o,e=run(['-c','Bkp','-n','ALL'],[mock.patch.object(BorgHelper,'backup',fake_bkp)])
+            if not (code==2 and seen==['n1','n2','n3'] and e.count(line)==1 and e.count('[ERREUR]')==1 and clean(o,e)): res['Bkp']=(code,seen,o[-200:],e[-400:])
+            del seen[:]
+            def fake_idx(self,nick,debug=0,**k):
+                seen.append(nick); self.borg.cfgread(nick).get('BORG_PASSPHRASE'); return 0
+            code,o,e=run(['-c','Index','-n','ALL'],[mock.patch.object(BorgHelper,'index',fake_idx)])
+            il=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'c')).db.read_index_last('n2') or {}
+            if not (code==2 and seen==['n1','n2','n3'] and e.count(line)==1 and clean(o,e) and il.get('code')==2
+                    and '%cd' not in json.dumps(il) and S not in json.dumps(il) and 'Error' not in json.dumps(il)
+                    and 'rc illisible' in json.dumps(il,ensure_ascii=False)): res['Index']=(code,seen,o[-200:],e[-400:],il)
+            _prfd=BorgHelper.prep_report_from_db
+            def fake_prep(self,nick,debug=0,maxp=None):   # nicks sains : erreur ordinaire de leur ligne (borg factice), dite et passée
+                seen.append(nick)
+                if nick=='n2': self.borg.cfgread(nick).get('BORG_PASSPHRASE')
+                raise RuntimeError(f"borg factice {nick}")
+            del seen[:]
+            code,o,e=run(['-c','Report','-n','ALL','-j'],[mock.patch.object(BorgHelper,'prep_report',fake_prep)])
+            if not (code==2 and seen==['n1','n2','n3'] and e.count(line)==1 and clean(o,e) and 'borg factice n1' in o and 'borg factice n3' in o
+                    and 'rc illisible : « % » à doubler dans BORG_PASSPHRASE' in o):
+                res['Report']=(code,o[-500:],e[-400:])
+            def fake_prfd(self,nick,maxp=None):
+                if nick=='n2': self.borg.cfgread(nick).get('BORG_PASSPHRASE')
+                return _prfd(self,nick,maxp=maxp)
+            code,o,e=run(['-c','Report','-o','-n','ALL','-j'],[mock.patch.object(BorgHelper,'prep_report_from_db',fake_prfd)])
+            if not (code==2 and e.count(line)==1 and clean(o,e) and all(n_ in o for n_ in ('n1','n3')) and 'rc illisible : « % » à doubler dans BORG_PASSPHRASE' in o):
+                res['Report -o']=(code,o[-500:],e[-400:])
+            code,o,e=run(['-c','Status','-n','ALL'])
+            if not (code==1 and 'n1' in o+e and 'n3' in o+e and '« % » à doubler dans BORG_PASSPHRASE' in o+e and clean(o,e)): res['Status']=(code,o[-500:],e[-400:])
+            code,o,e=run(['-c','Status','-n','ALL','-j'])
+            try: sj={x['nick']:x for x in json.loads(o)}
+            except (ValueError,TypeError,KeyError): sj={}
+            if not (sorted(sj)==['n1','n2','n3'] and sj['n2'].get('error')=='« % » à doubler dans BORG_PASSPHRASE' and clean(o,e)): res['Status -j']=(code,o[-500:],e[-300:])
+            code,o,e=run(['-c','IdxTop','-n','ALL'])
+            if not (code==1 and e.count(line)==1 and clean(o,e) and 'n1' in o+e and 'n3' in o+e): res['IdxTop']=(code,o[-300:],e[-400:])
+            # row 28 : index-last.json écrit avant 1.0.212 (texte de configparser) -> masqué à la lecture (servi par /access)
+            bdb=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'c')).db
+            with open(bdb.index_last_path('n3'),'w',encoding='utf-8') as f:
+                json.dump({'code':1,'message':f"InterpolationSyntaxError: '%' must be followed by '%' or '(', found: '%cd{S}'",
+                           'last_failure':{'message':f"x Raw value: '{S}%(x)s'"}},f)
+            il3=bdb.read_index_last('n3') or {}
+            if S in json.dumps(il3) or '%cd' in json.dumps(il3) or not il3.get('message','').endswith("found: '[redacted]'"): res['index-last ancien']=il3
+            # revue 3 (row 31) : autres boucles multi-nicks — Prune (factice qui lit la passphrase), DbStatus et DbEncrypt -D réels (n2 indexé)
+            del seen[:]
+            def fake_prune(self,nick,debug=0):
+                seen.append(nick); self.borg.cfgread(nick).get('BORG_PASSPHRASE'); return {'exitcode':0}
+            code,o,e=run(['-c','Prune','-n','ALL'],[mock.patch.object(BorgHelper,'prune',fake_prune)])
+            if not (code==2 and seen==['n1','n2','n3'] and e.count(line)==1 and clean(o,e)): res['Prune']=(code,seen,o[-200:],e[-400:])
+            code,o,e=run(['-c','DbStatus','-n','ALL'])
+            if not (code==2 and e.count(line)==1 and clean(o,e) and 'n1: diff.db' in o+e and 'n3: diff.db' in o+e): res['DbStatus']=(code,o[-300:],e[-400:])
+            code,o,e=run(['-c','DbEncrypt','-n','ALL','-D'])
+            if not (code==2 and e.count(line)==1 and clean(o,e) and 'n1: diff.db absent' in o+e and 'n3: diff.db absent' in o+e): res['DbEncrypt -D']=(code,o[-300:],e[-400:])
+            # row 29 : borg lancé (boex -> _borg_child_env) sur une valeur à « % » -> erreur assainie ; BkpReconcile la dit sans la valeur
+            bb=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'c'))
+            try: _borg_child_env(bb.borg.cfgread('n2')); res['_borg_child_env']='aucune erreur'
+            except _RcValueError as x_:
+                if '%cd' in str(x_) or S in str(x_) or x_.__cause__ is not None or not x_.__suppress_context__: res['_borg_child_env']=str(x_)
+            out=io.StringIO()
+            with mock.patch.object(bb.db,'open_bkp_runs',lambda n_: ['r96']),mock.patch.object(bb.db,'bkp_markers',lambda *a,**k: []), \
+                 mock.patch.object(bb.db,'repo_orphan_create',lambda *a,**k: None),mock.patch.object(bb.db,'run_create_alive',lambda *a,**k: []), \
+                 mock.patch.object(bb.borg,'repoLocalAbsent',lambda *a,**k: False),contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                bb._reconcile_killed_bkp('n2',retry='x')
+            if not ("[WARN] n2 : rapprochement impossible (borg list : « % » à doubler dans BORG_PASSPHRASE) — réessayé x" in out.getvalue()
+                    and clean(out.getvalue(),'')): res['BkpReconcile']=out.getvalue()[-300:]
+            # row 33 : erreur de syntaxe (tout le fichier) pendant Status -> arrêt, ligne du rc, code 2 (jamais « Erreur » par nick)
+            try: configparser.ConfigParser().read_string("[a]\nx=1\nligne sans egal\n",source=rc)
+            except configparser.ParsingError as x_: pe=x_
+            def fake_one(self,nick,debug=0,bkp_live=False):
+                if nick=='n2': raise pe
+                return {'nick':nick,'last_backup':None,'bkp_running':None,'bkp_interrupted':None,'bkp_stale':None,'priority_op_running':False,'build':None,'rebuild':None}
+            code,o,e=run(['-c','Status','-n','ALL'],[mock.patch.object(BorgHelper,'_status_one',fake_one)])
+            if not (code==2 and f"[ERREUR] {rc} illisible, ligne 3 : « clé = valeur » attendu  [borgHelper v{Version}]\n" in e and 'sans egal' not in o+e):
+                res['Status syntaxe']=(code,o[-300:],e[-300:])
+            # row 30 : « % » dans BORG_REPO (lu par les verrous de Report avant le rapport du nick) -> ligne du nick, tableau des autres
+            wr(S,repo2='%zz')
+            def fake_prep2(self,nick,debug=0,maxp=None): raise RuntimeError(f"borg factice {nick}")
+            code,o,e=run(['-c','Report','-n','ALL','-j'],[mock.patch.object(BorgHelper,'prep_report',fake_prep2)])
+            l2=f"[ERREUR] n2 : rc illisible : « % » à doubler dans BORG_REPO  [borgHelper v{Version}]\n"
+            if not (code==2 and e.count(l2)==1 and '%zz' not in o+e and 'borg factice n1' in o and 'borg factice n3' in o
+                    and 'rc illisible : « % » à doubler dans BORG_REPO' in o): res['Report BORG_REPO']=(code,o[-400:],e[-400:])
+            # row 32 : lecteur multi-nicks dont TOUS les nicks échouent (n2, n4) -> une ligne par nick, jamais redite, code 1
+            rc2=os.path.join(d,'rc2'); wr(S,path=rc2,nicks=('n2','n4'))
+            b2=BorgHelper(cfgfile=rc2,cache_dir=os.path.join(d,'c'))
+            for n_ in ('n2','n4'): b2.db.ensure_diff_db(b2.db.get_diff_db(n_))
+            del b2; wr(S+'%cd',path=rc2,nicks=('n2','n4'))
+            saved_rc=rc; rc=rc2
+            try: code,o,e=run(['-c','IdxTop','-n','ALL'])
+            finally: rc=saved_rc
+            if not (code==1 and e.count(line)==1 and e.count(line.replace('n2 :','n4 :'))==1 and clean(o,e)): res['tous en échec']=(code,o[-300:],e[-400:])
+            if res: print(f"  {res}")
+            return not res
+        check("rc illisible par nick (valeur à « % ») : ligne [ERREUR] du nick, nicks suivants traités, code le pire — Bkp, Index, Report, Report -o, Status, IdxTop -n ALL (revue 96)",_rc_interp_per_nick)
         def _db_migrate_cache_error_wrapped():
             """Revue : l'appel à _db_migrate_cache (après _db_migrate_run) n'était PAS dans le même except
             que _db_migrate_run -> une DbModeError venant de _db_migrate_cache (CAS/write échoués sur
@@ -20703,6 +21210,87 @@ def codec_selftest(pattern=None,list_only=False):
                 BorgHelper._db_migrate_cache=orig
             return r==2 and '[ERREUR]' in out.getvalue()
         check("_db_migrate : _db_migrate_cache dans le même except que _db_migrate_run -> code 2 + [ERREUR], jamais une exception non attrapée",_db_migrate_cache_error_wrapped)
+        def _db_migrate_sqlite_error_wrapped():
+            """1.0.212 (story 96, report 84) : diff.db tenue en écriture par une autre connexion au-delà du délai, ENTRE deux lots
+            (en-tête « migrating » + curseur posés) -> sqlite3.OperationalError de la boucle par lots : [ERREUR] avec l'état
+            reprenable (« relancer DbEncrypt -y »), code 2 (revue 96, décision de l'utilisateur), jamais une exception ; base restée
+            « migrating » au curseur ; verrou
+            rendu, relance -> siv1, chemins relus identiques. Délai de 60 s ramené à 0,3 s (connexion admin de la migration seule)."""
+            b,paths=_db5_env('m96'); p=b.db.get_diff_db('m96'); before=_db5_paths(b,'m96')
+            g=globals(); orig_open,orig_pr,orig_batch=g['_open_db'],g['printer'],g['_MIGRATE_BATCH']; hold=[]
+            def _open(db_path,*a,**k):
+                if k.get('role')=='admin' and k.get('timeout')==60: k['timeout']=0.3
+                return orig_open(db_path,*a,**k)
+            def _pr(data,debug=0):
+                if not hold and isinstance(data,str) and "jusqu'à id=" in data:   # premier lot validé : l'autre connexion prend le verrou
+                    h=sqlite3.connect(p,timeout=0,isolation_level=None); h.execute("BEGIN IMMEDIATE"); hold.append(h)
+                return orig_pr(data,debug)
+            out=io.StringIO(); r='exception'
+            g['_open_db'],g['printer'],g['_MIGRATE_BATCH']=_open,_pr,5
+            try:
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                    try: r=b.db_encrypt('m96',confirm=True,debug=1)
+                    except Exception as e: r=f"exception {type(e).__name__}: {e}"
+            finally:
+                g['_open_db'],g['printer'],g['_MIGRATE_BATCH']=orig_open,orig_pr,orig_batch
+                for h in hold: h.execute("ROLLBACK"); h.close()
+            h1=_db5_header(b,'m96'); o=out.getvalue()
+            r2=_q_run(b.db_encrypt,'m96',confirm=True)
+            want=("  [ERREUR] m96: OperationalError: database is locked — DbEncrypt interrompu, aucun lot partiel écrit : relancer "
+                  f"DbEncrypt -y pour reprendre au dernier lot validé  [borgHelper v{Version}]\n")
+            res={'code':(r,len(hold)),'msg':(want in o and o.count('[ERREUR]')==1 and 'Traceback' not in o),
+                 'migrating':(h1['path_enc'],(h1.get('migration_cursor') or {}).get('id')),
+                 'reprise':('DbEncrypt terminé (siv1)' in r2,_db5_mode(b,'m96'))}
+            ok=(r==2 and len(hold)==1 and res['msg'] and h1['path_enc']=='migrating' and (h1.get('migration_cursor') or {}).get('id',0)>0
+                and res['reprise']==(True,'siv1') and _db5_paths(b,'m96')!=before)
+            if ok:   # chemins chiffrés en base : relus par le lecteur (décodés) identiques aux chemins d'origine
+                c=_open_db(p,nick='m96',role='read')
+                try: dec={c.codec.path.decode(x) for (x,) in c.execute("SELECT path FROM snapshot_file WHERE nick='m96'")}
+                finally: c.close()
+                ok=dec==before[0]; res['relus']=ok
+            if not ok: print(f"  {res}\n  {o[-400:]}")
+            return ok
+        check("DbEncrypt : diff.db tenue en écriture au-delà du délai entre deux lots -> [ERREUR] + état reprenable, code 2, reprise (1.0.212)",_db_migrate_sqlite_error_wrapped)
+        def _db_migrate_cache_sqlite_three_paths():
+            """Revue 96 (row 8) : sqlite3.Error de _db_migrate_cache (cache.db verrouillée, disque plein) sur ses TROIS chemins —
+            diff.db absente (-y), diff.db déjà dans le mode cible, fin d'une migration (DbEncrypt et DbDecrypt) -> ligne [ERREUR]
+            exacte de la phase (diff.db absente / déjà chiffrée / déjà en clair, cache.db pas encore dans le mode cible), code 2,
+            jamais une exception ; erreur levée seulement par la fonction forcée (relance sans elle : terminé)."""
+            orig=BorgHelper._db_migrate_cache; res={}
+            def _boom(self,nick,direction,passphrase,cfg,debug=0): raise sqlite3.OperationalError('database is locked')
+            def run(fn,nick):
+                out=io.StringIO(); r='exception'
+                BorgHelper._db_migrate_cache=_boom
+                try:
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                        try: r=fn(nick,confirm=True)
+                        except Exception as e: r=f"exception {type(e).__name__}: {e}"
+                finally: BorgHelper._db_migrate_cache=orig
+                return r,out.getvalue()
+            L=lambda nick,verb,st: (f"  [ERREUR] {nick}: OperationalError: database is locked — {verb} interrompu, {st} : relancer {verb} -y "
+                                   f"pour reprendre  [borgHelper v{Version}]\n")
+            # 1. diff.db absente
+            b,_p=_db5_env('m96a'); dp=b.db.get_diff_db('m96a')
+            for suf in ('','-wal','-shm'):
+                if os.path.exists(dp+suf): os.unlink(dp+suf)
+            r,o=run(b.db_encrypt,'m96a')
+            if not (r==2 and L('m96a','DbEncrypt',"diff.db absente, cache.db pas encore dans le mode cible") in o and 'Traceback' not in o): res['absente']=(r,o[-300:])
+            # 2. migration (DbEncrypt) puis 3. déjà chiffrée ; DbDecrypt de même
+            b,_p=_db5_env('m96b')
+            r,o=run(b.db_encrypt,'m96b')
+            if not (r==2 and L('m96b','DbEncrypt',"diff.db déjà chiffrée (siv1), cache.db pas encore dans le mode cible") in o and _db5_mode(b,'m96b')=='siv1'):
+                res['migration']=(r,o[-300:],_db5_mode(b,'m96b'))
+            r,o=run(b.db_encrypt,'m96b')
+            if not (r==2 and 'déjà chiffrée (siv1)' in o and L('m96b','DbEncrypt',"diff.db déjà chiffrée (siv1), cache.db pas encore dans le mode cible") in o):
+                res['déjà siv1']=(r,o[-300:])
+            r2=_q_run(b.db_encrypt,'m96b',confirm=True)
+            if 'déjà chiffrée (siv1)' not in r2 or '[ERREUR]' in r2: res['relance']=r2[-300:]
+            r,o=run(b.db_decrypt,'m96b')
+            if not (r==2 and L('m96b','DbDecrypt',"diff.db déjà en clair, cache.db pas encore dans le mode cible") in o and _db5_mode(b,'m96b')=='plain'):
+                res['DbDecrypt']=(r,o[-300:],_db5_mode(b,'m96b'))
+            if res: print(f"  {res}")
+            return not res
+        check("DbEncrypt/DbDecrypt : sqlite3.Error de _db_migrate_cache sur ses trois chemins -> [ERREUR] de la phase, code 2 (revue 96)",_db_migrate_cache_sqlite_three_paths)
         def _db_rekey_cas_failure_wrapped():
             """Revue : le raise DbModeError sur échec de la CAS dans db_rekey était dans un try/finally
             SANS except -> remontait non attrapée au lieu du [ERREUR]/code 2 des autres refus de la même
@@ -31476,22 +32064,67 @@ _SENTRY_PATH_RE=re.compile(
     r"|(?:~|\.{1,2})?(?:/"+_SENTRY_PATH_SEG+r")+/?"                              # /abs/olu, ~/x, ./x
     r"|(?:"+_SENTRY_PATH_SEG+r"/)+(?:"+_SENTRY_PATH_SEG+r")?")                   # rel/at/if (groupe : jamais « +? » paresseux)
 _SENTRY_SECRET_ENVS=('BORG_PASSPHRASE','BORGHELPERC_RUNTIME_PASSPHRASE')
+# 1.0.212 (story 96) : ligne d'un fichier recopiée par configparser — ParsingError « [line  3]: 'BORG_PASSPHRASE hunter2\n' »,
+# MissingSectionHeaderError/MultilineContinuationError « line: 1\n'…' » ; revue 96 : valeur citée par une erreur d'interpolation
+# (« found: '%cd' », « bad interpolation variable reference '%(x' », « interpolation key 'x' … Raw value: '…' »). Masqué jusqu'à
+# la fin de la ligne, jamais jusqu'au guillemet fermant : sentry_sdk tronque le texte (512/1024) AVANT before_send.
+_SENTRY_RC_LINE_RE=re.compile(r"(\[line\s*\d+\]:[ \t]*|\bline:[ \t]*\d+\n|\bfound:[ \t]*|\bvariable reference[ \t]*|\binterpolation key[ \t]*"
+                              r"|\bRaw value:[ \t]*)[^\n]*")
 
 def _sentry_scrub_text(text):
     """Texte libre envoyé à Sentry (1.0.130, AD-15 étendu) : toute suite qui ressemble à un chemin (au moins
     un '/' : absolu, relatif, ~/, URL de dépôt ssh://…) devient '<chemin>', toute passphrase connue du
     processus devient '[redacted]'. Volontairement large (faux positifs acceptés : « a/b », dates
-    2026/09/27) — un chemin de sauvegarde ne doit jamais sortir du processus."""
+    2026/09/27) — un chemin de sauvegarde ne doit jamais sortir du processus. 1.0.212 (story 96) : ligne de fichier recopiée par
+    configparser (rc illisible : la passphrase d'une ligne sans « = » n'est pas celle de l'environnement) -> '[redacted]'."""
     if not isinstance(text,str) or not text: return text
+    text=_SENTRY_RC_LINE_RE.sub(lambda m: m.group(1)+"'[redacted]'",text)
     for env in _SENTRY_SECRET_ENVS:
         v=os.environ.get(env)
         if v and len(v)>=4: text=text.replace(v,'[redacted]')
     return _SENTRY_PATH_RE.sub('<chemin>',text)
 
+_SENTRY_ARGV_VALOPTS=set()   # revue 96, 3 (row 35) : options à valeur d'un autre programme (borgHelperWWW les ajoute : argparse)
+
+def _sentry_argv_valopts():
+    """Options à valeur : celles de la CLI (« : » de _CLI_SHORTOPTS, « = » de _CLI_LONGOPTS) et _SENTRY_ARGV_VALOPTS."""
+    v={'-'+c for i,c in enumerate(_CLI_SHORTOPTS) if c!=':' and _CLI_SHORTOPTS[i+1:i+2]==':'}
+    return v|{'--'+o[:-1] for o in _CLI_LONGOPTS if o.endswith('=')}|_SENTRY_ARGV_VALOPTS
+
+def _sentry_argv_scrub(av):
+    """Revue 96, 2 (row 19) : ligne de commande ajoutée aux événements par l'intégration argv de sentry_sdk (extra « sys.argv »), CLI et
+    borgHelperWWW — seuls les NOMS d'options restent : toute valeur remplacée par '[redacted]' (passphrase de -P, de Login -p lancé par
+    POST /login, clé d'API -K/--api-key de WWW, chemin de -C relatif ou absolu, nom de commande compris) ; programme -> son nom de
+    fichier. Revue 3 (row 35) : l'argument qui suit une option à valeur est TOUJOURS une valeur, même s'il commence par « - »
+    (« -P --secret ») ; groupe d'options courtes lu comme getopt (« -dPx » : -d, puis -P de valeur collée « x ») ; « --opt=v » ->
+    « --opt=[redacted] »."""
+    vo=_sentry_argv_valopts(); out=[]; nxt=False
+    for i,a in enumerate(av):
+        if not isinstance(a,str): out.append('[redacted]'); nxt=False; continue
+        if i==0: out.append(os.path.basename(a)); continue
+        if nxt: out.append('[redacted]'); nxt=False; continue
+        if a.startswith('--') and len(a)>2:
+            if '=' in a: out.append(a.split('=',1)[0]+'=[redacted]')
+            else: out.append(a); nxt=a in vo
+            continue
+        if a.startswith('-') and len(a)>1:
+            kept='-'
+            for j,ch in enumerate(a[1:],1):
+                kept+=ch
+                if '-'+ch in vo:
+                    if j<len(a)-1: kept+='[redacted]'
+                    else: nxt=True
+                    break
+            out.append(kept); continue
+        out.append('[redacted]')
+    return out
+
 def _sentry_before_send(event,hint):
     """before_send Sentry : purge chemins/passphrase/DEK des extra/contexts/frames (AD-15) et, depuis 1.0.130,
     des textes libres (message d'exception, message, logentry, fils d'Ariane)."""
     if 'extra' in event: event['extra']=_sentry_scrub(event['extra'])
+    av=(event.get('extra') or {}).get('sys.argv') if isinstance(event.get('extra'),dict) else None
+    if isinstance(av,list): event['extra']['sys.argv']=_sentry_argv_scrub(av)   # revue 96 : -P masqué, chemins (-C) aussi
     if 'contexts' in event: event['contexts']=_sentry_scrub(event['contexts'])
     exc=event.get('exception')
     if isinstance(exc,dict):
@@ -31672,6 +32305,7 @@ def _cli_guess_cmd(argv):
 
 def _cli_main():
     _READER_FAILED[0]=0   # 1.0.178 (A87) : appel en processus (selftest) : jamais l'erreur d'un appel précédent
+    _CLI_RC[0]=_CLI_RC_PATH[0]=None; _RC_SENTRY_SENT[0]=False   # revue 96 : de même, une fois par exécution
     sentryid=_sentry_dsn()
     if sentryid:   # 1.0.182 (story 48) : DSN vide (fichier neutre) -> aucun import de sentry_sdk
         _sentry_init(sentryid)
@@ -31740,6 +32374,14 @@ def _cli_main():
     except _CliArgError as e: _usage_error(cmd,str(e))
     _e=_cli_required(cmd,options)
     if _e: _usage_error(cmd,_e)
+    # 1.0.212 (story 96, décisions Q96-1/Q96-2) : rc illisible (syntaxe, section/clé en double, encodage, droits) dit une fois, avant
+    # toute lecture du rc (ALL de -j compris) : une ligne [ERREUR] avec le rc, le numéro de ligne et la nature — jamais le contenu de
+    # la ligne —, code 2 (la commande n'a rien fait). Avant : trace Python dont la dernière ligne recopiait la ligne brute
+    # (« BORG_PASSPHRASE hunter2 » sans « = ») vers stderr ET Sentry, code 1 ; rc 000 lu vide. Revue 96 (décision de l'utilisateur
+    # du 2026-10-22) : DSN configuré -> UN message Sentry masqué « rc illisible, ligne N : nature » (_rc_unreadable_exit).
+    _CLI_RC[0]=cfgfile_arg or '~/.borghelperrc'; _CLI_RC_PATH[0]=cfgfile_arg or os.path.expanduser("~/.borghelperrc")
+    _rce=_rc_check(cfgfile_arg or os.path.expanduser("~/.borghelperrc"))
+    if _rce: _rc_unreadable_exit(_rce[1])
     if cmd in _CLI_JSON_ONE_NICK and '-j' in options:
         _nl=nick if nick!='ALL' else (BorgRunner(cfgfile=cfgfile_arg).cfgreadnicks(debug) or '')
         if len(_nl.split(','))>1:
@@ -31838,6 +32480,9 @@ def _cli_main():
                     printer(f"[ERREUR] {type(_e).__name__} : {_e}"); _c=2; bh.db.clear_priority_lock(n)
                 except SchemaVersionError as _e:   # ensure_diff_db au début du Bkp (hors de son except interne)
                     printer(f"Erreur schéma DB : {_e}"); _c=1; bh.db.clear_priority_lock(n)
+                except configparser.InterpolationError as _e:   # revue 96, 2 (row 20, décision de l'utilisateur) : ce nick seul
+                    _c=_rc_nick_err(n,_e); bh.db.clear_priority_lock(n)
+                except configparser.Error: raise   # revue 96 (row 4) : tout le fichier illisible en cours -> _cli_entry, une ligne, code 2
                 except Exception as _e:   # défaut inattendu d'un nick : signalé, les suivants sauvegardés quand même
                     printer(f"[ERREUR] {n}: Bkp interrompu — {type(_e).__name__}: {_e}"); _c=1
                     _sentry_capture(_e,n)   # 1.0.176 (story 39, décision de l'utilisateur) : comme l'excepthook d'un nick seul
@@ -31851,7 +32496,8 @@ def _cli_main():
             nicks=nick
             for nick in nicks.split(','):
                 print(f"Prunning {nick}...")
-                ret=bh.prune(nick,debug=debug)
+                try: ret=bh.prune(nick,debug=debug)
+                except configparser.InterpolationError as _e: errcmd=max(errcmd,_rc_nick_err(nick,_e)); continue   # revue 96, 3 (row 31)
                 if ret['exitcode']!=0: _prune_fail(bh,nick,ret); errcmd=max(errcmd,_exit_code(ret['exitcode']))   # 1.0.172 : le pire des nicks
         else:
             print(f"Prunning {nick}...")
@@ -31864,7 +32510,8 @@ def _cli_main():
     elif cmd=='cacheinfo':
         bh.cache_info(nick,debug=debug)
     elif cmd=='cacheclean':
-        bh.cache_clean(nick,debug=debug)
+        _r=bh.cache_clean(nick,debug=debug)
+        if _r: sys.exit(_r)   # revue 96, 3 (row 31) : 2 si un nick a un rc illisible (« % »)
     elif cmd=='index':
         _force='-F' in options; _snaponly='-S' in options; _target=options.get('-A',None)
         _rebuild='--rebuild' in options   # 1.0.143 : fantôme (-F : jeté, reprise de zéro)
@@ -31895,9 +32542,11 @@ def _cli_main():
                 # envoyée à Sentry (décision de l'utilisateur, revue). Ctrl-C (130) arrête ; un seul nick : relancée (inchangé).
                 # Avant : boucle interrompue, nicks suivants jamais indexés, code de l'exception au lieu du pire.
                 if not _multi or not isinstance(_e,(Exception,SystemExit)) or (isinstance(_e,SystemExit) and _e.code==130): raise
+                if isinstance(_e,configparser.Error) and not isinstance(_e,configparser.InterpolationError): raise   # revue 96 : tout le fichier
                 if isinstance(_e,SystemExit):
                     r=_exit_code(_e.code) if isinstance(_e.code,int) else (0 if _e.code is None else 1)
                     if r and not isinstance(_e.code,int): printer(f"[ERREUR] {n}: {_e.code}")   # texte de sys.exit : jamais affiché sinon
+                elif isinstance(_e,configparser.InterpolationError): r=_rc_nick_err(n,_e)   # revue 96, 2 (row 20) : ce nick seul, code 2
                 else:
                     _nick_stop_msg(_e,_mark,True)   # « [ERREUR] Type : message »
                     r=2 if isinstance(_e,(DbKeyError,DbModeError,DbTamperError,DbCodecError)) else 1
@@ -31955,33 +32604,40 @@ def _cli_main():
         _dryrun='-D' in options
         _rc=0
         for n in nick.split(','):
-            _rc=max(_rc,bh.idxpurge(n,pattern=options.get('-x'),dryrun=_dryrun,debug=debug) or 0)   # 1.0.207 : 1 si rétention invalide
+            try: _rc=max(_rc,bh.idxpurge(n,pattern=options.get('-x'),dryrun=_dryrun,debug=debug) or 0)   # 1.0.207 : 1 si rétention invalide
+            except configparser.InterpolationError as _e: _rc=max(_rc,_rc_nick_err(n,_e))   # revue 96, 3 (row 31)
         if _rc: sys.exit(_rc)
     elif cmd=='dbencrypt':
         _dryrun='-D' in options; _yes='-y' in options; errcmd=0
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
-            r=bh.db_encrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
+            try: r=bh.db_encrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
+            except configparser.InterpolationError as _e: r=_rc_nick_err(n,_e)   # revue 96, 3 (row 31) : ce nick seul
             if r: errcmd=max(errcmd,r)   # 1.0.170 : le pire des nicks (comme Index, Bkp)
         sys.exit(errcmd)
     elif cmd=='dbdecrypt':
         _dryrun='-D' in options; _yes='-y' in options; errcmd=0
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
-            r=bh.db_decrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
+            try: r=bh.db_decrypt(n,dryrun=_dryrun,confirm=_yes,debug=debug)
+            except configparser.InterpolationError as _e: r=_rc_nick_err(n,_e)   # revue 96, 3 (row 31) : ce nick seul
             if r: errcmd=max(errcmd,r)   # 1.0.170 : le pire des nicks (comme Index, Bkp)
         sys.exit(errcmd)
     elif cmd=='dbrekey':
         _yes='-y' in options; errcmd=0
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
         for n in _nicks:
-            r=bh.db_rekey(n,confirm=_yes,debug=debug)
+            try: r=bh.db_rekey(n,confirm=_yes,debug=debug)
+            except configparser.InterpolationError as _e: r=_rc_nick_err(n,_e)   # revue 96, 3 (row 31) : ce nick seul
             if r: errcmd=max(errcmd,r)   # 1.0.170 : le pire des nicks (comme Index, Bkp)
         sys.exit(errcmd)
     elif cmd=='dbstatus':
         _nicks=nick.split(',') if nick and nick!='ALL' else bh.borg.cfgreadnicks(debug).split(',')
+        _dsrc=0
         for n in _nicks:
-            bh.db_status(n,debug=debug)
+            try: bh.db_status(n,debug=debug)
+            except configparser.InterpolationError as _e: _dsrc=_rc_nick_err(n,_e)   # revue 96, 3 (row 31) : ce nick seul, code 2
+        if _dsrc: sys.exit(_dsrc)
     elif cmd=='borgcleanup':   # 1.0.160 (story 23) : seule voie de suppression (jamais borgHelperWWW)
         # -D : aperçu explicite (comme IdxPurge/DbEncrypt), l'emporte sur -y — rien supprimé, aucune question
         sys.exit(bh.borg_cleanup(confirm='-y' in options and '-D' not in options,keys='--keys' in options,history='--history' in options))
@@ -31992,9 +32648,34 @@ def _cli_main():
     if cmd in _READER_CODE_CMDS and _READER_FAILED[0]: sys.exit(1)
 
 
-if __name__=='__main__':
+_CLI_RC=[None]   # rc de la CLI tel qu'affiché (-C donné, sinon ~/.borghelperrc) — posé par _cli_main avant toute lecture du rc
+_CLI_RC_PATH=[None]   # revue 96, 2 : son chemin réel (relu par _cli_entry sur une UnicodeDecodeError)
+_RC_SENTRY_SENT=[False]
+
+def _rc_unreadable_exit(txt):
+    """1.0.212 (story 96, Q96-1/Q96-2 ; revue 96, décision de l'utilisateur du 2026-10-22) : fichier rc illisible -> une ligne [ERREUR]
+    « <rc> illisible, ligne N : nature » (« illisible : nature » sans numéro), code 2 ; DSN configuré : UN message Sentry masqué
+    « rc illisible, <txt> » (_rc_sentry_once). Avant la revue : plus aucune alerte, un Bkp de cron s'arrêtait en silence."""
+    printer(f"[ERREUR] {_CLI_RC[0] or '~/.borghelperrc'} illisible{', ' if txt.startswith('ligne ') else ' : '}{txt}")
+    _rc_sentry_once(f"rc illisible, {txt}")
+    sys.exit(2)
+
+def _cli_entry():
+    """Point d'entrée de la CLI (corps de __main__, appelable par CodecSelfTest). Revue 96 (rows 2, 4) : erreur de configparser
+    sortie d'une commande — valeur à « % » (InterpolationError, levée à la lecture de la valeur : found: '…', Raw value: '…'),
+    rc modifié pendant un long Bkp/Index/-n ALL — même ligne [ERREUR] et code 2 que _rc_check, jamais la trace ni son texte."""
     try:
         _cli_main()
+    except configparser.InterpolationError as e:   # revue 96, 2 (row 20) : nick seul (ou commande d'un nick) — ligne du nick, code 2
+        _clear_exc_frames(e)
+        if getattr(e,'_rc_said',False): sys.exit(1)   # revue 96, 3 (row 32) : lecteur multi-nicks tous en échec — déjà dite, code des lecteurs
+        _rc_nick_err(getattr(e,'section',None) or '?',e); sys.exit(2)
+    except configparser.Error as e:
+        _clear_exc_frames(e); _rc_unreadable_exit(_rc_err_text(e))
+    except UnicodeDecodeError as e:   # revue 96, 2 (row 27) : rc devenu indécodable en cours — dit seulement si le rc l'est vraiment
+        _rce=_rc_check(_CLI_RC_PATH[0]) if _CLI_RC_PATH[0] else None
+        if not _rce: raise
+        _clear_exc_frames(e); _rc_unreadable_exit(_rce[1])
     except SchemaVersionError as e:
         printer(f"Erreur schéma DB : {e}"); sys.exit(1)
     except (DbKeyError,DbModeError,DbTamperError,DbCodecError) as e:
@@ -32002,3 +32683,6 @@ if __name__=='__main__':
         # altéré) : erreur de données/configuration, pas un bug — message clair, code 2, jamais de trace
         # Python ni d'événement Sentry (1.0.124 ; auparavant toutes les commandes de lecture plantaient).
         printer(f"[ERREUR] {type(e).__name__} : {e}"); sys.exit(2)
+
+if __name__=='__main__':
+    _cli_entry()

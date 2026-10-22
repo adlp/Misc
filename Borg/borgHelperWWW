@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 
 from fastapi import FastAPI, APIRouter, Header, HTTPException, Query, Request, Depends
 from fastapi.routing import APIRoute
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response, PlainTextResponse
 from pydantic import BaseModel, Field
 
 def _mdump(m):
@@ -77,13 +77,26 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          RK_DBERR, RK_UNVERIFIED, RK_UNCHECKABLE, RK_NOPASS,   # 1.31.15 : passphrase absente (story 77)
                          _ORPHAN_TXT,   # 1.31.14 : mention d'un borg create orphelin (_never_cache), source unique dans borgHelper
                          _MIGR_PENDING_TXT,   # 1.31.16 : mesures d'avant 1.0.139 pas encore migrées (_never_cache), borgHelper 1.0.201
+                         _rc_err_text,   # 1.34.1 (story 96) : erreur de lecture du rc sans le contenu de la ligne
                          _storage_merge,   # 1.33.0 (story 87a) : /storage multi-rc (mode dossier) — dépôts réunis, compté une fois
                          _state_load, _storage_alert_path)   # 1.34.0 (story 87b) : état d'alerte des stockages (CACHE_DIR de chaque rc)
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.34.0"
+WWW_VERSION="1.34.1"
+
+def _etxt_rc(x):
+    """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
+    interpolation d'une valeur à « % », encodage) par _rc_err_text (« ligne N : nature »), jamais son str() qui recopie la ligne
+    brute ou la valeur (« [line 3]: 'BORG_PASSPHRASE hunter2' », « found: '%cd' ») ; autre exception : telle quelle."""
+    return _rc_err_text(x) if isinstance(x,(configparser.Error,UnicodeDecodeError)) else x
+
+def _rc_unreadable_exit(path,x):
+    """1.34.1 (revue 96) : démarrage sur un fichier de conf ou un rc illisible -> une ligne [ERREUR] (forme de la CLI), jamais la
+    trace dont la dernière ligne recopiait la ligne du fichier dans le journal."""
+    t=_rc_err_text(x)
+    sys.exit(f"[ERREUR] {path} illisible{', ' if t.startswith('ligne ') else ' : '}{t}")
 # Garde de fermeture SQLite (story 81) appliquée à CE fichier : liste blanche nommée ({fonction: ouvertures non prouvées}) et
 # nombre EXACT d'ouvertures de production analysées (push_selftest exclu). Constantes de WWW (1.31.18, story 83) : lues par son push
 # selftest et, par littéral dans la source, par la garde de borgHelper — un changement de WWW seul ne touche plus borgHelper.
@@ -167,6 +180,8 @@ if __name__=='__main__':
                      "quitte (code 0 si tout OK, 1 sinon) — nécessite quand même -C/--cfgfile comme un "
                      "démarrage normal (le reste du module s'initialise identiquement)")
     _args=_p.parse_args()
+    # revue 96, 3 (row 35) : options à valeur de WWW (-K/--api-key…) — leur valeur masquée dans le sys.argv envoyé à Sentry
+    sys.modules['borgHelper']._SENTRY_ARGV_VALOPTS.update(o for a in _p._actions if a.nargs!=0 for o in a.option_strings)
     if _args.conf: os.environ['BORGHELPERWWW_CONF']=_args.conf
     if _args.cfgfile: os.environ['BORGHELPERWWW_CFGFILE']=_args.cfgfile
     # 1.32.0 (story 86) : la ligne de commande choisit le mode — un mode venu de l'environnement est écarté (les deux en CLI : refus)
@@ -236,8 +251,10 @@ if _conf_path:
     if not os.path.isfile(_conf_path):
         sys.exit(f"Fichier de conf borgHelperWWW introuvable : {_conf_path}")
     _cp=configparser.ConfigParser()
-    _cp.read(_conf_path)
-    _apply_conf_section(_cp['borgHelperWWW'] if _cp.has_section('borgHelperWWW') else _cp['DEFAULT'])
+    try: _cp.read(_conf_path)
+    except (configparser.Error,UnicodeDecodeError) as _x: _rc_unreadable_exit(_conf_path,_x)   # revue 96 : jamais la trace
+    try: _apply_conf_section(_cp['borgHelperWWW'] if _cp.has_section('borgHelperWWW') else _cp['DEFAULT'])
+    except configparser.Error as _x: _rc_unreadable_exit(_conf_path,_x)   # revue 96, 2 (row 21) : valeur à « % » (clé d'API…) sans trace
 
 # ── .borghelperrc[_borgHelperWWW] (spec-borghelperrc-www-section) ───────────────────
 # Dernier repli fichier, APRÈS borghelperwww.conf ci-dessus (_apply_conf_section ne comble que ce qui
@@ -281,11 +298,12 @@ if _www_cfgfile and os.path.isfile(_www_cfgfile):
     _cp2=configparser.ConfigParser()
     try:
         _cp2.read(_www_cfgfile)
-    except configparser.Error:
+    except (configparser.Error,UnicodeDecodeError):   # revue 96 : encodage de même (dit au démarrage, sans trace)
         pass  # fichier réellement invalide : cfgread() (borgHelper) donnera l'erreur détaillée plus bas
     else:
         if _cp2.has_section('_borgHelperWWW'):
-            _apply_conf_section(_cp2['_borgHelperWWW'],from_rc=True)
+            try: _apply_conf_section(_cp2['_borgHelperWWW'],from_rc=True)
+            except configparser.Error as _x: _rc_unreadable_exit(_www_cfgfile,_x)   # revue 96, 2 (row 21)
 
 def _env_bool(name,default):
     v=os.environ.get(name)
@@ -518,7 +536,7 @@ def _rc_parse_master(master,cfgdir):
         cp=configparser.ConfigParser(interpolation=None,default_section='\x00defaut-neutre'); cp.optionxform=str
         cp.read_string(txt,source=os.path.basename(master))
     except (OSError,UnicodeDecodeError,configparser.Error) as e:
-        return [],[f"maître illisible ({type(e).__name__} : {e})"]
+        return [],[f"maître illisible ({type(e).__name__} : {_rc_err_text(e)})"]   # revue 96 : jamais la ligne du maître
     if not cp.has_section(_RC_LIST_SECTION):
         return [],[f"section [{_RC_LIST_SECTION}] absente du maître (une ligne « fichier = préfixe » par rc servi, maître compris)"]
     creal=os.path.realpath(cfgdir)
@@ -572,7 +590,7 @@ def _rc_build(old=None):
     for prefix,path,fname in lst:
         try: cache=_rc_cache_dir(path)
         except (OSError,UnicodeDecodeError,configparser.Error) as e:
-            unav.append((prefix,f"{fname} (préfixe {prefix}) absent ou illisible ({type(e).__name__} : {e})"))
+            unav.append((prefix,f"{fname} (préfixe {prefix}) absent ou illisible ({type(e).__name__} : {_rc_err_text(e)})"))   # revue 96
             k=_RC['known_cache'].get(path)   # dernier CACHE_DIR connu de ce rc (même devenu indisponible) : toujours réservé
             if k is not None: caches.setdefault(k,fname)
             continue
@@ -590,7 +608,7 @@ def _rc_build(old=None):
         if e is None or e.path!=path or e.real!=os.path.realpath(path) or e.cache_dir!=cache:
             try: e=_RcEntry(prefix,path,fname,cache,BorgHelper(cfgfile=path))
             except (Exception,SystemExit) as x:
-                probs.append(f"{fname} (préfixe {prefix}) : CACHE_DIR {cache} inutilisable ({type(x).__name__} : {x})"); break
+                probs.append(f"{fname} (préfixe {prefix}) : CACHE_DIR {cache} inutilisable ({type(x).__name__} : {_etxt_rc(x)})"); break
         else: e.listed=fname
         entries[prefix]=e
     if probs:
@@ -813,6 +831,17 @@ def _rc_launch_check(e):
         raise HTTPException(503,detail=f"rc du préfixe {e.prefix} modifié depuis la liste servie (CACHE_DIR) — lancement refusé, "
                             "corriger le rc ou la liste")
 
+_CHILD_RC_SAID=set()
+
+def _log_child_rc(err,path):
+    """1.34.1 (revue 96, 3 row 34) : un borgHelper lancé par WWW n'envoie aucun message Sentry pour un rc illisible (sinon un par
+    requête) — WWW le dit dans SON journal, une fois par texte : ligne « [ERREUR] <rc> illisible… » du rc lancé ou « … : rc illisible :
+    … » d'un nick (jamais de contenu de ligne : texte de _rc_err_text)."""
+    for l in (err or '').splitlines():
+        l=re.sub(r'  \[borgHelper v[^]]*\]$','',l)
+        if l.startswith('[ERREUR] ') and (l.startswith(f"[ERREUR] {path} illisible") or ' : rc illisible : ' in l) and l not in _CHILD_RC_SAID:
+            _CHILD_RC_SAID.add(l); print(f"[WARN] borgHelper lancé : {l}",file=sys.stderr,flush=True)
+
 def _rc_scrub_all(text):
     """Chemins de TOUS les rc servis (lien et réel) remplacés par « <rc préfixe> » — messages d'erreur rendus par l'API."""
     if not DIR_MODE or not text: return text
@@ -893,7 +922,7 @@ def _bkp_status_watcher_pass_1():
             # passage — isolation par nick, le passage suivant réessaiera. SystemExit inclus (1.27.6) :
             # les ensure_*_db de borgHelper font sys.exit(1) sur une base occupée/corrompue ; hors de ce
             # filet, il traversait le watcher et arrêtait tout le serveur (boucle asyncio).
-            print(f"[watcher] nick={nick} erreur : {'sortie borgHelper (voir message ci-dessus)' if isinstance(e,SystemExit) else e}",
+            print(f"[watcher] nick={nick} erreur : {'sortie borgHelper (voir message ci-dessus)' if isinstance(e,SystemExit) else _etxt_rc(e)}",
                   file=sys.stderr,flush=True)
             continue
     _storage_alert_pass()   # 1.34.0 (story 87b) : alerte « stockage presque plein », une par franchissement et par stockage
@@ -978,7 +1007,7 @@ def _reconcile_run(nick,run_id):
             for r in sorted((r for r,v in runs.items() if v==RK_ABSENT),key=lambda r: r==run_id):
                 if errs and r==run_id: break
                 try: _reconcile_claim_error(nick,r)
-                except Exception as e: errs.append(f"{r[:8]} : {e}")
+                except Exception as e: errs.append(f"{r[:8]} : {_etxt_rc(e)}")   # revue 96, 2 (row 22)
             if errs: raise RuntimeError('; '.join(errs))
             if rs in (RK_CLOSED,RK_ABSENT,None): state='fait'   # None : ligne plus ouverte (fermée ailleurs)
             elif rs in (RK_BADEND,RK_UNCHECKABLE):   # figés : la fin viendra du délai (AD-7) — dit au journal
@@ -999,7 +1028,7 @@ def _reconcile_run(nick,run_id):
                   +(f" dans {nxt} s" if nxt else ' au passage suivant'),file=sys.stderr,flush=True)
     except (Exception,SystemExit) as e:
         state,nxt='à refaire',_RECONCILE_RETRY
-        print(f"[watcher] nick={nick} rapprochement du Bkp interrompu {run_id[:8]} impossible : {e}",file=sys.stderr,flush=True)
+        print(f"[watcher] nick={nick} rapprochement du Bkp interrompu {run_id[:8]} impossible : {_etxt_rc(e)}",file=sys.stderr,flush=True)
     finally:
         with _RECONCILE_LOCK: _RECONCILE[(nick,run_id)]={'state':state,'next':time.monotonic()+nxt}
 
@@ -1164,7 +1193,7 @@ def _storage_alert_pass():
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
     served=set(); keep={p_ for p_ in (_RC.get('suspended') or ())} if DIR_MODE else set()
     try: rcs=_storage_rcs()
-    except (Exception,SystemExit) as x: print(f"[watcher] alerte de stockage : rc servis : erreur {x}",file=sys.stderr,flush=True); return
+    except (Exception,SystemExit) as x: print(f"[watcher] alerte de stockage : rc servis : erreur {_etxt_rc(x)}",file=sys.stderr,flush=True); return
     if DIR_MODE:   # revue 87b (row 67) : rc listé mais indisponible (illisible, absent un instant) : ses réservations gardées
         try: keep|=set(_rc_state().unavailable)
         except (Exception,SystemExit): return
@@ -1220,10 +1249,10 @@ def _storage_alert_pass():
                                  f"— {n_sent} abonnement(s)",file=sys.stderr,flush=True)
         except (Exception,SystemExit) as x:
             keep.add(pfx)
-            print(f"[watcher] alerte de stockage{f' (rc {pfx})' if pfx else ''} : erreur {x}",file=sys.stderr,flush=True)
+            print(f"[watcher] alerte de stockage{f' (rc {pfx})' if pfx else ''} : erreur {_etxt_rc(x)}",file=sys.stderr,flush=True)
     if not DIR_MODE and not rcs: return   # row 67 : -C sans nick lu (rc vide ou illisible un instant) : jamais de purge
     try: _storage_claims_stale(served,keep)
-    except (Exception,SystemExit) as x: print(f"[watcher] alerte de stockage : purge des réservations : erreur {x}",file=sys.stderr,flush=True)
+    except (Exception,SystemExit) as x: print(f"[watcher] alerte de stockage : purge des réservations : erreur {_etxt_rc(x)}",file=sys.stderr,flush=True)
 
 def _storage_claims_stale(live,keep):
     """Revue 87b (row 63) : réservations (`<préfixe>|<storage_id>|<endpoint>`) d'un stockage absent de tout état servi (entrée
@@ -1389,7 +1418,7 @@ async def _bkp_status_watcher():
         try:
             await asyncio.to_thread(_bkp_status_watcher_pass)
         except (Exception,SystemExit) as e:
-            print(f"[watcher] erreur pendant l'interrogation bkp_status : {e}",file=sys.stderr,flush=True)
+            print(f"[watcher] erreur pendant l'interrogation bkp_status : {_etxt_rc(e)}",file=sys.stderr,flush=True)   # revue 96
         if time.monotonic()>=next_purge:
             next_purge=time.monotonic()+PUSH_PURGE_INTERVAL
             try:
@@ -1398,12 +1427,12 @@ async def _bkp_status_watcher():
                 n=await asyncio.to_thread(_push_prune_unknown_nicks)
                 if n: print(f"[watcher] push: {n} abonnement(s) nettoyé(s) de serveurs retirés du rc",file=sys.stderr,flush=True)
             except (Exception,SystemExit) as e:
-                print(f"[watcher] push: erreur de purge des abonnements expirés : {e}",file=sys.stderr,flush=True)
+                print(f"[watcher] push: erreur de purge des abonnements expirés : {_etxt_rc(e)}",file=sys.stderr,flush=True)
         if time.monotonic()>=next_schema:
             next_schema=time.monotonic()+SCHEMA_CHECK_INTERVAL
             try: await asyncio.to_thread(_schema_watch_pass)
             except (Exception,SystemExit) as e:
-                print(f"[watcher] erreur du contrôle de schéma : {e}",file=sys.stderr,flush=True)
+                print(f"[watcher] erreur du contrôle de schéma : {_etxt_rc(e)}",file=sys.stderr,flush=True)
         await asyncio.sleep(BKP_WATCHER_INTERVAL)
 
 class _ExitGuardRoute(APIRoute):
@@ -2029,7 +2058,10 @@ def _check_external_ops(request: Request):
     for n in _nick_list(target):
         try: cfg=_cfgread(n)
         except (Exception,SystemExit) as e:
-            raise HTTPException(500,detail=f"{n} : configuration illisible ({_rc_scrub_all(str(e))}) — action refusée")   # row 8 : aucun chemin de rc
+            # 1.34.1 (story 96) : erreur de lecture du rc -> « ligne N : nature » (_rc_err_text) ; avant : texte de configparser, qui
+            # recopie la ligne brute (« BORG_PASSPHRASE hunter2 » sans « = ») dans la réponse HTTP
+            why=_rc_err_text(e) if isinstance(e,(configparser.Error,OSError,UnicodeDecodeError)) else _rc_scrub_all(str(e))
+            raise HTTPException(500,detail=f"{n} : configuration illisible ({why}) — action refusée")   # row 8 : aucun chemin de rc
         if cfg is None: continue   # nick inconnu (Login d'un nouveau nick) : la route répond comme avant
         try: ok=op_allowed(cfg,op,n)
         except SystemExit: ok=False   # EXTERNAL invalide (code 2 en CLI) : jamais d'action à l'aveugle
@@ -2063,7 +2095,8 @@ class CommandResult(BaseModel):
 # cache : si identique, le résultat mis en cache est restitué sans relancer borgHelper.
 # 1.32.0 (story 86) : mode dossier — BorgHelper du MAÎTRE, pour les bases propres à WWW seulement (scopecache.db, push.db, préférences
 # push : dossier et préfixe du maître) ; tout le reste passe par _bhn/_cfgread (garde AST du push selftest : liste blanche)
-_bh_paths=_RC['state'].master.bh if DIR_MODE else BorgHelper(cfgfile=CFGFILE)
+try: _bh_paths=_RC['state'].master.bh if DIR_MODE else BorgHelper(cfgfile=CFGFILE)
+except (configparser.Error,UnicodeDecodeError) as _x: _rc_unreadable_exit(CFGFILE,_x)   # revue 96 : démarrage -C, jamais la trace
 
 def _validate_groups_paths_startup():
     """Fail-fast à l'import : valide la syntaxe GROUPS_PATHS de chaque nick connu (repli [DEFAULT]
@@ -2080,7 +2113,9 @@ def _validate_groups_paths_startup():
         except ValueError as e:
             sys.exit(f"Configuration invalide — GROUPS_PATHS sur le nick '{n}' : {e}")
 
-_validate_groups_paths_startup()
+try: _validate_groups_paths_startup()
+except (configparser.Error,UnicodeDecodeError) as _x:   # revue 96 : rc illisible (ou valeur à « % ») au démarrage
+    _rc_unreadable_exit(getattr(_x,'source',None) or (MASTER if DIR_MODE else CFGFILE),_x)
 _RESPONSE_CACHE={}
 # AD-13 : la clé inclut un condensé salé (sel aléatoire par processus, jamais persisté) de la
 # passphrase de la requête, jamais la passphrase en clair — deux passphrases différentes pour le
@@ -3487,6 +3522,7 @@ def _exec_dir(cmd,nick,extra_args,passphrase=None):
             rest=', '.join(g[0].prefix for g in groups[k+1:]) or 'aucun'
             parts.append((e,mp,124,'',f"[ERREUR] Commande {cmd} : timeout après {TIMEOUT}s sur ce rc — arrêtée ; rc non lancés : {rest}\n"))
             break
+        _log_child_rc(proc.stderr,e.path)   # revue 96, 3 (row 34)
         parts.append((e,mp,proc.returncode,_rc_scrub_out(proc.stdout or '',e),_rc_scrub(proc.stderr or '',e)))
     r=_merge_parts(cmd,parts,duidx,json_req=bool(fl&{'-j','-R'}))
     if skipped: r.stderr=''.join(f"{m}\n" for m in skipped)+(r.stderr or '')
@@ -3514,6 +3550,7 @@ def _exec_borghelper(cmd: str, nick: Optional[str], extra_args, passphrase: Opti
         proc=_run_group(argv,TIMEOUT,env)   # 1.31.1 (A91) : au délai, borgHelper ET son borg arrêtés (groupe)
     except subprocess.TimeoutExpired:
         raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
+    _log_child_rc(proc.stderr,argv[argv.index('-C')+1] if '-C' in argv else None)   # revue 96, 3 (row 34) : rc de l'argv (garde AST : jamais CFGFILE ici)
     return CommandResult(exitcode=proc.returncode,stdout=proc.stdout,stderr=proc.stderr)
 
 class _PartialLaunch(Exception):
@@ -4449,6 +4486,17 @@ async def _ui_fallback_404(request: Request, exc):
             and 'text/html' in request.headers.get('accept','')):
         return HTMLResponse(_UI_HTML,status_code=404)
     return await _default_http_exception_handler(request,exc)
+
+@app.exception_handler(configparser.Error)
+async def _rc_unreadable(request: Request, exc):
+    """1.34.1 (story 96) : rc devenu illisible pendant une requête (lecture du rc dans le serveur, hors d'un `except` de la route) —
+    réponse inchangée (500 « Internal Server Error », comme l'exception non rattrapée d'avant), mais une seule ligne au journal :
+    rc, « ligne N : nature », jamais la trace dont la dernière ligne recopiait la ligne brute du rc (passphrase d'une ligne sans
+    « = »)."""
+    src=getattr(exc,'source',None)
+    print(f"[ERREUR] rc illisible pendant {request.method} {request.url.path}{f' ({src})' if src else ''} : {_rc_err_text(exc)}",
+          file=sys.stderr,flush=True)
+    return PlainTextResponse("Internal Server Error",status_code=500)
 
 # Service Worker des notifications push (spec-push-ui-prefs-json) : fichier statique séparé, à côté de
 # l'UI. Servi à la RACINE (portée par défaut = toute l'origine) et sur `app`, jamais derrière
@@ -6443,6 +6491,46 @@ def push_selftest():
                     return (len(api_routes)>40 and unguarded==[] and bad.status_code==500 and 'borgHelper' in bad.json()['detail']
                             and after.status_code==200)
                 check("routes : sys.exit de borgHelper -> 500, serveur maintenu ; toutes les routes protégées",_routes_guarded)
+                def _rc_unreadable_route():
+                    """1.34.1 (story 96, revue 96 row 10) : erreur de configparser non rattrapée dans une route (rc devenu illisible)
+                    -> 500 « Internal Server Error » inchangé (_rc_unreadable), une seule ligne au journal « [ERREUR] rc illisible
+                    pendant GET <route> (<rc>) : ligne 3 : « clé = valeur » attendu », jamais la ligne brute (secret) ni une trace."""
+                    S='s96-www-hunter2'
+                    try: configparser.ConfigParser().read_string(f"[DEFAULT]\nA=1\nBORG_PASSPHRASE {S}\n",source='/r/rc')
+                    except configparser.Error as x: pe=x
+                    else: return False
+                    err=io.StringIO()
+                    with mock.patch(f"{__name__}._nick_list",side_effect=pe),contextlib.redirect_stderr(err):
+                        bad=client.get(f"{P}/access",headers=H)
+                    e=err.getvalue()
+                    ok=(bad.status_code==500 and bad.text=='Internal Server Error' and S not in bad.text+e and 'Traceback' not in e
+                        and e.count('[ERREUR]')==1
+                        and f"[ERREUR] rc illisible pendant GET {P}/access (/r/rc) : ligne 3 : « clé = valeur » attendu\n" in e)
+                    if not ok: print(f"  {bad.status_code} {bad.text[:200]!r} {e[-600:]!r}")
+                    return ok
+                check("routes : rc illisible (configparser) -> 500 inchangé, une ligne [ERREUR] au journal, jamais la ligne du rc ni de trace (1.34.1)",_rc_unreadable_route)
+                def _rc_unreadable_watcher():
+                    """1.34.1 (story 96, mutations row 39) : une passe du watcher (mode -C) sur un rc sans « = » -> ligne « [watcher] erreur
+                    pendant l'interrogation bkp_status : ligne 3 : « clé = valeur » attendu », jamais la ligne du rc ni le secret. Lecture du
+                    rc simulée (_nick_list lève la vraie ParsingError) ; purge, schéma et attente factices ; la boucle s'arrête à son attente."""
+                    S='s96-watcher-hunter2'
+                    try: configparser.ConfigParser().read_string(f"[DEFAULT]\nA=1\nBORG_PASSPHRASE {S}\n",source='/r/rc')
+                    except configparser.Error as x: pe=x
+                    else: return False
+                    class _Stop(Exception): pass
+                    async def _sleep(*a,**k): raise _Stop()
+                    err=io.StringIO(); stopped=False
+                    with mock.patch(f"{__name__}._nick_list",side_effect=pe),mock.patch(f"{__name__}._push_purge_expired",lambda: 0), \
+                         mock.patch(f"{__name__}._push_prune_unknown_nicks",lambda: 0),mock.patch(f"{__name__}._schema_watch_pass",lambda: {}), \
+                         mock.patch.object(asyncio,'sleep',_sleep),contextlib.redirect_stderr(err):
+                        try: asyncio.run(_bkp_status_watcher())
+                        except _Stop: stopped=True
+                    e=err.getvalue()
+                    ok=(stopped and "[watcher] erreur pendant l'interrogation bkp_status : ligne 3 : « clé = valeur » attendu\n" in e
+                        and S not in e and 'BORG_PASSPHRASE' not in e and 'Traceback' not in e)
+                    if not ok: print(f"  {stopped} {e[-600:]!r}")
+                    return ok
+                check("watcher : rc illisible (configparser) -> ligne « ligne N : nature » au journal, jamais la ligne du rc ni le secret (1.34.1)",_rc_unreadable_watcher)
                 def _lifespan_runs():
                     """1.31.4 (story 57) : démarrage/arrêt par le lifespan du routeur (ni `on_event`, déprécié en fastapi 0.142, ni
                     `FastAPI(lifespan=)`, absent de 0.63) — le lifespan RÉELLEMENT posé sur app.router démarre le watcher (tâche
@@ -9898,7 +9986,9 @@ print('S86JSON:'+json.dumps(out,ensure_ascii=False))
                     and h['retrait']==[w2,0,[]] and h['double']==[w2,1,[]] and dm['keep_failed'] is True
                     and h['retour']==[base+['mail:db2'],1,[]]   # mail.rc revenu : sa section [_borgHelperWWW] redite
                     and isinstance(dm['illisible'],list) and dm['illisible'][:4]==[base[:2],'MissingSectionHeaderError',200,500]
-                    and '<rc mail>' in dm['illisible'][4] and rd not in dm['illisible'][4] and dm['watched'] is True
+                    # 1.34.1 (story 96) : détail « ligne N : nature » (_rc_err_text), plus le texte de configparser (chemin, ligne brute)
+                    and dm['illisible'][4]=='mail:db : configuration illisible (ligne 1 : « [section] » attendu avant la première clé) — action refusée'
+                    and rd not in dm['illisible'][4] and dm['watched'] is True
                     and h['absent']==[w2,1,['mail']] and dm['keep_absent']==[True,True,False,False]
                     and h['revenu']==[base,1,[]]   # mail.rc remis dans son état de départ (sans db2) après le contrôle « illisible »
                     and h['reattrib']==[w2+['mail:x'],2,[]] and dm['susp']==['préfixe réattribué',True,['mail']]

@@ -1,5 +1,71 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.212, borgHelperWWW 1.34.1 — Fichier de conf illisible sans secret — 2026-10-22
+
+Chantier « reconstruction progressive », story 96 (reports 87a et 84 ; décisions de l'utilisateur du 2026-10-22 : Q96-1, Q96-2,
+revue 96 rows 6 et 7 ; mesures sur les binaires finaux, HOME de bac, borg seulement par un BORG_EXE de bac, faux DSN Sentry local —
+`work/s96/mesure-avant-final.txt` (avant), `mesure-final2.txt`, `mesure-final2-extra.txt` (Status d'un nick indexé, Login -p,
+`-n ALL` avec un nick fautif), `bkp-all-final2.txt`, `ok-identique-final2.txt`, `www-C-final2.txt`, `www-dir-final2.txt`,
+`conf-pct-final2.txt`, `sect-pct-final2.txt`, `dbenc-{mid,depart,cache}-final2.txt`, `security-{avant,apres}-final2.txt` ; revue 3,
+chemins changés : `mesure-final3.txt`, `boucles-final3.txt`, `www-C-final3.txt`, `security-{avant,apres}-final3.txt` : 36 entrées,
+0 reste, dossiers borg et borghelper de l'utilisateur inchangés).
+
+- **borgHelper** : fichier de conf illisible — ligne sans `=`, clé avant la première section, section en double, clé en double
+  (la CLI compare les clés sans la casse), encodage invalide, BOM, sans droit de lecture, dossier, dossier parent non traversable —
+  dit une fois, avant toute commande (après les arguments ; CodecSelfTest et PerfBench exceptés) : `[ERREUR] ~/.borghelperrc
+  illisible, ligne 3 : « clé = valeur » attendu` (ou `… illisible : permission refusée`), **code 2** (Q96-1) ; fichier devenu
+  illisible (syntaxe) pendant une longue commande : même ligne, la commande s'arrête. Valeur à `%` mal formée (`ab%cd`, `%(x)s`,
+  référence circulaire), qui ne se voit qu'à la lecture de la valeur : **par nick** (décision de l'utilisateur, revue 2) —
+  `[ERREUR] n2 : rc illisible : « % » à doubler dans BORG_PASSPHRASE` (ou `référence %(…)s circulaire dans …`), les autres nicks
+  traités (Bkp, Index, Prune, Report, Report -o, DbEncrypt/DbDecrypt/DbRekey, DbStatus, Key, CacheClean, IdxPurge, Status, lecteurs
+  multi-nicks), code = le pire (lecteurs : 1, même tous en échec) ; valeur à `%` lue par borg (`BORG_PASSPHRASE`, `BORG_REPO`…) :
+  de même, BkpReconcile compris. Jamais le contenu d'une ligne, une valeur
+  ou le fragment cité par configparser. Sentry (DSN configuré, décision row 6) : **un** message masqué par exécution, `rc
+  illisible, ligne N : nature` ou `rc illisible, « % » à doubler dans <CLÉ>`, seulement si sentry_sdk est chargé et un client
+  actif (flush 1 s) ; jamais sous borgHelperWWW (qui l'écrit une fois dans son journal). Status : l'erreur d'un nick indexé dont la passphrase porte un `%` dit la nature (avant : `found: '%…'` ou
+  `Raw value: '…'`, passphrase comprise, en texte et en `-j`) ; `index-last.json` d'avant 1.0.212 masqué à la lecture. Mesuré (12 rc illisibles × 8 commandes) : avant, 68 traces, 21 sorties portant la
+  passphrase, 20 envois Sentry la portant ; après, 0 trace, 0 sortie, 90 messages Sentry reçus (un par commande arrêtée, témoin
+  positif), 0 portant la passphrase. Avant aussi : un rc sans droit de lecture, un dossier ou un rc derrière un dossier non
+  traversable était lu vide (« Ce serveur est inconnu », code 3 ; Status, DbStatus, IdxTop en code 0). Rc valide : sorties
+  identiques (Status, Report -n ALL, DbStatus, IdxTop -j, Storage -j, DbEncrypt -D) ; rc absent : inchangé. Storage en CLI : la
+  ligne `[ERREUR]` en code 2 (avant : trace, ou `errors['*']` en code 1 pour un rc sans droit de lecture) ; la bibliothèque garde
+  `errors['*']`.
+- **borgHelper** : Sentry — dans tout texte envoyé, une ligne de fichier ou une valeur recopiée par configparser (`[line N]: …`,
+  `line: N` puis la ligne, `found: …`, `variable reference …`, `interpolation key …`, `Raw value: …`) est masquée jusqu'à la fin de
+  la ligne (sentry_sdk tronque avant le filtre : un repr coupé n'a pas de guillemet fermant) ; ligne de commande jointe par
+  sentry_sdk (`sys.argv`, CLI et borgHelperWWW) : seuls les noms d'options restent, toute valeur `[redacted]`, même commençant
+  par `-` (avant : en clair
+  dans chaque événement — passphrase de `-P` et de Login `-p`, clé d'API `-K`/`--api-key` de WWW, chemin de `-C`).
+- **borgHelper** : DbEncrypt/DbDecrypt — erreur SQLite (verrou tenu par un autre processus au-delà du délai, disque plein, E/S) :
+  ligne `[ERREUR]` avec l'état reprenable de la phase, **code 2** (décision row 7 ; aussi avant le départ : ouverture, en-tête,
+  comptes — « non commencé, rien changé » ; base corrompue ou occupée au contrôle de schéma : message et code 1 inchangés) — lots : « aucun lot partiel écrit : relancer
+  DbEncrypt -y pour reprendre au dernier lot validé » ; cache.db (aussi sur les relances « déjà chiffrée » et diff.db absente) :
+  « diff.db déjà chiffrée (siv1), cache.db pas encore dans le mode cible : relancer DbEncrypt -y pour reprendre ». Avant : trace,
+  code 1. Mesuré : verrou pris entre deux lots (curseur `snapshot_file#2000`, 75 s) -> 60 s puis la ligne, base `migrating` au
+  curseur, relance -> `siv1` ; verrou pris avant le départ -> `DbModeError : en-tête verrouillé (database is locked) — relancer`,
+  code 2, rien changé (déjà ainsi avant) ; cache.db tenue -> ligne de la phase cache en 7 s, relance -> cache.db `siv1`.
+- **borgHelperWWW** : rc illisible — action (`/bkp`, `/prune`, `/init`, `/restore`, `/delbkp` sur un nick) : 500 « configuration
+  illisible (ligne N : nature) » au lieu du texte de configparser (ligne brute dans la réponse HTTP) ; erreur de configparser non
+  rattrapée dans une route : réponse inchangée (500 « Internal Server Error »), une ligne `[ERREUR] rc illisible pendant <route>
+  (<rc>) : ligne N : nature` au journal au lieu de la trace ; watcher (bkp_status, push, schéma, stockage, rapprochement, par nick),
+  mode dossier (maître ou rc listé illisible) : « ligne N : nature » ; démarrage sur un rc ou un `borghelperwww.conf` illisible :
+  `[ERREUR] <fichier> illisible, ligne N : …` et arrêt, sans trace (valeur à `%` d'un réglage de `borghelperwww.conf` ou de
+  `[_borgHelperWWW]` comprise : avant, trace avec la clé d'API). Mesuré (rc sans `=`, sans section, `%(x)s` ; chaque route de
+  l'openapi sauf `{…}` et `/api/login`, nick et ALL, watcher à 3 s) : avant, 34 réponses sur 120 portaient la ligne, journal 62
+  occurrences du secret et 186 traces ; après, en `-C` et en mode dossier, 0 réponse sur 192, journal 0 occurrence et 0 trace.
+- Contrôles : « rc illisible par nick (valeur à « % ») : … » (revue 2 : Bkp, Index, Report, Report -o, Status nick indexé et -j,
+  IdxTop -n ALL, index-last ancien) ; « CLI rc illisible : … (1.0.212) » (égalité exacte, BorgHelper() jamais construit, rc par défaut, dossier, parent fermé, BOM, valeur à `%`,
+  CodecSelfTest exempté, Sentry neutralisé localement), « CLI rc illisible : DSN configuré -> un message Sentry masqué … »,
+  « Sentry before_send : ligne de fichier recopiée par configparser … » (texte tronqué, interpolation, sys.argv), « DbEncrypt :
+  diff.db tenue en écriture … code 2 … », « DbEncrypt/DbDecrypt : sqlite3.Error de _db_migrate_cache sur ses trois chemins … » ;
+  « Storage : rc illisible » renommé (« -> erreur « * », code 1 (bibliothèque : syntaxe, droits) ; CLI : [ERREUR], code 2 ») et
+  cas des droits de la bibliothèque revérifié ; push selftest : « routes : rc illisible (configparser) -> 500 inchangé, une ligne
+  [ERREUR] au journal … (1.34.1) », et « mode dossier : rechargement à chaud … » attend le détail exact du 500 d'une action ;
+  revue 3 : « rc illisible par nick » couvre aussi Prune, DbStatus, DbEncrypt -D -n ALL, BkpReconcile (borg list), `%` dans
+  BORG_REPO (Report), syntaxe pendant Status, lecteur dont tous les nicks échouent ; « Liens physiques » remet le décor qp/qe ;
+  série de mutations : « … DSN configuré … » exige UN message pour deux nicks fautifs dans la même exécution, push selftest
+  « watcher : rc illisible (configparser) -> ligne « ligne N : nature » au journal … (1.34.1) ».
+
 ## borgHelper 1.0.211 — Liens physiques et « Inchangés » — 2026-10-22
 
 Chantier « reconstruction progressive », story 88 (D204 ; mesures du 2026-10-21, borg 1.2.6 — `work/s88/m2.out` à `m12.out`,

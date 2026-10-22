@@ -1551,6 +1551,22 @@ autour du traitement de la route, dépendances comprises. Intercepter plus haut 
 exécute la route dans une tâche séparée. Toute nouvelle route déclarée sur `app` ou `router` hérite de la
 protection ; `push_selftest` vérifie qu'aucune route n'y échappe.
 
+**`configparser.Error` dans une route (1.34.1, story 96, revue 96).** Rc devenu illisible pendant que le serveur tourne : les
+lectures du rc dans le processus (`_cfgread`, `cfgreadnicks`, `BorgHelper()` d'un rc…) levaient l'erreur de configparser jusqu'à
+uvicorn — 500 « Internal Server Error » et, au journal, la trace dont la dernière ligne recopiait la ligne brute du rc (baseline,
+`www-avant`, deux rc cassés × 120 appels : 186 traces, 62 occurrences du secret). `@app.exception_handler(configparser.Error)`
+(`_rc_unreadable`) garde la même réponse et n'écrit qu'une ligne : `[ERREUR] rc illisible pendant <méthode> <route> (<rc>) : ligne
+N : nature` (`_rc_err_text`). `_etxt_rc(x)` (erreur de configparser ou d'encodage -> `_rc_err_text`, autre : telle quelle) passe
+dans chaque `print` du watcher (bkp_status, push, schéma, alerte de stockage, rapprochement, par nick) et dans les messages du mode
+dossier (maître illisible, rc listé « absent ou illisible », CACHE_DIR inutilisable) ; le détail du 500 « configuration
+illisible » de `_check_external_ops` (actions) de même. Démarrage (`borghelperwww.conf`, `BorgHelper(CFGFILE)` en `-C`,
+`_validate_groups_paths_startup`, revue 2 : `_apply_conf_section` de `borghelperwww.conf` et de `[_borgHelperWWW]`, qui
+interpole chaque réglage — valeur à `%`, clé d'API comprise) : `_rc_unreadable_exit` — `sys.exit('[ERREUR] <fichier> illisible,
+ligne N : …')`, jamais la trace. Revue 2 : l'échec de rapprochement du watcher (erreurs réunies dans un `RuntimeError`) passe aussi
+chaque erreur par `_etxt_rc`. Mesure finale (`work/s96/www_e2e_final.py`, `-C` et dossier, HOME de bac, rc sans `=`, sans section, `%(x)s`, watcher à 3 s,
+chaque route de l'openapi sauf `{…}` et `/api/login`, nick et ALL) : 0 réponse sur 192 et 0 occurrence ni trace au journal, par
+mode ; démarrage refusé en une ligne. Contrôle : push selftest « routes : rc illisible (configparser) -> 500 inchangé … ».
+
 **Pourquoi `VACUUM INTO` et pas `VACUUM` ?** `VACUUM` écrit son fichier temporaire dans `/tmp`, qui peut être sur une partition séparée et pleine même si le filesystem du `diff.db` a de l'espace. `VACUUM INTO chemin` crée la copie compacte dans le même répertoire, utilisant l'espace libre du bon filesystem.
 
 **Préfixe vs glob :**
@@ -2414,6 +2430,59 @@ couperait `x.conf` en `x`). Non couvert : les événements de **performance** (`
 invocation), qui ne passent pas par `before_send` ; sans intégration automatique, ils ne portent que le nom de la
 transaction. `CodecSelfTest` couvre les deux niveaux (clés sensibles, texte libre).
 
+**Ligne de rc recopiée par configparser (1.0.212, story 96, revue 96).** Le texte d'une `ParsingError` recopie chaque ligne
+fautive (`[line  3]: 'BORG_PASSPHRASE hunter2\n'`), celui d'une `MissingSectionHeaderError` (et de `MultilineContinuationError`,
+3.13+) la première (`line: 1` puis la ligne), ceux des erreurs d'interpolation la valeur (`found: '%cd'`, `bad interpolation
+variable reference '%(x'`, `interpolation key 'x' … Raw value: 'ab%(x)scd'`) : une passphrase écrite sans `=` ou avec `%` n'est
+pas celle de l'environnement, le masque par valeur ne la voit pas. `_sentry_scrub_text` remplace d'abord tout ce qui suit ces
+marqueurs **jusqu'à la fin de la ligne** (`_SENTRY_RC_LINE_RE`) par `'[redacted]'` : sentry_sdk sérialise (et tronque à 512/1024
+caractères) AVANT `before_send`, un repr coupé n'a pas de guillemet fermant. `_sentry_argv_scrub` traite l'extra `sys.argv` de
+l'intégration argv (CLI et borgHelperWWW, même `before_send`) : seuls les noms d'options restent — tout argument qui n'est pas une
+option devient `'[redacted]'` (valeurs de `-P`, de Login `-p`, de `-K`, chemin de `-C`, nom de commande), `--opt=v` ->
+`--opt=[redacted]`, groupe d'options courtes lu comme getopt (`-dPx` -> `-dP[redacted]`), l'argument qui suit une option à
+valeur toujours masqué même s'il commence par `-` (options à valeur : `_CLI_SHORTOPTS`/`_CLI_LONGOPTS`, et
+`_SENTRY_ARGV_VALOPTS` que borgHelperWWW remplit avec ses options argparse), programme -> son nom de fichier. Filet : la CLI ne laisse plus sortir ces exceptions (voir « Fichier de conf illisible »).
+
+**Fichier de conf illisible (1.0.212, story 96, reports 87a et 84 ; revue 96).** `_cli_main` pose `_CLI_RC` (rc tel
+qu'affiché : `-C` donné, sinon `~/.borghelperrc`) puis appelle `_rc_check(rc)` une fois, après les contrôles d'arguments et avant
+toute lecture du rc (le `cfgreadnicks` de `-j` sur `ALL`, `BorgHelper()`) ; CodecSelfTest et PerfBench, qui ne le lisent pas,
+partent avant. `_rc_check` lit comme `BorgHelper.__init__` — `ConfigParser()` par défaut (clés sans casse ; `cfgread` garde la
+casse), encodage de `configparser.read` (`io.text_encoding(None)`) — mais ouvre le fichier lui-même : `configparser.read` avale
+l'`OSError` (rc 000 lu vide). Seuls `FileNotFoundError`/`NotADirectoryError` valent « absent » (comportement d'avant) ; toute autre
+`OSError` (droits, dossier, parent non traversable) est dite. BOM UTF-8 en tête : `_RC_BOM_TXT`. Pas d'interpolation ici
+(`STORAGE_ALERT=90%` est lu brut exprès) : une valeur à `%` lève `InterpolationError` à sa lecture, dans la commande. `_rc_err_text`
+rend « ligne N : nature » (numéro de `lineno`, du premier élément de `ParsingError.errors`, ou pour `UnicodeDecodeError` de la
+première ligne dont les octets ne se décodent pas) ou la nature seule (interpolation : `« % » à doubler (écrire %%)` ; `OSError` :
+`_RC_OSERR` par `errno`, sinon `strerror`) — jamais le contenu d'une ligne, ni sa valeur, ni nom de section ; interpolation : la
+clé seule, `« % » à doubler dans <CLÉ>` ou, pour `InterpolationDepthError` (auto-référence), `référence %(…)s circulaire dans
+<CLÉ>`. `_rc_unreadable_exit(txt)` affiche `[ERREUR] <rc> illisible, ligne N : nature` et sort en 2 ; `_rc_sentry_once(txt)` envoie
+au plus un message Sentry par exécution (`_RC_SENTRY_SENT`, empreinte `borghelper-rc-illisible`), seulement si `sentry_sdk` est
+déjà chargé et qu'un client est actif (jamais d'import sans DSN), flush 1 s. `_cli_entry` (corps de `__main__`, appelable par
+CodecSelfTest) prend une `configparser.Error` sortie d'une commande : erreur de fichier (syntaxe relue en cours) -> même ligne,
+code 2 ; `InterpolationError` d'une commande d'un nick -> `_rc_nick_err(section, e)` ; `UnicodeDecodeError` -> le rc est relu par
+`_rc_check`, ligne `[ERREUR]` seulement s'il est vraiment indécodable, sinon relancée. **Interpolation par nick (revue 96, 2 ;
+décision de l'utilisateur du 2026-10-22)** : une valeur à `%` mal formée ne concerne qu'un nick — `_rc_nick_err(nick,e)` imprime
+`[ERREUR] <nick> : rc illisible : <nature>`, envoie le message Sentry (une fois) et rend 2 ; les boucles gardent leur isolation
+(stories 30, 39) : Bkp (`except configparser.InterpolationError` avant `except Exception`), Index (branche dédiée, pas de
+`_sentry_capture`), `report`/`report_offline` jumelles (ligne du nick « ⚠ rc illisible : … », code 2 ; revue 3 : les lectures
+d'avant le rapport — `cfgreaded`, verrous qui lisent BORG_REPO — sont dans l'isolation, `repoLocalAbsent` n'est jamais relu
+pour une erreur d'interpolation), `_PerNick` (lecteurs : `InterpolationError` ajoutée à `_NICK_STOP`, `_nick_stop_msg` la dit et
+la marque `_rc_said` — tous les nicks en échec : `done()` la relance, `_cli_entry` ne la redit pas et sort en 1, le code des
+lecteurs), Status (`error` = `_etxt(e)`) ; revue 3 (row 31) : boucles de `_cli_main` de Prune, DbEncrypt/DbDecrypt/DbRekey,
+DbStatus, IdxPurge et celles de `key()` et `cache_clean()` (rendent le pire code ; CacheClean sort en 2). Une autre
+`configparser.Error` y est relancée (tout le fichier) — Status et `_storage_collect` compris (revue 3, row 33).
+`_borg_child_env` relève l'`InterpolationError` d'une clé borg en `_RcValueError` (revue 3, row 29 : tout site `boex`,
+BkpReconcile compris, jamais la valeur). `_etn(e)` (« rc illisible : nature » ou « Type: message ») remplace `type(e).__name__`
+dans les messages qui pouvaient nommer `_RcValueError`. `_rc_sentry_once` ne fait rien sous borgHelperWWW (`_via_www()`) :
+`_log_child_rc` de WWW écrit la ligne `[ERREUR]` de l'enfant une fois par texte dans son journal. `_resolve_passphrase` relève l'`InterpolationError` de `cfg.get` en
+`_RcValueError` (même famille, message assaini, `from None`) : les sites qui affichent `str(e)` ne voient plus la valeur ; les
+`[WARN]` génériques qui pourraient la porter (comptes par inode, BkpReconcile, Index, Bkp précédent, stockage…) passent par `_etxt`.
+`read_index_last` masque à la lecture (`_rc_text_scrub`) le message d'un `index-last.json` écrit avant 1.0.212. Limites connues :
+rc qui perd ses droits en cours de commande (configparser le lit vide), erreur de syntaxe rencontrée par `_resolve_passphrase`
+(`rd(nick)` avalée : « passphrase absente »). La bibliothèque est inchangée (`BorgHelper()` lève l'erreur de configparser ; `storage()` garde `errors['*']`).
+Contrôles « CLI rc illisible » (égalité exacte, sans `-C`, Sentry neutralisé localement) et « … DSN configuré -> un message Sentry
+masqué » (faux transport).
+
 ### Vérification manuelle (`borgHelperWWW`, pas de framework de test)
 
 `demo.borghelperrc` ne suffit pas seul (dépôts locaux non chiffrés) ; protocole reproductible avec un `.borghelperrc`
@@ -2646,6 +2715,16 @@ de l'ouverture, comme avant ; fichier présent mais refusé : erreur relancée. 
 `illisible` passe par `ensure_diff_db` (arrêt réel) ; `_reconcile_archives` : diff.db `illisible` -> « rapprochement
 impossible », rien retiré (sinon mesures de history.db retirées, R1 mesuré). `clear_cache_nick` : `_db_absent` -> 0, rien
 créé. DbStatus : en-tête lu en `mode=rw`, history.db sondée.
+**Erreur SQLite pendant DbEncrypt/DbDecrypt (1.0.212, story 96, report 84 ; revue 96)** : `_db_migrate` prend aussi
+`sqlite3.Error` autour de `_db_migrate_run` puis `_db_migrate_cache` (`phase` 'lots' puis 'cache') et sur les deux autres appels de
+`_db_migrate_cache` (diff.db absente : 'cache0' ; déjà dans le mode cible : 'cache') ; `_migrate_sqlerr` affiche l'état reprenable
+de la phase et rend 2 (décision de l'utilisateur, comme les Db*Error) ; revue 2 (row 24) : le bloc d'avant le départ (`_open_db`
+admin, `_enc_header_read`, comptes) aussi — phase 'avant', « non commencé, rien changé ». Le premier `BEGIN IMMEDIATE` de
+`_db_migrate_run` reste converti en DbModeError (`_sqlerr`, « en-tête verrouillé … — relancer », code 2) ; `_db_schema_fail`
+(contrôle de schéma : base corrompue ou occupée) garde son message et son code 1. Mesures finales (`work/s96/dbenc_lock_final.py`) :
+verrou d'un autre processus entre deux lots (curseur `snapshot_file#2000`, 75 s) -> 60 s, ligne 'lots', code 2, base `migrating`
+au curseur, relance -> `siv1` ; verrou avant le départ -> DbModeError, code 2, base `plain` ; cache.db tenue -> 7 s (délai 5 s de
+la connexion), ligne 'cache', diff.db `siv1`, relance -> cache.db `siv1`.
 **Dry-run sans écriture (1.0.171, A58, décision de l'utilisateur)** : `_db_migrate` n'appelle `ensure_diff_db` (migration
 de schéma) qu'avec `-y` sans `-D` ; `-D` et le refus « ajouter -y » lisent la base telle quelle (compte `?` si une table
 manque) ; `_db_check_readonly` y garde les arrêts d'`ensure_diff_db` sans écrire (illisible -> `_db_schema_fail`, schéma
