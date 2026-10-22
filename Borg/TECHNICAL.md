@@ -261,14 +261,19 @@ index `(nick, path)` gardé. Écriture par `_snap_link_versions` (insertion si a
 `owner` : propriétaire construit depuis `{user}:{group} ({uid}:{gid})` de `borg list --format` (ex.
 `root:root (0:0)`).  
 `NULL` pour les lignes écrites avant l'ajout de ces colonnes (migrations `ALTER TABLE` automatiques dans
-`ensure_diff_db()`, ré-indexer pour peupler). Utilisées par `TreeHist` pour les colonnes « genre »/« droits »/« propriétaire ».
+`ensure_diff_db()`, ré-indexer pour peupler). Utilisées par `TreeHist` pour les colonnes « genre »/« droits »/« propriétaire ».  
+`link` (1.0.211) : nom principal STOCKÉ (même codec que `path`) d'une version `h` (second nom d'un lien physique), NULL
+sinon ; index partiels `idx_snapfile_hlink` et `idx_snapfile_hltarget` — voir « Liens physiques par inode ».
 
 #### `archive_snapshot`
 Table mince : associe une archive à ses fichiers via `file_id → snapshot_file.id`.  
 Réduit la duplication des chaînes de chemin quand le même fichier apparaît dans plusieurs archives consécutives.
 
 #### `archive_snapshot_indexed`
-Sentinelle d'idempotence pour les snapshots — une ligne par archive dont le snapshot est complet.
+Sentinelle d'idempotence pour les snapshots — une ligne par archive dont le snapshot est complet.  
+`gen` (1.0.211, revue 88-3 row 36) : génération, tirée du compteur `db_meta` `snap_gen` par les déclencheurs
+`trg_snapgen_*` à chaque écriture de sentinelle (le compteur avance aussi à chaque suppression) — empreinte des valeurs
+gardées `diff_pair_hl`, jamais réutilisée.
 
 #### `archive_stats`
 Métadonnées de taille par archive (original, compressé, dédupliqué, nfiles, durée).  
@@ -441,6 +446,7 @@ erDiagram
         TEXT type "code borg d/-/l/p/s/b/c, NULL si non réindexé"
         TEXT mode "ls-style ex. drwxr-xr-x, NULL si non réindexé"
         TEXT owner "user:group (uid:gid), NULL si non réindexé"
+        TEXT link "1.0.211, nom principal stocké d'une version h"
     }
 
     archive_snapshot {
@@ -455,6 +461,7 @@ erDiagram
         TEXT archive
         INTEGER entry_count
         TEXT indexed_at
+        INTEGER gen "1.0.211, déclencheurs trg_snapgen_*"
     }
 
     archive_stats {
@@ -764,6 +771,116 @@ lignes figées avant 1.0.162 gardées. `prev_nf = nfiles − added + removed` re
 précédente (contrôle sur vrai borg). IdxPurge range un `removed` sans taille (ligne ancienne ou synthétique : un
 répertoire) parmi les exclus sous `removed directory` (`_XCT`) : les exclus n'ont pas de taille par ligne, et les
 comptes de Report restent inchangés par la purge.
+
+**Liens physiques par inode (1.0.211, story 88, D204, décisions 1-7, revues 88, 88-2 et 88-3).** Mesuré (borg 1.2.6) : `nfiles`
+compte un fichier par inode ; `borg list` marque les noms suivants d'un mode `h…`, de taille 0, avec `linktarget` = le nom
+principal ; `borg diff` donne une ligne par nom ; un nom ajouté ou retiré d'un inode donne `modified` (+0/−0) aux autres.
+**Snapshot** : colonne `snapshot_file.link` (nom principal d'une version `h`, chemin STOCKÉ comme `path`, `_path_stored`),
+lue par `_SNAP_LIST_FMT` (`… {path}{NUL}{linktarget}{NUL}{NL}`, complet et incrémental — `--rebuild` et `_index_old_snaps`
+passent par `indexsnap`) ; enregistrements recollés puis coupés sur NUL + fin de ligne (`_snap_list_records`, revue 88-3
+row 39 : une cible de lien symbolique ou un chemin avec saut de ligne ne crée plus de ligne fantôme ; sortie sans NUL, borg
+simulé : lignes telles quelles) ; elle fait partie de l'identité d'une version (`_SNAPFILE_MATCH`) : un nom principal changé
+(promotion) est une nouvelle version, l'incrémental relit tout nom changé et clone les autres avec leur `link`. Version
+`h` **non résolue** — son `link` ne mène à aucune version non `h` liée à la même archive (`_HL_RESOLVED` : index
+`idx_snapfile_nick_path` puis clé primaire d'`archive_snapshot`, row 32) : snapshot d'avant 1.0.211, ou version réutilisée
+par un binaire plus ancien (son `_SNAPFILE_MATCH` ignore la colonne : `link` périmé après `rm a; ln b c`) — incertaine ;
+l'auto-réparation (même prédicat) refait une fois le dernier snapshot en complet — **une fois par archive** (revue 88-3
+row 42) : jamais depuis un snapshot écrit par 1.0.211 (marqueur `db_meta` `snap_hl:<nick>:<archive>` = génération de sa
+sentinelle, posé par `_snap_hl_mark` dans la transaction de la sentinelle, complet ou incrémental ; une sentinelle refaite
+par un autre binaire a une autre génération ; marqueurs des snapshots disparus retirés par la passe d'écrivain), et jamais
+pour un nom principal hors du périmètre indexé (`_idx_path_ok` faux : IDX_INCLUDE/IDX_EXCLUDE, jamais dans le snapshot —
+incertain, sans réparation possible) ; message propre (« second nom de lien physique sans nom principal… »). Les anciens
+restent incertains jusqu'à leur sortie de rétention ou `Index --rebuild`. Colonne, index partiels
+`idx_snapfile_hlink ON snapshot_file(nick, path, link) WHERE substr(mode,1,1)='h' OR mode IS NULL` et `idx_snapfile_hltarget
+ON snapshot_file(nick, link) WHERE substr(mode,1,1)='h'` (`_HL_INDEX2`, nom principal d'une version `h`), génération des
+snapshots (`archive_snapshot_indexed.gen`, voir Valeurs gardées) : ajoutés par un **écrivain** seulement
+(`ensure_diff_db(create=True)` : Index, Bkp, indexsnap, DbEncrypt…), sous `BEGIN IMMEDIATE`, version de schéma relue (base
+plus récente : jamais touchée) — ajouts purs, `DIFF_DB_SCHEMA_VERSION` inchangée ; mesuré : 0,15 à 0,27 s sur une base de
+1 Go. Lecteurs sans colonne : liens inconnus (`~`).
+**Comptes** (`_hl_adjust(conn, nick, archives|pair|restrict)`) : lignes de `diff_index` dont le chemin a, dans le
+snapshot présent de l'une des **deux archives de la paire**, une version `h` ou sans mode, ou est le nom principal d'une
+version `h` liée (`_HL_TARGET`, sondé seulement pour une version non `h`) — préfiltre par l'index partiel sur tout le nick,
+puis ces versions de la paire seules (row 33 : la valeur, `pair_h` et `unk_*` compris, ne dépend que des entrées de son
+empreinte) ; jamais toutes les lignes. Clé d'inode d'un nom
+dans une archive (version liée à l'archive, snapshot présent = sentinelle seule) : son chemin s'il est maître, son nom
+principal s'il est `h`. Agrégation SQL par paire et clé (un groupe = un inode) ; les noms dont la clé change (promotion,
+nouveau maître, `ln -f`, déduplication, lien cassé) relient les groupes par union-find (sans eux : chemin direct). Par
+composante : ajoutés max(0, Kn−Ka), supprimés max(0, Ka−Kn), modifiés min(Ka, Kn, inodes nouveaux portant une ligne
+modifiée) ; nom principal sans ligne dans la paire = inchangé s'il a une version dans chaque archive (snapshot présent ;
+absent : supposé), sinon incertain et son nœud ignoré (row 37 : nom principal exclu par IDX/IdxPurge puis supprimé, second
+nom promu — jamais un ajouté fantôme). Rend l'écart par nom − par inode (`added`, `modified`, `modified_m` exact pour
+IdxTop/DiffTop, `removed`), `unk_am`/`unk_r` (ligne inconnue, comptée par nom : snapshot absent, nom absent d'un snapshot
+présent — row 38 —, mode NULL, `h` non résolue ; snapshot absent : décidé par la paire seule, `has()` — `unk_am` si elle a
+des ajouts ou modifications (nouvelle archive absente) ou des modifications (ancienne absente), `unk_r` si elle a des
+suppressions) et `pair_h` (lien vu sur un chemin de la paire, dans le snapshot de l'une de ses deux archives), plus
+`nick_h` (relu, jamais gardé). Paires : `diff_indexed_pairs` et orphelines (archive nouvelle de `diff_index` sans
+paire, par l'index `(nick, archive_new)`). « ~ » (`_hl_uncertain`, décision 4, rows 16 et 20) : inconnu ET (`pair_h`, ou
+snapshot d'une archive de la paire absent (`snap_miss`, sentinelle lue en direct par `_hl_get`, jamais gardée) et `nick_h`
+(revue 88-3 row 41, décision 4 à la lettre — la restriction de la row 33 ne vaut que pour les snapshots présents), ou
+`nick_h` et ajoutés − supprimés ≠ nfiles nouveau − nfiles ancien, une seule paire, nfiles connus) ; dépôt sans lien :
+jamais. Report : `unk_am` ou `unk_r` ; IdxTop/DiffTop (« Inchangés ») : `unk_am`. Consommateurs : `_diff_stats_for_nick`
+(Report live et hors ligne, ArchiveHistory, figeage, `_chart_counts` ; clé `approx`, `files_approx` d'ArchiveHistory et
+d'`archive_chart`, colonne ajoutée sous verrou, `HISTORY_DB_SCHEMA_VERSION` inchangée), `idxtop` et `difftop` (jumeaux,
+une connexion et une transaction de lecture chacun ; erreur SQLite de `_hl_get` : lignes gardées, par nom, erreur dite,
+`~` seulement si un lien physique est connu — `_hl_link_known`, row 40).
+`_read_tx` : pas de BEGIN dans une transaction ouverte (base en mode vide) ni hors WAL. IdxPurge : `_hl_adjust` restreint
+aux lignes purgées (table temporaire `hl_purge`, terme `+d.id IN …` jamais d'index : sinon chaque id sondé par chemin, plus
+de 10 min mesurées) ; écart reporté sur les exclus (`_hl_move_exclu`) : `… hardlink` (`_HL_XTYPE`, hors comptes, tailles
+dans leur famille `_XADDED`/`_XREMOVED`), ou ajouté au type compté s'il est négatif. **Valeurs gardées (décision 6, revue 88-2 row 30).** `diff_pair_hl` (nick, archive_old, archive_new, `pair_id`,
+`entry_count` (ici « COUNT|MAX » des lignes de la paire), `snap_old`, `snap_new` — empreinte —, `added`, `modified`,
+`modified_m`, `removed`, `unk_am`, `unk_r`,
+`pair_h`, `computed_at`) : table ajoutée par un écrivain (même bloc que `link`), `DIFF_DB_SCHEMA_VERSION` inchangée, ignorée
+d'un ancien binaire. Écrivain : `_hl_store_pass` en fin de passe d'Index (`_index_finish` : Index, tranche, Bkp,
+fantôme de `--rebuild`) — jamais par IdxPurge (décision 7 de l'utilisateur, row 57 : ses paires touchées, périmées par
+l'empreinte, sont calculées à la volée par les lecteurs jusqu'à ce que les refasse un `Index -n <nick>` simple (ou une tranche `Index -t` qui finit avant son échéance), 15 s de calcul par passe — jamais un Bkp (sa passe ne garde que la paire de son archive ; un Index en attente repris par un Bkp : aucune) ni une tranche arrivée à son échéance ; mesuré, `q1.out`, `q2.out`) — paires sans valeur valide, plus récentes d'abord, une archive
+nouvelle à la fois ; demande d'arrêt (`_index_stop_reason` : échéance de tranche, opération prioritaire ou Report) vérifiée
+avant chaque archive, la première comprise (déjà là en fin de passe : passe sautée) ; budget de 15 s (`_HL_STORE_BUDGET`)
+vérifié après chaque archive, le reste au prochain Index ; Index d'un Bkp (tour tenu par l'appelant) : la seule paire de
+son archive (`target`, l'Index repris par `index-pending` : aucune) — `store_bkp_status_finish` et le push jamais retardés
+par l'arriéré ; empreinte et calcul lus dans une transaction, écriture courte ; valeurs des paires disparues retirées ;
+toute erreur (`except Exception`, `MemoryError` comprise, row 35) : [WARN], jamais d'échec. Lecteur : `_hl_get` (Report
+live et hors ligne via `_diff_stats_for_nick`, ArchiveHistory, figeage, IdxTop, DiffTop ; borgHelperWWW par la CLI) prend
+une valeur seulement si son empreinte est celle de maintenant (row 36) — `diff_indexed_pairs.id`, `COUNT(*)` et `MAX(id)`
+des lignes de `diff_index` de son archive nouvelle (index couvrant `(nick, archive_new)` ; sur-ensemble de la paire : un
+changement ailleurs ne cause qu'un recalcul ; id AUTOINCREMENT jamais réutilisé ; jamais l'`entry_count` déclaré, faux pour
+les doublons d'avant 1.0.176) et, pour chaque archive, la génération de sa sentinelle (`archive_snapshot_indexed.gen` et
+`entry_count`) ; sinon calcul à la volée (`_hl_adjust`), jamais écrit ; `nick_h` relu. Génération : déclencheurs
+`trg_snapgen_ins`/`_upd`/`_del` (`_HL_GEN_DDL`) qui incrémentent `db_meta` `snap_gen` à chaque écriture ou suppression de
+sentinelle — y compris par un binaire plus ancien ou une écriture directe — et donnent à la sentinelle écrite la valeur
+du compteur (jamais un rowid, réutilisable, ni une date à la seconde) ; sentinelles d'avant la colonne : leur rowid, compteur
+au maximum. Base sans la colonne (jamais rouverte par un écrivain à jour) : empreinte de snapshot NULL, aucune valeur
+gardée prise. Événements qui changent les entrées, tous vus par l'empreinte : IdxPurge et purge de doublons (lignes),
+DIFF_KEEP et rapprochement (paire retirée), re-diff (nouvelle ligne de paire), snapshot refait (`-F`, auto-réparation),
+purgé par IDX_SNAP_KEEP ou écrit plus tard pour l'ancienne archive (génération), `--rebuild`/`_swap_db` (autre base),
+écritures d'un binaire plus ancien. **DbEncrypt/DbDecrypt** (row 31) : `snapshot_file.link` migré dans le même lot que
+`path` (encodé ou décodé s'il n'est pas NULL) et vérifié comme lui (échantillon `_MIGRATE_VALIDATE_SAMPLE` par table et
+colonne, les `link` rares compris) — valeurs gardées valides avant comme après (mêmes liens, autre codec). Noms principaux
+restés **en clair** dans une base chiffrée (DbEncrypt de 1.0.209 ou d'un 1.0.211 d'avant la revue) — `_hl_plain_fixes` : un
+`link` qui ne se décode pas, déjà normalisé, et sans forme de chiffré (`_hl_cipher_shape` : un segment hors base64 du codec
+ou pas plus long que l'étiquette — row 52 : nom principal exclu par IDX_* ou purgé, sans version) ou dont l'encodage est le
+`path` d'une version du nick est réencodé (row 48 : un chiffré, même altéré ou d'une autre clé, jamais réencodé, preuve
+gardée) : (1) `_hl_link_repair`, passe d'un **Index simple**
+seulement (jamais Bkp, tranche ni IdxPurge, row 47), par lots de 5 000 dans l'ordre de l'index `(nick, link)`, `stop()`
+vérifié avant chaque lot, une fois par nick (`db_meta` `hl_link_ok:<nick>`, posé à la fin, retiré par la transaction finale
+de DbEncrypt et de DbDecrypt — `_hl_marks_drop`, row 44 : un cycle déchiffrement/chiffrement par un binaire plus ancien est
+revérifié) ; (2) en tête de DbDecrypt, dans la transaction qui passe la base en migration (row 43) ; un `link` encore en
+clair au déchiffrement (`_norm_lp(orig)==orig`) est gardé tel quel, jamais bloquant ; reprise d'un DbEncrypt commencé par un
+binaire qui ne migrait pas `link` : noms principaux des lignes déjà migrées sans forme de chiffré encodés avant la boucle,
+échantillon « legacy » d'un tel `link` réencodé, jamais pris pour une altération (un chiffré altéré reste une altération,
+row 53) ; reprise d'un DbDecrypt dans le même cas : noms principaux des lignes déjà migrées qui se décodent, décodés. Base déchiffrée par l'ancien DbDecrypt : `link` chiffrés,
+non résolus (incertains). Passe d'écrivain : chaque écriture sur une connexion NEUVE (`_hl_write`), `_write_mode_check` après
+son `BEGIN IMMEDIATE` (row 45 : DbEncrypt pendant la passe d'un Index -> rien écrit), puis `PRAGMA data_version` de la
+connexion de lecture comparé à celui relevé à la fin de la lecture (row 51 : base remplacée par le `_swap_db` d'un autre
+processus — IdxPurge, reconstruction d'un nick partageant DB_NAME — entre lecture et écriture : ROLLBACK, rien écrit,
+« repris au prochain Index ») ; marqueurs `snap_hl:` retirés seulement sans la sentinelle EXACTE (row 54 : nick `a` et `a:b`
+sur une même base) ; erreur d'une archive : `[WARN]`, archive suivante (row 46). Tranches `Index -t` qui
+finissent toujours à leur échéance (row 49) : la passe est sautée à chaque fois — les valeurs gardées viennent alors de
+l'Index simple et du Bkp (sa paire) ; sans eux, les lecteurs calculent à la volée. Hors empreinte : versions d'un snapshot jamais modifiées sur place
+(1.0.164). Coût mesuré le 2026-10-21, avant les rows 51-56, la fusion de la story 94 et la décision 7 (`work/s88/cost/h1.out`, `h2.out`, `i1.out`, `i2.out`, inodes de 4 noms, 12
+snapshots) : arbre de type rsnapshot (400 000 fichiers par snapshot, 80 % de liens, 570 000 lignes touchées) — Report -o, IdxTop, DiffTop, figeage : 0,55 / 1,21 / 0,46 / 0,17 s avec les valeurs gardées (1.0.209 : 0,58 / 1,12 / 0,46 / 0,13 s), 9,8 / 10,5 / 1,5 / 9,3 s à la volée ; écrivain 1,17 s par paire nouvelle, 12,74 s pour 11 (remesuré sur le code actuel, `q2.out`) ; base de 1 Go à 2 % de liens : 0,63 / 1,64 / 0,52 / 0,24 s gardées (1.0.209 : 0,59 / 1,55 / 0,50 / 0,19 s), 1,20 / 2,23 / 0,61 / 0,80 s à la volée, écrivain 0,14 s par paire, 1,65 s pour 11 (`q1.out`) ; auto-réparation : 0,04 / 0,11 s (attributs NULL) plus, une fois après la mise à jour, 0,32 / 0,14 s (seconds noms du snapshot précédent non marqué) ; IdxPurge du même motif (purge restreinte, sans passe de calcul depuis la décision 7, `q1.out`, `q2.out`) : 8,4 -> 8,2 s à
+2 % de liens (bruit), 5,5 -> 14,5 s sur l'arbre de type rsnapshot (avec la passe : 25,6 s, `p2.out`) ; Report -o juste après,
+à la volée : 0,43 / 0,70 s (motif qui retire 96 % des lignes : meilleur cas ; une purge de peu de lignes qui touche toutes les paires laisse les lecteurs au coût à la volée de `h1.out`/`h2.out`, Report -o 1,20 / 9,8 s, jusqu'à l'`Index -n` simple suivant) ; passe de cet Index : 0,30 / 3,58 s. Exclus de l'Index (comptes sans chemin) : par nom. Le JSON du Bkp
+(`borgHelper_file_counts`, `_pair_file_counts`) reste par nom.
 
 ### `Index` (indexation manuelle, parallèle)
 
@@ -1457,7 +1574,7 @@ IDX_INCLUDE seul  → DELETE WHERE nick=? AND NOT (p1 OR p2 OR ...)
 Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
 ```
 
-**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas. Limite (bases d'avant 1.0.116, story 80 D203, mesurée en 1.0.202) : une paire écrite sans tailles par un Bkp d'avant 1.0.116 (lignes de `borg create --list`) puis vidée par `IdxPurge -x` a des exclus de `total_size` 0 — lus par `_diff_stats_for_nick` (moitié « taille » des `modifications` de Report et ArchiveHistory), IdxTop et DiffTop ; jamais refaite par `_recheck_zero_pairs` (exclus présents), et la refaire ferait revenir les entrées purgées par `-x`. 1.0.162 : un `removed` sans taille (répertoire ancien ou synthétique) est rangé sous `removed directory` (`_XCT`), pour que les comptes de Report (fichiers ordinaires) restent inchangés par la purge ; les exclus écrits avant 1.0.162 gardent leur `removed`.
+**Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée ; 1.0.211 : lignes écartées par les comptes par inode rangées sous `… hardlink`, hors comptes ; marque `approx` calculée sur les seules lignes indexées), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas. Limite (bases d'avant 1.0.116, story 80 D203, mesurée en 1.0.202) : une paire écrite sans tailles par un Bkp d'avant 1.0.116 (lignes de `borg create --list`) puis vidée par `IdxPurge -x` a des exclus de `total_size` 0 — lus par `_diff_stats_for_nick` (moitié « taille » des `modifications` de Report et ArchiveHistory), IdxTop et DiffTop ; jamais refaite par `_recheck_zero_pairs` (exclus présents), et la refaire ferait revenir les entrées purgées par `-x`. 1.0.162 : un `removed` sans taille (répertoire ancien ou synthétique) est rangé sous `removed directory` (`_XCT`), pour que les comptes de Report (fichiers ordinaires) restent inchangés par la purge ; les exclus écrits avant 1.0.162 gardent leur `removed`.
 
 **Purge snapshots intégrée :** en fin d'opération (même s'il n'y avait rien à purger dans `diff_index`), `IdxPurge` appelle `_snapurge_check`/`_snapurge_exec` et supprime les snapshots (`archive_snapshot` + `archive_snapshot_indexed` + `snap_excluded_stats`) dont l'archive dépasse `IDX_SNAP_KEEP`. Un seul commit SQLite et un seul VACUUM pour les deux opérations.
 
@@ -2383,7 +2500,9 @@ migration précis rencontré et corrigé pendant cette story (voir git blame de 
 Ordre figé (AD-7) : `snapshot_file` puis `diff_index` (`_MIGRATE_TABLES`). `archive_snapshot` n'a pas de colonne
 `path` propre (seulement `file_id` vers `snapshot_file`, voir schéma `diff.db`) — rien à y migrer directement ; les
 tables de stats (`archive_stats`, `diff_excluded_stats`, `snap_excluded_stats`, `repo_stats`,
-`diff_indexed_pairs`, `archive_snapshot_indexed`) n'ont aucune colonne `path`.
+`diff_indexed_pairs`, `archive_snapshot_indexed`) n'ont aucune colonne `path`. `snapshot_file.link` (1.0.211, nom
+principal stocké d'une version `h`, même codec que `path`) : migré dans le même lot que `path` (`UPDATE … SET path=?,
+link=?`, NULL laissé tel quel) et échantillonné avec lui (revue 88-3 row 31).
 
 Connexion **admin nue** (`_open_db(db_path, nick=None, role='admin')`) : le codec est manipulé à la main
 (`DbCodec(dek)` construit une fois, dek unlockée depuis l'en-tête) plutôt que via `conn.codec`, parce qu'une base en
@@ -2404,10 +2523,11 @@ perte (chaque ligne déjà migrée reste lisible avec la DEK courante) ni duplic
 déjà traitées via `id>cursor`).
 
 **Validation avant le commit final.** Pendant la boucle, chaque ligne traitée est candidate à l'échantillonnage
-(`sample`, plafonné à `_MIGRATE_VALIDATE_SAMPLE=50` tuples `(table,id,orig,new)` — les 50 premières rencontrées dans
-CETTE invocation, pas un tirage aléatoire sur toute la base : suffisant pour détecter une régression du codec ou de
-la boucle, pas un audit exhaustif). Une fois les deux tables terminées, chaque ligne échantillonnée est **relue**
-(`SELECT path FROM <table> WHERE id=?`) et son aller-retour vérifié : `codec.path.decode(got)==_norm_lp(orig)` en
+(`sample`, plafonné à `_MIGRATE_VALIDATE_SAMPLE=50` tuples `(table,id,colonne,orig,new)` **par table et colonne**
+(1.0.211 : les `link`, rares, sont échantillonnés même quand les premières lignes n'en ont pas) — les 50 premières
+rencontrées dans CETTE invocation, pas un tirage aléatoire sur toute la base : suffisant pour détecter une régression du
+codec ou de la boucle, pas un audit exhaustif). Une fois les deux tables terminées, chaque ligne échantillonnée est **relue**
+(`SELECT <colonne> FROM <table> WHERE id=?`) et son aller-retour vérifié : `codec.path.decode(got)==_norm_lp(orig)` en
 chiffrement, `codec.path.encode(got)==orig` en déchiffrement — une incohérence (valeur relue différente de celle
 écrite, ou aller-retour invalide) lève `DbTamperError` et **annule le commit final** (la base reste `migrating`,
 investigable, reprenable après correction). Le commit final (`path_enc: migrating -> siv1` ou suppression complète

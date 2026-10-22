@@ -378,10 +378,11 @@ bh = BorgHelper()
 db_path = bh.db.get_diff_db('mon-serveur')
 
 # Statistiques par archive : added/removed/modified = fichiers ordinaires seuls (1.0.162, comme nfiles de borg) ;
-# added_sz/removed_sz/modified_sz par familles (répertoires et liens compris) — un compte peut être 0 avec une taille > 0
+# added_sz/removed_sz/modified_sz par familles (répertoires et liens compris) — un compte peut être 0 avec une taille > 0 ;
+# 1.0.211 : liens physiques comptés par inode ; approx=True : comptes incertains (Report affiche « ~XX%nb »)
 stats = bh.db._diff_stats_for_nick('mon-serveur')
 for archive, s in sorted(stats.items()):
-    print(f"{archive}: +{s['added']} -{s['removed']} ~{s['modified']}")
+    print(f"{archive}: +{s['added']} -{s['removed']} ~{s['modified']}{' (approx.)' if s['approx'] else ''}")
 
 # Vérifier si une paire est indexée
 indexed = bh.db.is_diff_pair_indexed('mon-serveur', 'archive-old', 'archive-new')
@@ -902,7 +903,7 @@ sys.exit(0)
 | `get_archive_chart(nick, db_path=None)` | 1.0.140 — lignes figées dans la rétention : `[{archive, archive_date, duration, …, read_errors, gone}]` ; `[]` si aucune |
 | `is_diff_pair_indexed(nick, a_old, a_new)` | Vérifie si une paire est indexée ; 1.0.176 : `None` sur une vraie erreur SQLite (marquée `[ERREUR]`, jamais `False` : la paire serait recalculée en double), `False` si la table est absente |
 | `is_archive_snapshot_indexed(nick, archive)` | Vérifie si le snapshot est indexé. 1.0.200 : False si la base est absente, sans la table ou supprimée après l'ouverture (muet) ; **None** sur une vraie erreur SQLite (inconnu, avant : False) avec `[ERREUR] SQLite error (<base>): …` sur stderr (une fois par base et par processus) — `indexsnap` saute alors le snapshot (code 1, rien supprimé) |
-| `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (Report, ArchiveHistory, figeage) — comptes en fichiers ordinaires depuis 1.0.162, tailles par familles ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées ; 1.0.179 : DbModeError/DbKeyError/DbTamperError (et tout défaut) remontent aussi sans `conn` (avant : `{}` en silence) |
+| `_diff_stats_for_nick(nick, archives=None, conn=None)` | Stats de mouvement par archive (Report, ArchiveHistory, figeage) — comptes en fichiers ordinaires depuis 1.0.162, tailles par familles ; `archives` (1.0.140) restreint aux archives nouvelles données, `conn` : erreurs SQLite remontées ; 1.0.179 : DbModeError/DbKeyError/DbTamperError (et tout défaut) remontent aussi sans `conn` (avant : `{}` en silence) ; 1.0.211 : comptes par inode (seconds noms d'un lien physique écartés d'après le snapshot), clé `approx` (bool) par archive — vraie quand le résultat est incertain : snapshot nécessaire absent (ou nom absent d'un snapshot présent, version sans mode, nom principal qui ne mène à aucune version non `h` de la même archive) ET lien physique vu sur un chemin de la paire (snapshots de ses deux archives seulement), ou — snapshot d'une archive de la paire absent — vu dans un snapshot quelconque du nick (lu en direct), ou vu dans le nick avec des comptes contraires à `nfiles` (décisions 4 et 5, revue 88-3 rows 33 et 41) ; identité d'inode d'après `snapshot_file.link` ; corrections relues dans `diff_pair_hl` (gardées par l'Index, décision 6 ; empreinte : lignes réelles de la paire et génération des snapshots), calculées à la volée sinon (jamais écrites par un lecteur) ; `archives` : tout itérable, doublons ignorés |
 | `store_excluded_diff_stats(nick, a_old, a_new, exclu, db_path)` | Stocke stats fichiers exclus d'une paire, dans une transaction à part — sans vérifier la paire : des exclus écrits sans leur paire sont retirés par l'Index suivant (`_drop_orphan_exclusions`, 1.0.201) ; préférer `store_diff_entries(…, exclu=…)` |
 | `store_diff_entries(nick, a_old, a_new, a_new_date, entries, db_path=None, exclu=None)` | Écrit une paire et ses lignes (`INSERT OR IGNORE` de la paire d'abord : déjà présente -> rien réinséré) ; `exclu` (1.0.201) : exclus écrits dans la même transaction, seulement si la paire l'a été — préférer cet argument à `store_excluded_diff_stats` (transaction à part : exclu sans paire possible) ; `False` sur erreur SQLite |
 | `store_excluded_snap_stats(nick, archive, count, size, db_path)` | Stocke stats fichiers exclus d'un snapshot |

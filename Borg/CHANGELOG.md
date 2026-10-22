@@ -1,5 +1,107 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.211 — Liens physiques et « Inchangés » — 2026-10-22
+
+Chantier « reconstruction progressive », story 88 (D204 ; mesures du 2026-10-21, borg 1.2.6 — `work/s88/m2.out` à `m12.out`,
+coût `work/s88/cost/h1.out`, `h2.out`, `i1.out`, `i2.out`, `p2.out`, `q1.out`, `q2.out` ; décisions de l'utilisateur du 2026-10-21, 1 à 7 ;
+revues 88, 88-2 et 88-3).
+
+- **borgHelper** : liens physiques comptés **par inode**, comme `nfiles` de borg (un fichier par inode ; `borg diff` donne
+  une ligne par nom). Identité d'inode **exacte** (décision 5) : le snapshot garde, pour chaque second nom (mode `h…`), son
+  nom principal (`linktarget` de `borg list`, nouvelle colonne `snapshot_file.link`, chemin stocké et chiffré comme `path`) ;
+  les noms d'une paire sont regroupés par inode (en SQL) et comptés une fois — maître supprimé et nom promu, nouveau nom
+  passé maître, `ln -f`, déduplication, lien cassé par remplacement : comptés comme borg, quel que soit l'ordre du
+  répertoire ; plus aucune heuristique (date, propriétaire, droits). Source unique `_hl_adjust` pour « Inchangés »
+  d'IdxTop et de DiffTop (jumeaux, type exact `modified`, une connexion et une transaction de lecture chacun), la colonne
+  `modifications` de Report (les deux `_fmt_stats`, live et `-o`, via `_diff_stats_for_nick`), ArchiveHistory et le
+  figeage. Mesuré : paire `k1`/`k2` modifiée — « Inchangés » 11 sur 15 (avant : 10), Report `21%nb` (avant : `28%nb`).
+- **`~` seulement si le résultat est incertain** (décision 4) : snapshot nécessaire absent (purgé au-delà d'`IDX_SNAP_KEEP`,
+  `NOIDX`, sentinelle absente), nom absent d'un snapshot présent, nom principal sans version dans une archive dont le
+  snapshot est présent, ou version d'un nom de la paire sans mode ou dont le nom principal ne mène à aucune version non `h`
+  de la même archive (snapshot d'avant 1.0.211, lien périmé écrit par un binaire plus ancien), **et** lien physique vu sur
+  un chemin de la paire (dans le snapshot de l'une de ses deux archives seulement), ou — snapshot d'une archive de la paire
+  absent — lien vu dans un snapshot quelconque du nick (décision 4 à la lettre, revue 88-3 row 41 : lu à chaque lecture,
+  jamais gardé ; ainsi une paire dont les deux snapshots sont purgés garde son `~` même si ses comptes s'accordent avec
+  `nfiles`), ou vu dans le nick avec des comptes contraires à `nfiles`. Calcul par
+  nom de ce qui manque, `~` devant le nombre d'« Inchangés » (`~10 (66%)`) et devant `XX%nb` (`~28%nb`) ; un dépôt sans
+  lien physique n'a jamais `~`. `ArchiveHistory -j` : `files_approx`, figé aussi dans `archive_chart` (colonne ajoutée sous
+  verrou ; `HISTORY_DB_SCHEMA_VERSION` inchangée). Exclus de l'Index : toujours par nom. Le JSON du Bkp
+  (`borgHelper_file_counts`) reste par nom (dit dans README).
+- **Snapshot** : `borg list` des snapshots (complet, incrémental, `--rebuild`, archives anciennes) lit `{NUL}{linktarget}`,
+  enregistrements terminés par NUL (une cible de lien symbolique ou un chemin avec saut de ligne ne crée plus de ligne
+  fantôme) ; un nom principal changé est une nouvelle version. Un dernier snapshot qui a encore un second nom dont le nom
+  principal ne mène à aucune version non `h` de la même archive est refait une fois en complet (auto-réparation) — une
+  fois par archive : jamais depuis un snapshot écrit par 1.0.211 (marqueur `snap_hl:` dans `db_meta`), jamais pour un nom
+  principal hors du périmètre indexé (`IDX_INCLUDE`/`IDX_EXCLUDE`, ou racines imbriquées : resté incertain), avec son
+  propre message. **diff.db** : colonne `link`, index partiels `idx_snapfile_hlink` (versions `h` ou sans
+  mode) et `idx_snapfile_hltarget` (nom principal des `h`), colonne `archive_snapshot_indexed.gen` et déclencheurs qui
+  la tirent d'un compteur `snap_gen` de `db_meta` à chaque écriture ou suppression de sentinelle (y compris par un binaire
+  plus ancien), ajoutés par un écrivain seulement, sous verrou, schéma vérifié d'abord (base plus récente : jamais
+  touchée) — ajouts purs, `DIFF_DB_SCHEMA_VERSION` inchangée ; un binaire plus ancien continue d'écrire (un second nom au
+  nom principal absent ou périmé reste incertain). Construction mesurée : 0,15 à 0,27 s sur une base de 1 Go.
+- **IdxPurge** : l'écart par nom − par inode des seules lignes purgées est rangé sous `added hardlink`, `modified hardlink`
+  ou `removed hardlink`, hors comptes (tailles dans leur famille), ou ajouté au type compté — Report, IdxTop et
+  ArchiveHistory inchangés par la purge (un binaire d'avant 1.0.211 ne compte pas ces types).
+- **Correction gardée** (décision 6) : calculée par l'Index (fin de passe : Index, tranche, Bkp, `--rebuild`) — jamais par
+  IdxPurge (décision 7 : ses paires touchées restent calculées à la lecture jusqu'à ce que les refasse un `Index -n <nick>` simple (ou une tranche `Index -t` qui finit avant son échéance), 15 s de calcul par passe — jamais un Bkp (sa passe ne garde que la paire de son archive ; un Index en attente repris par un Bkp : aucune) ni une tranche arrivée à son échéance) —, gardée dans la nouvelle table `diff_pair_hl` avec l'empreinte de ses entrées (lignes réelles de la paire —
+  nombre et plus grand id —, génération des snapshots de ses deux archives) ; le résultat, `~` compris, ne dépend que de
+  ces entrées. Report, IdxTop, DiffTop, ArchiveHistory, le figeage et borgHelperWWW la relisent sans recalcul ; valeur
+  absente ou périmée (purge, snapshot refait, purgé ou écrit plus tard, reconstruction, binaire plus ancien) : calcul à la
+  lecture, jamais écrit ; paires anciennes complétées par chaque Index, une archive à la fois, les plus récentes d'abord,
+  15 s au plus (vérifiées après chaque archive), jamais au-delà de l'échéance d'une tranche ni pendant une opération
+  prioritaire (vérifiées avant chaque archive) ; l'Index d'un Bkp ne garde que la paire de son archive (fin de Bkp et push
+  jamais retardés par l'arriéré) ; toute erreur : `[WARN]`, jamais d'échec. Erreur SQLite de la lecture dans IdxTop ou
+  DiffTop : `~` seulement si un lien physique est connu, erreur dite. Table ajoutée par un écrivain,
+  `DIFF_DB_SCHEMA_VERSION` inchangée, ignorée d'un ancien binaire.
+- **DbEncrypt / DbDecrypt** : `snapshot_file.link` est chiffré ou déchiffré dans le même lot que `path` et vérifié avec lui
+  (échantillon par colonne) — avant, une base chiffrée gardait les noms principaux en clair et comptait faux. Base déjà
+  chiffrée ainsi : le prochain Index simple (jamais un Bkp, une tranche ni IdxPurge) réencode, par lots interruptibles,
+  chaque `link` en clair (sans forme de chiffré, ou dont l'encodage est un chemin du nick — un nom principal exclu par
+  `IDX_*` n'y reste pas en clair ; un chiffré, même altéré, n'est jamais réécrit), une fois
+  (`db_meta` `hl_link_ok:<nick>`, retiré par DbEncrypt et DbDecrypt), et retire les valeurs gardées du nick ; DbDecrypt
+  réencode d'abord ces liens, garde tel quel un nom principal resté en clair et ne reste jamais bloqué ; un DbEncrypt
+  interrompu par un binaire plus ancien puis repris encode les noms principaux déjà passés, un DbDecrypt repris de même
+  les décode. Base déchiffrée par l'ancien
+  DbDecrypt : ses `link` restés chiffrés ne mènent à aucune version (incertain, `~`). La passe d'écrivain revérifie le mode
+  de la base avant chaque écriture (connexion neuve), n'écrit rien si la base a été remplacée depuis sa lecture (bascule
+  d'un autre processus), et passe à l'archive suivante après une erreur. Tranches `Index -t` qui finissent
+  toujours à leur échéance : jamais de passe de calcul (valeurs gardées par l'Index simple et le Bkp).
+- Coût mesuré le 2026-10-21, avant les rows 51-56 de la revue, la fusion de la story 94 et la décision 7 (bases synthétiques, `work/s88/cost/h1.out`, `h2.out`, `i1.out`, `i2.out`) : arbre de type rsnapshot (400 000 fichiers par snapshot, 80 % de liens, 570 000 lignes touchées) — Report -o, IdxTop, DiffTop, figeage : 0,55 / 1,21 / 0,46 / 0,17 s avec les valeurs gardées (1.0.209 : 0,58 / 1,12 / 0,46 / 0,13 s), 9,8 / 10,5 / 1,5 / 9,3 s à la volée ; écrivain 1,17 s par paire nouvelle, 12,74 s pour 11 (remesuré sur le code actuel, `q2.out`) ; base de 1 Go à 2 % de liens : 0,63 / 1,64 / 0,52 / 0,24 s gardées (1.0.209 : 0,59 / 1,55 / 0,50 / 0,19 s), 1,20 / 2,23 / 0,61 / 0,80 s à la volée, écrivain 0,14 s par paire, 1,65 s pour 11 (`q1.out`) ; auto-réparation : 0,04 / 0,11 s (attributs NULL) plus, une fois après la mise à jour, 0,32 / 0,14 s (seconds noms du snapshot précédent non marqué) ;
+  IdxPurge du même motif (`q1.out`, `q2.out`, sans passe de calcul, décision 7 : reste le comptage par inode des seules
+  lignes purgées) : 8,4 -> 8,2 s à 2 % de liens (écart dans le bruit), 5,5 -> 14,5 s sur l'arbre de type rsnapshot (avec
+  la passe, avant la décision 7 : 25,6 s, `p2.out`) ; ses paires touchées sont ensuite calculées à la lecture jusqu'à
+  la passe d'un `Index -n <nick>` simple (0,30 / 3,58 s pour les refaire) — Report -o 0,43 / 0,70 s après ce motif, qui
+  retire 96 % des lignes (meilleur cas) ; cas représentatif, une purge de peu de lignes qui touche toutes les paires : coût
+  à la volée de `h1.out`/`h2.out` (Report -o 1,20 / 9,8 s au lieu de 0,63 / 0,55) jusqu'à cet Index. Jamais de borg.
+- Docs : limite « lien ou répertoire remplacé par un fichier compté inchangé » retirée de README (IdxTop, DiffTop) — réglée
+  depuis 1.0.163, sauf pour une paire indexée avant 1.0.163 (`Index -F` la refait) ; limite « liens physiques » remplacée
+  par le comptage par inode. Restent (mesurés) : `modified` (+0/−0) donné par borg au nom maître d'un inode dont le nombre
+  de liens change, compté modifié ; tous les anciens noms d'un inode supprimés et un nouveau nom ajouté : un ajouté et un
+  supprimé ; IdxPurge qui sépare deux noms d'un même inode.
+- CodecSelfTest : « Liens physiques : comptes par inode (snapshot)… (plain et chiffré) » (nom principal ; promotion,
+  nouveau maître dans les deux ordres, déduplication, lien cassé ; version sans mode, second nom sans nom principal, paire
+  orpheline, sentinelles retirées ; paires Y, Z, V — ligne C, row 8 — et W — sans lien, comptes contraires à nfiles puis
+  cohérents ; figeage `archives=` ; `files_approx` vivant et figé ; IdxPurge inchangé, détail `+4 · -3 · =9` ; base sans
+  colonne mode) et « Liens physiques sur vrai borg… » ; « Inchangés (DiffTop, IdxTop) » : nick sans lien, jamais `~` ;
+  « snapshot par version : base v10 migrée » : index partiel et colonne `link` ; « parité IdxPurge » : comptes comparés hors
+  marque `approx` ; « archive_chart d'avant 1.0.211 » : colonne ajoutée, ligne figée lue ; valeurs gardées (écrivain
+  borné, lecteurs sans écriture, valeur périmée par une sentinelle retirée). Revue 88-3 : nom principal périmé, nom
+  principal exclu puis supprimé (jamais d'ajouté fantôme), nom absent d'un snapshot présent, version `h` d'une autre
+  archive sans effet sur la paire, empreinte (sentinelle refaite à l'identique, ligne de paire retirée), arrêt demandé et
+  paire du Bkp seule, `MemoryError` en `[WARN]`, erreur SQLite sans `~` sur un nick sans lien ; row 41 : les deux
+  snapshots de la paire purgés, comptes cohérents — `~8` / `~57%nb` avec un lien dans le nick, sans `~` une fois le nick
+  sans lien (paires Z et W de même) ; « DbEncrypt puis DbDecrypt
+  avec liens physiques… » (revue 4 : base chiffrée à la 1.0.209 puis DbDecrypt sans erreur, nom principal en clair sans
+  version gardé, lien altéré jamais réencodé, réparation absente d'un Bkp, marqueurs retirés) ; « DbEncrypt repris après un
+  binaire qui ne migrait pas link… » ; « snapshot : enregistrements de borg list terminés par NUL… » ; « auto-réparation » :
+  nom principal périmé -> snapshot complet ; « auto-réparation une fois par archive… » (nom principal exclu par
+  `IDX_EXCLUDE` : second Index incrémental ; hors périmètre dans un snapshot non marqué : incrémental) ; passe d'écrivain :
+  une archive en erreur, les autres gardées. Décision 7 (row 57) : IdxPurge n'écrit aucune valeur gardée, seules celles
+  des paires touchées périmées, lecteurs à la volée aux mêmes comptes, puis la passe d'un Index simple les refait (contrôle des
+  liens physiques, et sur vrai borg : IdxPurge `-x` puis Index sans archive nouvelle). « bascule lente » (row 6 de la
+  story 94) : le processus qui bascule tient une connexion write comme `_vacuum_db`, écrivains d'un autre processus
+  (passe de calcul comprise) ; après chaque bascule, `integrity_check` ok, écriture d'une connexion neuve relue, encore ok.
+
 ## borgHelper 1.0.210 — Verrous SQLite gardés pendant une bascule — 2026-10-22
 
 Chantier « reconstruction progressive », story 94 (trouvé par la revue 5 de la story 88, row 56 : base servie laissée
