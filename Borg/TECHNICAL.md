@@ -1382,6 +1382,44 @@ copié) et sur `SQLITE_DONE` (copie validée) ; seul le premier appel sur une tr
 était pris pour orphelin et supprimé. Contrôles `CodecSelfTest` multi-processus : lecteurs, écrivain pendant 5 compactages, annulation,
 compactage sous `priority.lock`, kill -9 au milieu de la copie, base chiffrée.
 
+**Verrous POSIX et réouverture d'une base tenue (1.0.210, story 94).** Les verrous de SQLite sous Unix sont des verrous
+POSIX (`fcntl`), par processus et par fichier : `close()` de N'IMPORTE QUEL descripteur d'un fichier les retire tous, y compris
+ceux des connexions SQLite déjà ouvertes par ce processus — SQLite n'en sait rien (son décompte interne le croit toujours
+verrouillé) et ne les reprend pas (« How To Corrupt An SQLite Database File », §2.2). Jusqu'à 1.0.209, `_open_db` (rôles
+`write`/`admin`, depuis 1.0.100) faisait `os.open(path, O_RDWR|O_CREAT, 0600)` puis `os.close` à CHAQUE ouverture, base
+existante comprise, pour la créer en 0600 : toute réouverture d'une base que le processus tenait déjà le rendait invisible aux
+autres processus, jusqu'à la fermeture de toutes ses connexions. C'est le cas de tous les appelants de `_swap_db` — `_vacuum_db`
+(IdxPurge, nettoyage après Prune : `conn` tenue pour `changed`), bascule du fantôme (`watch` tenue) — dont `dst` est ouverte par
+`_open_db(admin)`, et des processus à plusieurs connexions (fils d'Index, borgHelperWWW). Un autre processus qui fermait alors
+sa dernière connexion obtenait le verrou EXCLUSIVE, se croyait seul et supprimait `-wal` et `-shm` (checkpoint de fermeture) :
+sous une copie en cours, un écrivain d'un autre processus écrivait dans de nouveaux `-wal`/`-shm` sans attendre la copie et son
+écriture était perdue ; un processus qui gardait l'ancienne mémoire partagée et ouvrait une nouvelle connexion lisait un `-wal`
+recréé vide : « disk I/O error », `SQLITE_IOERR_SHORT_READ`, puis « database disk image is malformed », durablement. Sans copie en
+cours ni nouvelle connexion ouverte après la suppression, pas de dommage : le processus aveugle reste cohérent dans son propre
+`-wal`. Mesures et journaux : CHANGELOG 1.0.210, `work/s94/meas/ev/`.
+
+Correctif : `_db_create_file(db_path)`, seul `os.open` d'une base du code de production, appelée par `_open_db` (rôles
+`write`/`admin`) : `O_CREAT|O_EXCL` sur le chemin donné (non résolu) — un fichier existant n'est jamais ouvert (EEXIST) ; le
+fichier qu'elle vient de créer est refermé aussitôt. Cette création et TOUS les `sqlite3.connect` d'`_open_db` (lecteur
+`mode=rw`, `create_file=False`, écrivain) se font sous le verrou de leur chemin (`_db_path_lock` : clé `os.path.abspath`, dict
+protégé par un verrou court sans aucune E/S ; remis à neuf dans l'enfant d'un fork) : un autre fil ne peut pas ouvrir par
+`_open_db`, sous le même nom, la base neuve avant ce `close()` — sinon ses verrous tomberaient pour toute la vie de sa
+connexion ; un `open()` bloqué (NFS, autofs, FUSE figés) ne gèle que les ouvertures de sa base. Limite : un lien et sa cible
+sont deux clés. Les `sqlite3.connect` directs hors `_open_db` (`_db_probe`, lectures `mode=ro`) ne l'attendent pas :
+`_db_probe` saute un fichier de 0 octet, les autres lisent des bases déjà créées. EEXIST sans fichier présent = lien pendant :
+`os.open(…, O_RDWR|O_CREAT, 0600)` sur le chemin donné, non résolu, comme 1.0.209 — le noyau suit le lien avec ses protections
+(`fs.protected_symlinks`), cible créée en 0600 quel que soit le propriétaire du lien (jamais `os.path.realpath`, qui les
+contournerait). Gardes CodecSelfTest : AST (`_file_open_scan`, liste blanche `_FOG_WL` par famille de
+chemins et nombre exact, `_FOG_EXCL` : O_CREAT|O_EXCL exigé, sauf un O_CREAT seul dans `except FileExistsError` ; limites : compte par (fonction, type
+d'appel), ouvertures faites dans une bibliothèque — tarfile, shutil.move, filecmp, zipfile — et `dir_fd=` non vues, alias,
+`getattr`, import nommé) et crochet d'audit
+(`_held_open_hook`, `_HELD_GUARD` : évènement `open` sur une base tenue — cibles de `/proc/self/fd` dont l'en-tête, lu par `pread`
+sur le descripteur existant, est celui de SQLite — ou son `-wal`/`-shm` ; création exclusive jamais relevée ; selftest seulement ; limites : base de 0
+octet non reconnue, chemin relatif avec `dir_fd=` résolu contre le dossier courant, ouvertures de fils démons d'un contrôle
+antérieur attribuées à la mesure), chacune prouvée par ses témoins (forme 1.0.209, `open(db_path,'rb')` dans `_vacuum_db`). `_swap_db`
+inchangé (contrat, messages, codes, coût). Restore à plat vers CACHE_DIR (`shutil.copy2` sur des bases en service) : reporté
+(revue 94 row 11).
+
 **Suppression d'une base : `_unlink_db` (1.0.149).** Retirer une base et ses `-wal`/`-shm` passe par une seule
 fonction, `_unlink_db(path)` (fichiers absents ignorés), appelée par `_swap_db` (nouvelle base après copie ou
 refusée), `_vacuum_db` (copie de compactage) et `_shadow_discard` (fantôme jeté). Avant, ces trois lignes étaient
@@ -2472,7 +2510,7 @@ avec `-y`, `_db_migrate_cache` quand même — décision de l'utilisateur), `_db
 `O_CREAT` — fichier inexistant (ou supprimé entre le test et l'ouverture) : connexion `:memory:` (mêmes « no such table »
 qu'un fichier vide : réponse des lecteurs inchangée, mesurée sur 21 commandes) ; fichier existant : URI `mode=rw` (ne
 recrée pas un fichier supprimé ; repli lecture seule sur un fichier 0444, comme avant ; `mode=ro` laisserait `-wal`/`-shm`).
-`write`/`admin` : `O_CREAT` 0600 inchangé. Un seul prédicat : `_db_probe(p, timeout)` -> `absent` (inexistant, 0 octet sans
+`write`/`admin` : création 0600 inchangée (1.0.210 : `_db_create_file`, `O_CREAT|O_EXCL`, jamais d'ouverture d'un fichier existant — verrous POSIX, voir « Verrous POSIX et réouverture d'une base tenue »). Un seul prédicat : `_db_probe(p, timeout)` -> `absent` (inexistant, 0 octet sans
 ouverture, aucune TABLE), `base` (au moins une table), `illisible` (erreur SQLite : corrompue, verrou au-delà du délai) ; sur
 une connexion déjà ouverte : `_conn_has_table(conn)` (`type='table'`) — avertissement AD-6 d'`_open_db`,
 `archive_view_check` (`empty`), `_create_schema` (`fresh` : une vue seule n'empêche plus l'en-tête siv1). Wrappers gardés :

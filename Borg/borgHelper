@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.209"
+Version="1.0.210"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3306,7 +3306,11 @@ def _swap_db(live,new,nick=None,abort=None,changed=None,pages=4096,busy_limit=12
     moins deux tranches pour que changed() précède toujours la validation. Annulation ou erreur : `live` reste
     l'ancienne base. Coût : `live` + WAL (taille de `new`) + `new` sur le disque pendant la copie.
     keep_new=True (fantôme, 1.0.143) : `new` n'est supprimée qu'après 'ok' ou 'invalid' ; annulation ou erreur la
-    gardent pour une nouvelle tentative (sinon toute la reconstruction serait perdue)."""
+    gardent pour une nouvelle tentative (sinon toute la reconstruction serait perdue).
+    1.0.210 (story 94) : tous les appelants tiennent déjà une connexion sur `live` (conn de _vacuum_db, watch du fantôme) ;
+    `dst` passe par _open_db, qui n'ouvre plus jamais un fichier existant par os.open (O_EXCL) — avant, son os.close retirait
+    les verrous POSIX de ce processus sur `live` pendant toute la copie : un autre processus qui fermait sa dernière connexion
+    supprimait -wal/-shm sous la copie (écritures perdues, « disk I/O error », « malformed » ; voir _db_create_file)."""
     _DONE,_BUSY,_LOCKED=101,5,6
     res=None
     if not os.path.isfile(new) or os.path.getsize(new)==0:   # jamais _open_db (O_CREAT) sur un absent
@@ -3374,6 +3378,51 @@ def _empty_snapshot(conn):
         except sqlite3.Error: pass
     return False
 
+_DB_PATH_LOCKS={}   # 1.0.210 (story 94) : chemin absolu -> verrou de _db_create_file et des sqlite3.connect d'_open_db
+_DB_PATH_LOCKS_GUARD=threading.Lock()   # protège le seul dict (aucune E/S sous lui)
+
+def _db_path_lock(db_path):
+    """1.0.210 (story 94, revue row 14) : verrou PAR CHEMIN (os.path.abspath, sans résolution de lien) de la création d'une base
+    et des sqlite3.connect d'_open_db — un open() bloqué d'une base (NFS, autofs, FUSE figés) ne gèle que les ouvertures de
+    cette base, jamais celles des autres rc d'un borgHelperWWW. Limite : un lien et sa cible sont deux clés (ouvertures
+    concurrentes d'une base neuve par ses deux noms, dans deux fils, non sérialisées)."""
+    try: k=os.path.abspath(os.fsdecode(db_path))
+    except (TypeError,ValueError): k=repr(db_path)
+    with _DB_PATH_LOCKS_GUARD:
+        lk=_DB_PATH_LOCKS.get(k)
+        if lk is None: lk=_DB_PATH_LOCKS[k]=threading.Lock()
+    return lk
+
+def _db_path_locks_reset():
+    global _DB_PATH_LOCKS,_DB_PATH_LOCKS_GUARD
+    _DB_PATH_LOCKS={}; _DB_PATH_LOCKS_GUARD=threading.Lock()
+os.register_at_fork(after_in_child=_db_path_locks_reset)   # enfant d'un fork pendant qu'un autre fil en tenait un : jamais bloqué
+
+def _db_create_file(db_path):
+    """Création d'une base en 0600 (rôles write/admin d'_open_db), appelée sous _db_path_lock(db_path). 1.0.210 (story 94) :
+    O_EXCL — SEUL site d'os.open d'un fichier de base du code de production (garde AST « ouvertures de fichiers de
+    production »). Jamais un descripteur ouvert puis fermé sur une base EXISTANTE : les verrous POSIX (fcntl) de SQLite sont
+    par processus et par fichier, et close() de N'IMPORTE QUEL descripteur du fichier les retire tous, connexions SQLite déjà
+    ouvertes par ce processus comprises (SQLite n'en sait rien et ne les reprend pas). Avant 1.0.210 (os.open sans O_EXCL
+    depuis 1.0.100), chaque ouverture write/admin d'une base déjà ouverte par le même processus le rendait invisible aux
+    autres : _swap_db (dst) dans _vacuum_db (conn tenue) ou la bascule du fantôme (watch tenue), processus à plusieurs
+    connexions (Index, borgHelperWWW). Un autre processus qui fermait alors sa dernière connexion se croyait seul (verrou
+    EXCLUSIVE obtenu) et supprimait -wal et -shm sous une copie en cours : écritures concurrentes perdues, puis « disk I/O
+    error », SQLITE_IOERR_SHORT_READ, « database disk image is malformed » (mesuré, story 94).
+    Fichier créé par cet appel : refermé aussitôt, sous le verrou de son chemin, que les ouvertures d'_open_db de ce chemin
+    prennent aussi — aucun autre fil ne peut l'avoir ouvert par _open_db (même nom) entre la création et ce close() (les
+    sqlite3.connect directs de _db_probe sautent un fichier de 0 octet). EEXIST sans fichier présent = lien pendant (revue
+    row 13) : os.open SANS O_EXCL sur le chemin donné, non résolu — le noyau suit le lien avec ses protections
+    (fs.protected_symlinks), cible créée en 0600 comme en 1.0.209, quel que soit le propriétaire du lien ; seule forme sans
+    O_EXCL permise par la garde AST, dans le `except FileExistsError` seulement."""
+    try:
+        try: fd=os.open(db_path,os.O_RDWR|os.O_CREAT|os.O_EXCL,0o600)
+        except FileExistsError:
+            if os.path.exists(db_path): return   # base existante : jamais ouverte ici
+            fd=os.open(db_path,os.O_RDWR|os.O_CREAT,0o600)   # lien pendant : suivi par le noyau, comme 1.0.209
+        os.close(fd)
+    except OSError: pass   # existante (EEXIST), ou erreur que sqlite3 rejouera avec son propre message (OperationalError)
+
 _DEK_FAIL=set()   # 1.0.169 : clés (chemin, mac, condensé passphrase) dont l'enveloppe a refusé la passphrase — pas de KDF refaite
 
 def _open_db(db_path,nick=None,role='read',passphrase=None,empty_ok=False,_retried=False,create_file=None,**kw):
@@ -3397,7 +3446,8 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,empty_ok=False,_retri
     comme une base jamais indexée ; l'Index suivant répare (_heal_empty_header). Base avec données, passphrase absente,
     écrivain, base hors WAL : DbKeyError comme avant. Défaut False : sonde de mode (borgHelperWWW _nick_owner_codec),
     moteur, bibliothèque. Attention : codec None ne veut PAS dire « en clair » quand mode=='empty'.
-    create_file (1.0.172, story 34/35, A61) : None -> le rôle décide (read : jamais ; write/admin : O_CREAT 0600) ; False pour
+    create_file (1.0.172, story 34/35, A61) : None -> le rôle décide (read : jamais ; write/admin : création 0600 par
+    _db_create_file, 1.0.210 : O_EXCL, jamais un fichier existant ouvert hors de SQLite) ; False pour
     write/admin -> ouverture mode=rw, fichier absent = sqlite3.OperationalError (ensure_*(create=False) : jamais recréer une
     base supprimée entre sa sonde et son ouverture)."""
     if role not in _DB_ROLES: raise ValueError(f"role invalide : {role!r} (attendu {'|'.join(_DB_ROLES)})")
@@ -3411,21 +3461,18 @@ def _open_db(db_path,nick=None,role='read',passphrase=None,empty_ok=False,_retri
         import pathlib
         conn=None; p=os.fsdecode(db_path)
         if not _file_gone(p):
-            try: conn=sqlite3.connect(pathlib.Path(p).absolute().as_uri()+'?mode=rw',factory=BhConnection,uri=True,**kw)
+            try:
+                with _db_path_lock(p): conn=sqlite3.connect(pathlib.Path(p).absolute().as_uri()+'?mode=rw',factory=BhConnection,uri=True,**kw)
             except sqlite3.OperationalError:
                 if not _file_gone(p): raise
         if conn is None: conn=sqlite3.connect(':memory:',factory=BhConnection,**kw)
     elif create_file is False and isinstance(db_path,(str,bytes,os.PathLike)) and os.fsdecode(db_path)!=':memory:':
         import pathlib   # write/admin sans création (A61) : erreur réelle si le fichier n'existe pas
-        conn=sqlite3.connect(pathlib.Path(os.fsdecode(db_path)).absolute().as_uri()+'?mode=rw',factory=BhConnection,uri=True,**kw)
+        with _db_path_lock(db_path): conn=sqlite3.connect(pathlib.Path(os.fsdecode(db_path)).absolute().as_uri()+'?mode=rw',factory=BhConnection,uri=True,**kw)
     else:
-        if isinstance(db_path,(str,bytes,os.PathLike)) and str(db_path)!=':memory:':
-            try:
-                fd=os.open(db_path,os.O_RDWR|os.O_CREAT,0o600)  # 0600 à la création, fichier existant intact
-                os.close(fd)
-            except OSError:
-                pass  # sqlite3 rejouera l'erreur avec son propre message (OperationalError)
-        conn=sqlite3.connect(db_path,factory=BhConnection,**kw)
+        with _db_path_lock(db_path):   # 1.0.210 (story 94) : création puis close() jamais pendant l'ouverture d'un autre fil
+            if isinstance(db_path,(str,bytes,os.PathLike)) and os.fsdecode(db_path)!=':memory:': _db_create_file(db_path)
+            conn=sqlite3.connect(db_path,factory=BhConnection,**kw)
     conn.role=role; conn.nick=nick
     try:
         if nick is not None:
@@ -12747,6 +12794,132 @@ def _sql_marker_scan(src,label,skip=()):
 
 _ST_PATH_VECTOR='Bzlli9DHwb7cerehZg/QIH8kVKtaTDqGJoDFQ/HBn.TTx6SCURAOpcPg'  # k_path=0x01*32, k_enc=0x02*32, 'a/b/c' (recalculé indépendamment)
 
+# ── 1.0.210 (story 94, revue row 1) : ouvertures de fichiers hors SQLite — garde AST et garde par crochet d'audit ──
+# Un close() de N'IMPORTE QUEL descripteur d'un fichier retire tous les verrous POSIX du processus sur lui, ceux des connexions
+# SQLite comprises (voir _db_create_file) : aucune base ne doit être ouverte hors de SQLite. Liste blanche NOMMÉE, nombre exact
+# par (fonction, appel) : famille de chemins qui n'est jamais une base ; seul site d'une base : _db_create_file (O_CREAT|O_EXCL).
+_FOG_WL={'borgHelper':{
+    'getDataFromEnvOrFile|open':(2,'fichier de données nommé par l\'utilisateur (passphrase)'),
+    '_repo_current_id._rd|open':(1,'config d\'un dépôt borg'),
+    '_borg_leftovers|open':(3,'dossiers de sécurité et clés de borg (location, clé, key-type)'),
+    '_audit_hook|open':(1,'journal du crochet d\'audit du selftest'),
+    '_audit_witness|open':(1,'témoin d\'audit : chemin inexistant'),
+    'mountedornot|open':(1,'/proc/mounts'), '_mount_table|open':(1,'/proc/self/mounts'), '_pid_start|open':(1,'/proc'),
+    '_LocalResolver._load|os.open':(1,'marque du résolveur de dépôts'), '_LocalResolver._update|os.open':(2,'marque : .lock et temporaire'),
+    '_state_load|os.open':(1,'fichier d\'état JSON'), '_state_update|os.open':(2,'état JSON : .lock et temporaire'),
+    '_db_create_file|os.open':(2,'création d\'une base : O_CREAT|O_EXCL, et un O_CREAT sans O_EXCL dans except FileExistsError (lien pendant, 1.0.209) — vérifié'),
+    '_atomic_write_rc|os.open':(1,'dossier du rc (fsync)'),
+    'BorgHelperDB._set_pid_lock|open':(1,'verrou PID (temporaire)'), 'BorgHelperDB._lock_holder|open':(1,'verrou PID'),
+    'BorgHelperDB.write_index_last|os.open':(1,'index-last.json (temporaire)'), 'BorgHelperDB.read_index_last|open':(1,'index-last.json'),
+    'BorgHelperDB._acquire_pid_lock_excl|open':(1,'verrou PID (temporaire)'), 'BorgHelperDB._acquire_pid_lock_excl|os.open':(1,'verrou PID'),
+    'BorgHelperDB._release_own_lock|open':(1,'verrou PID'), 'BorgHelperDB.set_index_pending_lock|open':(1,'index-pending.lock'),
+    'BorgHelperDB.repo_lock_holders|open':(1,'lock.roster d\'un dépôt borg'),
+    '_pid_stat|open':(1,'/proc'), '_pid_start_time|open':(2,'/proc'), '_mei_in_use|open':(1,'/proc'), '_proc_kids|open':(1,'/proc'),
+    '_proc_argv|open':(1,'/proc'), '_proc_environ|open':(1,'/proc'), '_proc_uid|open':(1,'/proc'), '_group_pids|open':(1,'/proc'),
+    '_proc_tmpdirs|open':(1,'/proc'), '_mei_mapped|open':(1,'/proc'),
+    'BorgRunner.repoLocalAbsent|os.open':(1,'dossier d\'un dépôt borg (montage autofs)'),
+    'BorgHelper.restore|shutil.copy2':(1,'fichiers restaurés vers la destination de Restore (destination dans CACHE_DIR non refusée : '
+                                         'revue 94 row 11, reportée)'),
+    'BorgHelper._restore_to_tar|.open':(2,'archive tar de destination'),
+    'BorgHelper._storage_collect|open':(1,'rc')},
+  'borgHelperWWW':{
+    '_rc_parse_master|open':(1,'rc'), '_rc_cache_dir|open':(1,'rc'), '_rc_www_section_warn|open':(1,'rc'),
+    '_borghelper_disk_version|open':(1,'source de borgHelper'), '_bkp_markers_state|open':(1,'marques de Bkp (PID)'),
+    '_push_prefs_locked|os.open':(1,'préférences push : .lock'), '_push_prefs_load|open':(1,'préférences push (JSON)'),
+    '_rc_files_check|os.open':(1,'liste des rc : .lock'), '_rc_files_check|open':(1,'liste des rc (JSON)'),
+    '<module>|.read_text':(2,'UI et service worker'), '<module>|.read_bytes':(1,'Chart.js'), 'favicon|.read_bytes':(1,'icône'),
+    '_storage_nicks|open':(1,'rc')}}
+_FOG_EXCL={'borgHelper':'_db_create_file|os.open'}   # site d'une base : O_CREAT|O_EXCL, ou O_CREAT seul dans except FileExistsError (1 au plus)
+
+def _file_open_scan(src,tests=('codec_selftest','perf_bench','push_selftest')):
+    """Ouvertures de fichiers par chemin du code de production (hors fonctions `tests` et _pb_*) : open, io.open, os.open,
+    builtins.open, attribut .open (Path, tarfile…), .read_bytes/.read_text/.write_bytes/.write_text, shutil.copy* (hors
+    copyfileobj) -> [(fonction qualifiée | '<module>', appel, ligne, nœud)] ; nœud._bh_eexist : appel dans un
+    `except FileExistsError`. Limites connues (revue 94 row 17) : liste blanche au compte par (fonction, type d'appel) — un
+    site remplacé par un autre du même type dans la même fonction n'est pas vu (arguments jamais comparés : refusé, pas
+    d'adversaire, coût) ; ouvertures faites DANS une bibliothèque (tarfile, shutil.move, filecmp, zipfile…) et `dir_fd=` non
+    vues ; alias (o=open ; o(p)), getattr, import nommé (from os import open) ; descripteur reçu d'ailleurs (os.fdopen : pas
+    une ouverture par chemin)."""
+    import ast
+    out=[]
+    def walk(n,q,ex=False):
+        for c in ast.iter_child_nodes(n):
+            if isinstance(c,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):
+                if isinstance(c,(ast.FunctionDef,ast.AsyncFunctionDef)) and (c.name in tests or c.name.startswith('_pb_')): continue
+                walk(c,q+[c.name]); continue
+            if isinstance(c,ast.ExceptHandler):
+                walk(c,q,isinstance(c.type,ast.Name) and c.type.id=='FileExistsError'); continue
+            if isinstance(c,ast.Call):
+                f=ast.unparse(c.func); k=None
+                if f in ('open','io.open','os.open','builtins.open'): k=f
+                elif isinstance(c.func,ast.Attribute) and c.func.attr=='open': k='.open'
+                elif isinstance(c.func,ast.Attribute) and c.func.attr in ('read_bytes','read_text','write_bytes','write_text'): k='.'+c.func.attr
+                elif f.startswith('shutil.copy') and f!='shutil.copyfileobj': k=f
+                if k: c._bh_eexist=ex; out.append(('.'.join(q) or '<module>',k,c.lineno,c))
+            walk(c,q,ex)
+    walk(ast.parse(src),[]); return out
+
+def _file_open_file(nm,src,wl,excl=None):
+    """Partie fichier de la garde : site hors liste blanche `wl` ({'fonction|appel': (nombre, famille)}), nombre exact par
+    entrée, et chaque appel du site `excl` avec O_CREAT et O_EXCL dans ses drapeaux (2e argument) — sauf UN appel O_CREAT sans
+    O_EXCL dans un `except FileExistsError` (lien pendant suivi par le noyau, revue 94 row 13) -> liste des écarts."""
+    import ast
+    bad=[]; cnt={}; loose=0
+    for q,k,l,c in _file_open_scan(src):
+        key=f"{q}|{k}"; cnt[key]=cnt.get(key,0)+1
+        arg=ast.unparse(c.args[0]) if c.args else ''
+        if key not in wl: bad.append(f"{nm}:{l} ({q}) {k}({arg}) : ouverture de fichier hors liste blanche")
+        if key==excl:
+            fl=ast.unparse(c.args[1]) if len(c.args)>1 else ''
+            if 'O_CREAT' in fl and 'O_EXCL' not in fl and getattr(c,'_bh_eexist',False) and loose==0: loose=1
+            elif not ('O_CREAT' in fl and 'O_EXCL' in fl): bad.append(f"{nm}:{l} ({q}) os.open({arg}) sans O_CREAT|O_EXCL : {fl or 'aucun drapeau'}")
+    for key,(n,_) in wl.items():
+        if cnt.get(key,0)!=n: bad.append(f"{nm} liste blanche {key} : {cnt.get(key,0)} ouverture(s), {n} attendue(s) — à revoir")
+    return bad
+
+_HELD_GUARD={'hits':None,'installed':False}   # crochet « ouverture d'une base tenue » : actif quand hits est une liste
+
+def _held_db_files():
+    """Fichiers de base SQLite que ce processus tient ouverts (et leurs -wal/-shm) : cibles de /proc/self/fd dont les 16 premiers
+    octets, lus par pread sur le descripteur EXISTANT (jamais une ouverture), sont l'en-tête de SQLite. Limite : base de 0 octet
+    (créée, encore jamais écrite) non reconnue."""
+    out=set()
+    try: ns=os.listdir('/proc/self/fd')
+    except OSError: return out
+    for n in ns:
+        try:
+            t=os.readlink(f'/proc/self/fd/{n}')
+            if t.startswith('/') and os.pread(int(n),16,0)==b'SQLite format 3\x00': out.update((t,t+'-wal',t+'-shm'))
+        except (OSError,ValueError): continue
+    return out
+
+def _held_open_hook(ev,args):
+    """Crochet d'audit (sys.addaudithook, posé une fois par processus) : pendant une mesure (_HELD_GUARD['hits'] liste), toute
+    ouverture par chemin (évènement `open` : open, io.open, os.open, Path.open, shutil.copy*…) dont le chemin réel est une base
+    que ce processus tient, ou son -wal/-shm, est relevée avec la pile de borgHelper. Création exclusive (mode 'x', ou
+    O_CREAT|O_EXCL : n'ouvre jamais un fichier existant) : jamais relevée. Les fichiers ouverts par SQLite n'ont pas d'évènement.
+    Selftest seulement (posé par le contrôle « ouvertures d'une base tenue », jamais en production). Limites (revue 94 row 18) :
+    chemin relatif avec dir_fd= (résolu contre le dossier courant, pas contre dir_fd : faux silence) ; ouvertures des fils
+    démons laissés par un contrôle antérieur, relevées si elles tombent pendant la mesure (attribuées à ce contrôle) ; base de
+    0 octet non reconnue (voir _held_db_files)."""
+    hits=_HELD_GUARD['hits']
+    if hits is None or ev!='open' or getattr(_AUDIT_TLS,'held_off',False): return
+    _AUDIT_TLS.held_off=True
+    try:
+        a,mode,flags=(tuple(args)+(None,None,None))[:3]
+        if a is None or isinstance(a,int): return
+        if isinstance(mode,str) and 'x' in mode: return
+        if isinstance(flags,int) and flags & os.O_CREAT and flags & os.O_EXCL: return
+        p=os.path.realpath(os.fsdecode(a))
+        if p in _held_db_files():
+            where=[]; f=sys._getframe(1)
+            while f is not None and len(where)<4:
+                if f.f_code.co_filename==__file__: where.append(f"{f.f_code.co_name}:{f.f_lineno}")
+                f=f.f_back
+            hits.append((p,' < '.join(where)))
+    except Exception: pass   # jamais d'exception hors du crochet : l'appel audité échouerait
+    finally: _AUDIT_TLS.held_off=False
+
 def codec_selftest(pattern=None,list_only=False):
     """Retourne le nombre de contrôles en échec plus celui des décors _pre en échec hors sélection (lignes DÉCOR EN ÉCHEC, 1.0.204)
     — 0 = tout OK ; None seulement si un filtre ne sélectionne aucun contrôle ET qu'aucun décor n'a échoué (sinon ce nombre).
@@ -16346,7 +16519,25 @@ def codec_selftest(pattern=None,list_only=False):
             b=BorgHelper(cfgfile=rc,cache_dir=cdir)
             b.borg.cfgwrite('n','srv','pw','/repo',None)
             c=_open_db(os.path.join(cdir,'new.db'),nick=None,role='write'); c.close()   # 1.0.171 : un lecteur ne crée plus
-            return (_mode(rc),_mode(cdir),_mode(os.path.join(cdir,'new.db')))==(0o600,0o700,0o600)
+            # 1.0.210 (story 94) : création O_EXCL (_db_create_file) — lien vers une cible absente : cible 0600, lien gardé
+            # (aussi par une chaîne de liens relatifs) ; lien vers une base 0640 : 0640 gardé ; lien « d'un autre compte »
+            # (propriétaire simulé) : suivi par le noyau, cible 0600 comme en 1.0.209 (revue 94 row 13 ; umask 022)
+            r={}; old_um=os.umask(0o022); real_uid=os.getuid
+            try:
+                t=os.path.join(cdir,'lt-cible.db'); l=os.path.join(cdir,'lt-lien.db'); os.symlink(t,l)
+                _open_db(l,nick=None,role='admin').close(); r['lien -> absente']=(_mode(t),os.path.islink(l))
+                os.symlink('lt-c2.db',os.path.join(cdir,'lt-a.db')); os.symlink('lt-a.db',os.path.join(cdir,'lt-b.db'))
+                _open_db(os.path.join(cdir,'lt-b.db'),nick=None,role='write').close(); r['chaîne']=_mode(os.path.join(cdir,'lt-c2.db'))
+                e=os.path.join(cdir,'lt-e.db'); open(e,'w').close(); os.chmod(e,0o640); os.symlink(e,os.path.join(cdir,'lt-le.db'))
+                _open_db(os.path.join(cdir,'lt-le.db'),nick=None,role='write').close(); r['lien -> existante']=_mode(e)
+                o=os.path.join(cdir,'lt-o.db'); os.symlink(o,os.path.join(cdir,'lt-lo.db')); os.getuid=lambda: real_uid()+1
+                try: _open_db(os.path.join(cdir,'lt-lo.db'),nick=None,role='write').close()
+                finally: os.getuid=real_uid
+                r['autre compte']=_mode(o) if os.path.exists(o) else 'absente'
+            finally: os.getuid=real_uid; os.umask(old_um)
+            ok=r=={'lien -> absente':(0o600,True),'chaîne':0o600,'lien -> existante':0o640,'autre compte':0o600}
+            if not ok: print(f"     détail : liens {r}")
+            return ok and (_mode(rc),_mode(cdir),_mode(os.path.join(cdir,'new.db')))==(0o600,0o700,0o600)
         check("permissions : rc 0600, cache 0700, .db 0600 à la création",_perm_new)
         def _pp_percent():
             """1.0.194 (story 69, D190) : passphrase injectée (BorgRunner/BorgHelper passphrase=, que -P, BORGHELPERC_RUNTIME_PASSPHRASE
@@ -19854,6 +20045,241 @@ def codec_selftest(pattern=None,list_only=False):
                         try: os.unlink(fx)
                         except OSError: pass
         check("bascule lente (> 5 s) : témoin au défaut de sqlite3 refusé ; archive_view_check et _index_finish (60 s) attendent et écrivent ; vue déjà bonne relue sous verrou -> 'ok' (1.0.205, D198)",_swap_slow_writers)
+        def _swap_locks_kept():
+            """1.0.210 (story 94) : verrous POSIX d'un processus gardés quand il rouvre une base qu'il tient déjà — vrais processus,
+            poignée de main par fichiers (revue 94 row 2) : la copie, dans l'autre processus, s'arrête après sa 1re tranche (verrou
+            d'écriture de la base servie tenu, fichier `started`) et attend le fichier `release` (30 s au plus) ; « copie encore en
+            cours » (processus vivant, pas de `done`) relevé juste avant `release` et exigé ; `done` porte la raison de sortie de
+            la barrière (`release` exigé ; « délai » dit à part dans le détail, revue 94 row 15). (1) Forme de _vacuum_db (conn) et de la
+            bascule du fantôme (watch) : le processus qui bascule tient une connexion (lecteur) sur la base servie quand _swap_db
+            ouvre `dst` par _open_db(admin). Un lecteur éphémère d'un autre processus ouvre, lit et ferme pendant la copie : -wal et
+            -shm toujours là (il ne s'est jamais cru seul) ; un écrivain de cet autre processus (_open_db write, 60 s, dans un fil)
+            est encore en attente au `release` puis écrit dans la nouvelle base. (2) Ce processus tient une connexion write et en
+            ouvre/ferme une seconde par _open_db pendant la copie ; après elle, une nouvelle connexion puis l'ancienne écrivent.
+            Les deux : copie 'ok', gen B, lignes présentes, integrity_check ok. 1.0.209 (os.open puis os.close sans O_EXCL dans
+            _open_db, mesuré) : (1) -wal/-shm supprimés sous la copie, écriture perdue ; (2) « disk I/O error ». Fils vivants au
+            fork dits dans le détail (revue 94 row 10)."""
+            import threading as _th
+            live=os.path.join(tmp,'swk-live.db'); new=live+'.new'; marker=live+'.started'; done=live+'.done'; rel=live+'.release'
+            def _child(held_role):
+                r='?'
+                try:
+                    h=_open_db(live,nick=None,role=held_role,timeout=60) if held_role else None
+                    try:
+                        if h is not None: h.execute("SELECT count(*) FROM t").fetchone()   # verrou SHARED tenu, comme conn/watch
+                        t0=[]; why=['barrière jamais atteinte']
+                        def _gate():   # rappel après chaque tranche : 1re tranche faite (verrou tenu), puis attente de `release`
+                            if not t0:
+                                t0.append(time.monotonic()); open(marker,'a').close()
+                                while not os.path.exists(rel) and time.monotonic()-t0[0]<30: time.sleep(0.02)
+                                why[0]='release' if os.path.exists(rel) else 'délai (30 s sans release)'
+                            return False
+                        r=_swap_db(live,new,pages=4,abort=_gate)+'|'+why[0]
+                    finally:
+                        if h is not None: h.close()
+                except BaseException as e: r=f"{type(e).__name__}: {e}"
+                finally:
+                    try:
+                        with open(done,'w') as fh: fh.write(str(r))
+                    finally: os._exit(0)
+            def _round(held_role,during,after):
+                _swap_mk(live,'A',30).close(); _swap_mk(new,'B',9000).close()
+                for f in (marker,done,rel):
+                    if os.path.exists(f): os.unlink(f)
+                out={'fils vivants au fork':_th.active_count()}
+                p=_fork.Process(target=_child,args=(held_role,)); p.start()
+                try:
+                    tw=time.monotonic()
+                    while not os.path.exists(marker) and p.is_alive() and time.monotonic()-tw<30: time.sleep(0.02)
+                    out['copie commencée']=os.path.exists(marker)
+                    try: during(out)
+                    except sqlite3.Error as e: out['erreur pendant']=f"{getattr(e,'sqlite_errorname','?')} {e}"
+                    out['copie encore en cours']=p.is_alive() and not os.path.exists(done)
+                finally:
+                    open(rel,'a').close(); p.join(30)
+                    if p.is_alive(): p.kill(); p.join(5)   # jamais d'orphelin qui garderait la base ouverte
+                try: after(out)
+                except sqlite3.Error as e: out['erreur après']=f"{getattr(e,'sqlite_errorname','?')} {e}"
+                try:
+                    with open(done) as fh: out['copie'],_,out['sortie de la barrière']=fh.read().partition('|')
+                except OSError: out['copie']=None
+                try:
+                    c=sqlite3.connect(live)
+                    try:
+                        out['gen']=c.execute("SELECT gen FROM meta").fetchone()
+                        out['lignes']=sorted(r[0] for r in c.execute("SELECT x FROM w"))
+                        out['intégrité']=c.execute("PRAGMA integrity_check").fetchone()[0]
+                    finally: c.close()
+                except sqlite3.Error as e: out['intégrité']=f"{type(e).__name__}: {e}"
+                return out
+            def _w(conn,x): conn.execute("INSERT INTO w VALUES(?)",(x,)); conn.commit()
+            wth=[]
+            def _during1(out):
+                r=sqlite3.connect(live,timeout=60)
+                try: r.execute("SELECT count(*) FROM t").fetchone()
+                finally: r.close()
+                out['-wal/-shm gardés']=all(os.path.exists(live+s) for s in ('-wal','-shm'))
+                res=out.setdefault('écrivain',[])
+                def _wr():
+                    try:
+                        w=_open_db(live,nick=None,role='write',timeout=60)
+                        try: _w(w,1)
+                        finally: w.close()
+                        res.append('écrit')
+                    except Exception as e: res.append(f"{type(e).__name__}: {e}")
+                t=_th.Thread(target=_wr,daemon=True); t.start(); wth.append(t)
+                t.join(0.5); out['écrivain en attente au release']=t.is_alive()   # copie tenue : il attend son verrou
+            def _after1(out):
+                for t in wth: t.join(70)
+                out['écrivain fini']=not any(t.is_alive() for t in wth)
+            held=[]
+            def _during2(out):
+                c=_open_db(live,nick=None,role='write',timeout=60); held.append(c)
+                c.execute("SELECT count(*) FROM t").fetchone()
+                _open_db(live,nick=None,role='write',timeout=60).close()   # seconde ouverture du même processus pendant la copie
+            def _after2(out):
+                c2=_open_db(live,nick=None,role='write',timeout=60)
+                try: c2.execute("SELECT count(*) FROM t").fetchone(); _w(c2,2)
+                finally: c2.close()
+                _w(held[0],3)
+            try:
+                o1=_round('read',_during1,_after1)
+                try: o2=_round(None,_during2,_after2)
+                finally:
+                    for c in held: c.close()
+                ok1=(o1.get('copie commencée') and o1.get('copie encore en cours') is True and o1.get('copie')=='ok' and o1.get('sortie de la barrière')=='release'
+                     and o1.get('-wal/-shm gardés') is True and o1.get('écrivain en attente au release') is True
+                     and o1.get('écrivain fini') is True and o1.get('écrivain')==['écrit'] and not any(k.startswith('erreur') for k in o1)
+                     and o1.get('gen')==('B',) and o1.get('lignes')==[1] and o1.get('intégrité')=='ok')
+                ok2=(o2.get('copie commencée') and o2.get('copie encore en cours') is True and o2.get('copie')=='ok' and o2.get('sortie de la barrière')=='release'
+                     and not any(k.startswith('erreur') for k in o2) and o2.get('gen')==('B',)
+                     and o2.get('lignes')==[2,3] and o2.get('intégrité')=='ok')
+                if not (ok1 and ok2): print(f"     détail : (1) {o1} — (2) {o2}")
+                return ok1 and ok2
+            finally:
+                if not any(t.is_alive() for t in wth):   # fil d'écrivain encore vivant : bases laissées (il s'en sert)
+                    _unlink_db(live); _unlink_db(new)
+                    for f in (marker,done,rel):
+                        try: os.unlink(f)
+                        except OSError: pass
+        check("bascule : processus qui rouvre une base qu'il tient (conn de _vacuum_db, watch du fantôme, seconde connexion) -> -wal/-shm gardés, aucune écriture perdue, base intacte (1.0.210, story 94)",_swap_locks_kept)
+        def _file_open_guard():
+            """1.0.210 (story 94, revue row 1) — garde AST (_file_open_scan) de borgHelper et borgHelperWWW : toute ouverture de
+            fichier par chemin du code de production est dans la liste blanche nommée _FOG_WL (famille de chemins qui n'est jamais
+            une base, nombre exact par fonction et appel) ; le seul site d'une base, _db_create_file, porte O_CREAT|O_EXCL. Témoins :
+            open(db_path,'rb') ajouté dans _vacuum_db, forme 1.0.209 de _db_create_file (sans O_EXCL), site retiré, et une source
+            par forme d'appel (open, io.open, os.open, builtins.open, Path.open, read_bytes, write_text, shutil.copy, copy2,
+            copyfile) — chacune signalée ; os.fdopen et shutil.copyfileobj (descripteur, objet fichier) jamais signalés."""
+            here=os.path.dirname(os.path.abspath(__file__)); bad=[]; srcs={}
+            for nm in ('borgHelper','borgHelperWWW'):
+                if nm=='borgHelperWWW' and not os.path.isfile(os.path.join(here,nm)):
+                    print("  borgHelperWWW absent à côté de borgHelper : sa partie de la garde est sautée"); continue
+                try:
+                    with open(os.path.join(here,nm),encoding='utf-8') as fh: srcs[nm]=fh.read()
+                except OSError as e: bad.append(f"{nm} illisible : {e}"); continue
+                bad+=_file_open_file(nm,srcs[nm],_FOG_WL[nm],_FOG_EXCL.get(nm))
+            wit={}
+            if 'borgHelper' in srcs:
+                src=srcs['borgHelper']; wl=_FOG_WL['borgHelper']; ex=_FOG_EXCL['borgHelper']
+                a="        tmp_path=f\"{db_path}.vacuum_tmp.{os.getpid()}\"\n"
+                m1=src.replace(a,a+"        open(db_path,'rb').close()\n",1) if src.count(a)==1 else None
+                b1=_file_open_file('t',m1,wl,ex) if m1 else ['décor absent']
+                wit['open dans _vacuum_db']=len(b1)==1 and '(BorgHelper._vacuum_db) open(db_path)' in b1[0]
+                f0="        try: fd=os.open(db_path,os.O_RDWR|os.O_CREAT|os.O_EXCL,0o600)\n"
+                m2=src.replace(f0,"        try: fd=os.open(db_path,os.O_RDWR|os.O_CREAT,0o600)\n",1) if src.count(f0)==1 else None
+                b2=_file_open_file('t',m2,wl,ex) if m2 else ['décor absent']
+                wit['forme 1.0.209']=len(b2)==1 and 'sans O_CREAT|O_EXCL' in b2[0]
+                f1="    def _set_pid_lock("
+                b3=_file_open_file('t',src,dict(wl,**{'BorgHelperDB._set_pid_lock|open':(2,'x')}),ex)
+                wit['site retiré']=len(b3)==1 and 'à revoir' in b3[0] and f1 in src
+            forms=("open(p)","io.open(p)","os.open(p,os.O_RDONLY)","builtins.open(p)","pathlib.Path(p).open()","pathlib.Path(p).read_bytes()",
+                   "pathlib.Path(p).write_text('x')","shutil.copy(p,q)","shutil.copy2(p,q)","shutil.copyfile(p,q)")
+            wit['formes']=all(len(_file_open_file('t',f"def f(p,q):\n    {x}\n",{}))==1 for x in forms)
+            wit['fdopen, copyfileobj']=_file_open_file('t',"def f(fd,a,b):\n    os.fdopen(fd)\n    shutil.copyfileobj(a,b)\n",{})==[]
+            wit['hors production']=_file_open_file('t',"def codec_selftest():\n    open('x')\ndef _pb_y():\n    open('x')\n",{})==[]
+            ok=not bad and all(wit.values()) and len(wit)==6
+            if not ok: print(f"     détail : écarts {bad[:6]} ; témoins {wit}")
+            return ok
+        check("ouvertures de fichiers de production hors SQLite : liste blanche nommée par famille, base seulement par _db_create_file (O_CREAT|O_EXCL), témoins (garde AST, 1.0.210, story 94)",_file_open_guard)
+        def _held_open_guard():
+            """1.0.210 (story 94, revue row 1) — garde par crochet d'audit (_held_open_hook) : aucune ouverture par chemin (évènement
+            `open`) d'une base que ce processus tient (ou de son -wal/-shm) sur les chemins de production qui rouvrent une base
+            tenue — connexion write tenue par le contrôle pendant : _open_db read/write/admin et create_file=False, base en clair et
+            base chiffrée (nick, passphrase), ensure_diff_db (création et lecteur), archive_view_check(repair=True), _db_meta_value,
+            _db_probe, _vacuum_db (sa conn + dst de _swap_db), bascule du fantôme (_shadow_swap réel, borg factice : watch + dst +
+            écriture d'après), et un processus à la borgHelperWWW (4 fils, chacun une connexion persistante, qui appellent
+            archive_view_check(timeout=2), _db_meta_value, ensure_diff_db(create=False)). Zéro relevé exigé. Témoins : open(base,'rb')
+            d'une base tenue relevé (crochet actif), création exclusive (O_EXCL, EEXIST) et fichier sans connexion jamais relevés."""
+            import types as _types, threading as _th
+            if not _HELD_GUARD['installed']: sys.addaudithook(_held_open_hook); _HELD_GUARD['installed']=True
+            d=tempfile.mkdtemp(dir=tmp); bdb=BorgHelperDB(d,'g94'); p=os.path.join(d,'g94-diff.db'); pe=os.path.join(d,'g94e-diff.db')
+            hits=[]; res={}; held=[]; out=io.StringIO()
+            def _hold(path,**k):
+                c=_open_db(path,**k); held.append(c); c.execute("SELECT count(*) FROM sqlite_master").fetchone(); return c
+            def _meta(path,k,v):
+                c=_open_db(path,nick=None,role='admin')
+                try: c.execute("INSERT OR REPLACE INTO db_meta VALUES(?,?)",(k,v)); c.commit()
+                finally: c.close()
+            try:
+                bdb.ensure_diff_db(p); bdb.ensure_diff_db(pe)
+                c=_open_db(pe,nick=None,role='admin'); _enc_header_write(c,_enc_header_build('pw94','siv1','light')[0]); c.commit(); c.close()
+                c=_open_db(p,nick=None,role='admin')
+                c.executemany("INSERT INTO db_meta VALUES(?,?)",[(f'pad{i}','x'*2000) for i in range(300)]); c.commit()
+                c.execute("DELETE FROM db_meta WHERE key LIKE 'pad%'"); c.commit(); c.close()   # pages libres : _vacuum_db a du travail
+                _HELD_GUARD['hits']=hits
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(out):
+                    _hold(p,nick=None,role='write',timeout=60)
+                    for r_ in ('read','write','admin'): _open_db(p,nick=None,role=r_,timeout=60).close()
+                    _open_db(p,nick=None,role='write',create_file=False,timeout=60).close()
+                    bdb.ensure_diff_db(p); bdb.ensure_diff_db(p,create=False)
+                    res['vue']=bdb.archive_view_check(p,repair=True)
+                    BorgHelper._db_meta_value(p,'x'); _db_probe(p); _db_has_schema(p)
+                    _hold(pe,nick='g94e',role='read',passphrase='pw94')
+                    for r_ in ('read','write','admin'): _open_db(pe,nick='g94e',role=r_,passphrase='pw94',timeout=60).close()
+                    res['_vacuum_db']=BorgHelper._vacuum_db(None,p,verbose=False)
+                    sp=p+_SHADOW_SUFFIX; bdb.ensure_diff_db(sp); _meta(sp,'rebuild_header_fp','plain'); _meta(sp,'gen','fantôme')
+                    arch=[{'name':'g94-a1'}]
+                    fake=_types.SimpleNamespace(_index_stop_reason=lambda n,dl: None,_kill_outcome=BorgHelper._kill_outcome,
+                        _header_fp=BorgHelper._header_fp,_live_header=lambda live: BorgHelper._live_header(None,live),
+                        _db_meta_value=BorgHelper._db_meta_value,
+                        borg=_types.SimpleNamespace(_stop=None,_boex_check_stdout=lambda *a: None,
+                                                    boex=lambda n,a,debug=0: {'exitcode':0,'stdout':[{'archives':arch}]}))
+                    plan={'deadline':None,'shadow':sp}
+                    res['fantôme']=BorgHelper._shadow_swap(fake,'g94',0,{},sp,arch,plan)
+                    res['fantôme en service']=BorgHelper._db_meta_value(p,'gen')=='fantôme'
+                    errs=[]
+                    def _www(i):
+                        try:
+                            c=_open_db(p,nick=None,role='read'); c.execute("SELECT count(*) FROM db_meta").fetchone()
+                            try:
+                                for _ in range(3):
+                                    bdb.archive_view_check(p,repair=True,timeout=2); BorgHelper._db_meta_value(p,'gen')
+                                    bdb.ensure_diff_db(p,create=False)
+                            finally: c.close()
+                        except Exception as e: errs.append(f"{type(e).__name__}: {e}")
+                    ths=[_th.Thread(target=_www,args=(i,),daemon=True) for i in range(4)]
+                    for t in ths: t.start()
+                    for t in ths: t.join(60)
+                    res['fils à la borgHelperWWW']=(not errs and not any(t.is_alive() for t in ths)) or errs[:2]
+                prod=list(hits)
+                # témoins (crochet toujours actif, bases toujours tenues)
+                hits.clear(); open(p,'rb').close(); wit_open=len(hits)==1 and hits[0][0]==os.path.realpath(p)
+                hits.clear()
+                try: os.close(os.open(p,os.O_RDWR|os.O_CREAT|os.O_EXCL,0o600))
+                except FileExistsError: pass
+                _db_create_file(p); free=os.path.join(d,'libre.txt'); open(free,'w').close(); open(free).close()
+                wit_quiet=hits==[]
+            finally:
+                _HELD_GUARD['hits']=None
+                for c in held:
+                    try: c.close()
+                    except sqlite3.Error: pass
+                shutil.rmtree(d,ignore_errors=True)
+            ok=(prod==[] and wit_open and wit_quiet and res.get('vue')=='ok' and res.get('_vacuum_db') is True
+                and res.get('fantôme')==0 and res.get('fantôme en service') is True and res.get('fils à la borgHelperWWW') is True)
+            if not ok: print(f"     détail : relevés {prod[:6]} ; témoins open={wit_open} silencieux={wit_quiet} ; {res} ; sortie {out.getvalue().strip().splitlines()[-3:]}")
+            return ok
+        check("ouvertures d'une base tenue par ce processus : zéro sur _open_db (clair, chiffrée), ensure_diff_db, vue, _vacuum_db, bascule du fantôme, fils à la borgHelperWWW ; témoins (crochet d'audit, 1.0.210, story 94)",_held_open_guard)
         def _diff_writer_guard():
             """1.0.205 (story 84, D198) : garde AST. Chaque _open_db de rôle write/admin du code de production (hors CodecSelfTest,
             _pb_*), rôle lu aussi en position, est accepté seulement par (1) un délai ≥ 60 s par VALEUR : constante numérique,

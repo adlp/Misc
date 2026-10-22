@@ -1,5 +1,69 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.210 — Verrous SQLite gardés pendant une bascule — 2026-10-22
+
+Chantier « reconstruction progressive », story 94 (trouvé par la revue 5 de la story 88, row 56 : base servie laissée
+« database disk image is malformed » ou `SQLITE_IOERR_SHORT_READ` après un `_swap_db` lent pendant que d'autres connexions
+attendaient ou écrivaient). Préexistant depuis 1.0.100, pas propre à la story 84.
+
+- **Cause (mesurée)** : `_open_db` (rôles `write`/`admin`) ouvrait puis refermait le fichier de la base par `os.open(…, O_CREAT)`
+  à CHAQUE appel, base existante comprise, pour la créer en 0600. Les verrous de SQLite sont des verrous POSIX, par processus et
+  par fichier : ce `close()` retirait tous ceux du processus, connexions SQLite déjà ouvertes comprises — sans que SQLite le
+  sache. Le processus devenait invisible aux autres jusqu'à la fermeture de toutes ses connexions ; un autre processus qui
+  fermait sa dernière connexion se croyait seul, prenait le verrou EXCLUSIVE et supprimait `-wal` et `-shm`. Tous les appelants
+  de `_swap_db` y étaient exposés : `_vacuum_db` (IdxPurge, nettoyage après Prune) tient `conn` et la bascule du fantôme tient
+  `watch` quand `_swap_db` ouvre la base servie par `_open_db(admin)` — un écrivain d'un autre processus (borgHelperWWW, Bkp,
+  Index) écrivait alors dans de nouveaux `-wal`/`-shm` sans attendre la copie et son écriture était perdue sans message ; un
+  processus à plusieurs connexions (fils d'Index, borgHelperWWW, fils de la vue et de fin d'Index du décor de la story 88)
+  lisait ensuite un `-wal` recréé vide : « disk I/O error », puis base abîmée, durablement.
+- **Correctif** : nouvelle `_db_create_file`, seul `os.open` d'une base du code de production : `O_CREAT|O_EXCL` sur le chemin
+  donné — un fichier existant n'est plus jamais ouvert hors de SQLite. Le fichier qu'elle vient de créer est refermé sous un
+  verrou PAR CHEMIN (`_db_path_lock`, chemin absolu non résolu) que prennent aussi les ouvertures d'`_open_db` de ce chemin
+  (`sqlite3.connect` compris, base existante comprise) : un autre fil ne peut pas ouvrir la base neuve par le même nom avant
+  ce `close()` ; un `open()` bloqué (NFS, autofs, FUSE) ne gèle que sa base, jamais les autres rc d'un borgHelperWWW (verrous
+  remis à neuf dans l'enfant d'un fork ; limite : un lien et sa cible sont deux clés). Lien pendant (EEXIST sans fichier) :
+  `os.open` sans `O_EXCL` sur le chemin donné, comme 1.0.209 — le noyau suit le lien avec ses protections
+  (`fs.protected_symlinks`), cible créée en 0600 quel que soit le propriétaire du lien. `b':memory:'` ne crée plus de
+  fichier « :memory: » dans le dossier courant. Droits mesurés identiques à 1.0.209 pour un fichier neuf, un lien vers une
+  cible absente (aussi par une chaîne de liens relatifs) ou existante (0640 gardé), un chemin `bytes` ou `Path`, un dossier
+  absent (`work/s94/meas/ev/links.log`, mesuré avant la revue row 13 : sa ligne « lien d'un autre compte » 0644 en 1.0.210 est
+  celle de la forme retirée ; 0600 rétabli, vérifié par « permissions … »). `_swap_db` inchangé : contrat,
+  messages, codes de sortie, attentes identiques.
+- **Gardes CodecSelfTest** (revue 94) :
+  - « ouvertures de fichiers de production hors SQLite … (garde AST) » : toute ouverture par chemin de borgHelper et de
+    borgHelperWWW (`open`, `io.open`, `os.open`, `Path.open`, `read_bytes`/`write_text`…, `shutil.copy*`) est dans une liste
+    blanche nommée par famille de chemins (rc, `/proc`, verrous PID, état JSON, dépôt borg, destination de Restore…), au
+    nombre exact par fonction ; seul site d'une base : `_db_create_file`, qui doit porter `O_CREAT|O_EXCL`. Témoins : un
+    `open(db_path,'rb')` ajouté dans `_vacuum_db`, la forme 1.0.209, un site retiré, chaque forme d'appel.
+  - « ouvertures d'une base tenue par ce processus … (crochet d'audit) » : crochet `sys.addaudithook` (évènement `open`) qui
+    relève toute ouverture par chemin d'une base que le processus tient (cibles de `/proc/self/fd` à l'en-tête SQLite, lu par
+    `pread` sur le descripteur existant) ou de son `-wal`/`-shm`, pendant `_open_db` read/write/admin et `create_file=False`
+    (base en clair et chiffrée), `ensure_diff_db`, `archive_view_check(repair=True)`, `_db_meta_value`, `_db_probe`,
+    `_vacuum_db`, la bascule du fantôme (`_shadow_swap` réel, borg factice) et quatre fils à la borgHelperWWW (connexions
+    persistantes) : zéro relevé exigé. Témoins : `open(base,'rb')` d'une base tenue relevé ; création exclusive jamais relevée.
+  - « bascule : processus qui rouvre une base qu'il tient … » : vrais processus, poignée de main par fichiers (copie arrêtée
+    après sa 1re tranche jusqu'au fichier `release`, « copie encore en cours » exigé), les deux formes (processus qui bascule
+    en tenant une connexion ; seconde connexion du même processus pendant la bascule d'un autre).
+  - « permissions : … .db 0600 à la création » étendu aux liens (cible absente, chaîne, base 0640, lien d'un autre compte :
+    0600 partout, comme 1.0.209).
+  - Sur une copie qui remet la ligne de 1.0.209 : les trois contrôles de verrous échouent (3.10 et 3.14 strict) ; avec `open(db_path,'rb')` dans
+    `_vacuum_db` : les deux gardes échouent (`work/s94/meas/ev/cst/`).
+- **Mesures** (SQLite 3.37.2, Python 3.10, copie ralentie dans un autre processus ; journaux `work/s94/meas/ev/`) :
+  - réplique de la revue 88 (`rep.py bi` : écrivain au délai de 5 s, `archive_view_check(repair=True)`, connexion
+    `BEGIN IMMEDIATE`/`ROLLBACK`) : 1.0.209 4/20 en échec au repos, 5/10 sous charge (10 fils de calcul + écritures disque
+    fsync, charge 4 à 19) ; 1.0.210 0/20 au repos, 0/10 sous charge ;
+  - témoin SQLite pur, sans borgHelper (`rep3.py`) : `os.open`+`os.close` d'une base tenue pendant la bascule d'un autre
+    processus -> 6/6 en échec (`-wal`/`-shm` supprimés par l'autre processus, « disk I/O error »), 0/6 sans ; sans bascule
+    (connexion ordinaire qui se ferme) : 0/6 dans les deux cas ;
+  - forme `_vacuum_db` / fantôme (`rep5.py`, connexion `write` ou `read` tenue par le processus qui bascule, lecteur éphémère
+    puis écrivain d'un autre processus) : écriture perdue 5/5 et 5/5 en 1.0.209, 0/5 et 0/5 en 1.0.210 ;
+  - décor « bascule lente » de la story 88 (code de la story 88, non commité) + `integrity_check` et écriture suivante :
+    5/24 en échec (4 « malformed », 1 « état de construction non écrit (disk I/O error) ») sans correctif — alors que son
+    contrôle passe (4/4 : il ne vérifie pas l'intégrité) —, 0/30 avec le correctif dans sa première forme (`O_EXCL` sur le
+    chemin résolu) ;
+  - coût : bascule de 144 Mo 0,60-0,65 s en 1.0.209, 0,59-0,69 s en 1.0.210 (une série avec 0,80 et 1,07 s, non reproduite dans les deux suivantes) ;
+    `_open_db(write)` d'une base existante 18-19 µs avant, 20-22 µs après.
+
 ## borgHelper 1.0.209, borgHelperWWW 1.34.0, UI 1.27.0, Service Worker 1.4.0 — Place libre des stockages et alertes — 2026-10-21
 
 Chantier « reconstruction progressive », story 87b (cadrage story 87, D195/A45 ; mesures du 2026-10-20 — `work/s87b/m1.out` :
