@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.213"
+Version="1.0.214"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2181,10 +2181,12 @@ def _has_control_char(s):
     """Vrai si `s` contient un caractère de contrôle (C0 : saut de ligne, retour chariot, tabulation, NUL… ; DEL)."""
     return any(ord(c)<32 or ord(c)==127 for c in s)
 
-def _borg_extract_args(bid,ftor):
+def _borg_extract_args(bid,ftor,sparse=False,numeric=True):
     # 1.0.176 (story 39, A80, décision de l'utilisateur) : --numeric-ids (borg >= 1.2, déjà requis par `borg compact`) — avant
     # --numeric-owner, déprécié depuis borg 1.2 : « Warning: … Use --numeric-ids instead » à chaque extraction (code 0, mesuré)
-    base=['extract','--numeric-ids','--exclude','*/log/*',f'::{bid}']
+    # 1.0.214 (story 114, mode fidèle) : `sparse` (--creux) -> --sparse ; `numeric` faux (--par-nom) -> --numeric-ids retiré
+    # revue 1 de la story 114 (row 2) : nom d'archive littéral (_borg_literal) — borg 1.2 remplace les marqueurs {…} de l'emplacement
+    base=['extract']+(['--numeric-ids'] if numeric else [])+(['--sparse'] if sparse else [])+['--exclude','*/log/*',f'::{_borg_literal(bid)}']
     if '*' in ftor or '?' in ftor: base+=_borg_glob_args(ftor)
     else: base.append(ftor)
     return base
@@ -2229,6 +2231,630 @@ def _rmdirs_if_empty(made):
     for d in made:   # le plus profond d'abord ; le premier non vide arrête (contenu de borg gardé)
         try: os.rmdir(d)
         except OSError: break
+
+# ── Restore, mode SÛR (1.0.214, story 114, décisions de l'utilisateur du 2026-10-22/23) ──────────────────────────────────
+# Défaut de Restore (et seul mode de borgHelperWWW) : `borg export-tar <archive> - <sélection>` lu EN FLUX (tarfile `r|`, jamais de
+# tar intermédiaire), chaque entrée écrite par borgHelper (_SafeWriter) : chemin normalisé, parents ouverts un par un sans suivre
+# de lien, cible contrôlée contre les ZONES protégées au moment d'écrire, fichier écrit sous un nom temporaire voisin puis renommé.
+# Mode FIDÈLE (--fidele, CLI seulement) : `borg extract` brut de 1.0.212, sans aucune protection (décision 16 : story 99 abandonnée).
+# Zones (définition de la story 99, décisions 1, 4, 6, 11) : dossier des bases (CACHE_DIR), dépôt borg LOCAL et clé de borg
+# (BORG_KEY_FILE) de chaque nick du rc, dossiers de borg (~/.cache/borg, ~/.config/borg ; clés BORG_*_DIR du rc), le rc lui-même —
+# tout ce qui est dessous sauté (jamais un refus), [WARN], code 1.
+_RZ_BASES='bases de borgHelper'; _RZ_RC='fichier rc'; _RZ_REPO='dépôt borg local'; _RZ_BORG='dossiers de borg'; _RZ_KEY='clé de borg'
+_RZ_UNDER="sous un lien de l'archive (--liens-en-dossiers : vrai dossier à la place du lien)"   # décisions 5 et 8
+_RZ_LINK='lien déjà présent dans la destination'   # jamais suivi ni remplacé par un dossier
+_RZ_ODD="chemin d'archive non normalisé (absolu, « .. » ou composant vide)"
+_RZ_DEV='périphérique (recréé seulement en root)'   # décision 11
+_RZ_TYPE='type de fichier non restaurable'
+_RZ_FULLDIR='dossier non vide déjà présent à la place'
+_RZ_NOTDIR='fichier déjà présent à la place d\'un dossier'
+_RZ_HARD='lien physique : premier nom indisponible'
+_RESTORE_SAFE_NOTE="mode sûr : attributs étendus et ACL non restaurés (--fidele pour les restaurer)"   # décision 4 : toujours dit
+_RESTORE_FIDELE_NOTE="mode fidèle : aucune protection des bases, du dépôt et du rc"
+_RESTORE_FIDELE_CMD="  mode fidèle (aucune protection des bases, du dépôt et du rc) : "   # suivi de la commande complète (relue par borgHelperWWW)
+_RESTORE_STOP_ERRNO={_errno.ENOSPC,_errno.EDQUOT,_errno.EROFS,_errno.EIO}   # décision 12 : flux interrompu (disque plein…), code 2
+
+def _restore_cli_line(cfgfile,nick,bid,ftor,where,flat=False,fidele=False,extra=(),exe=None):
+    """1.0.214 (story 114, décisions 13 et 16) : commande CLI complète et copiable d'une restauration — exécutable de borgHelper
+    (`exe` : chaîne, ou liste — interpréteur puis fichier, comme borgHelperWWW le lance ; défaut : chemin réel de ce fichier),
+    `-C <rc>` absolu, archive exacte, chemins cités pour le shell ; jamais de passphrase. Partagée avec borgHelperWWW
+    (commandes équivalentes de POST /restore)."""
+    a=(list(exe) if isinstance(exe,(list,tuple)) else [exe or os.path.realpath(__file__)])+['-C',os.path.abspath(cfgfile),'-c','Restore','-n',nick]
+    if bid: a+=['-b',bid]
+    a+=['-f',ftor,'-W' if flat else '-w',where if where=='-' else os.path.abspath(where)]
+    a+=list(extra)
+    if fidele: a.append('--fidele')
+    return ' '.join(shlex.quote(x) for x in a)
+
+def _path_under(p,root):
+    """p est root ou un de ses descendants (chemins absolus normalisés, segment entier)."""
+    return p==root or p.startswith(root.rstrip('/')+'/')
+
+def _restore_path_forms(p):
+    """Formes d'un chemin pour les zones : realpath (liens suivis, partie absente gardée) et chemin absolu normalisé non
+    résolu — un dossier atteint par l'un ou l'autre (lien vers le cache, /home lien vers /usr/home…)."""
+    a=os.path.normpath(os.path.abspath(p))
+    return {os.path.realpath(a),a}
+
+def _restore_ids_of(p):
+    """(st_dev, st_ino) de `p` (résolu) et de chacun de ses dossiers parents existants."""
+    out=set(); a=os.path.realpath(os.path.abspath(p))
+    while True:
+        try: st=os.stat(a); out.add((st.st_dev,st.st_ino))
+        except OSError: pass
+        if a=='/': return out
+        a=os.path.dirname(a)
+
+class _ZoneIds:
+    """Identités (st_dev, st_ino) des racines existantes d'une zone (montage bind, casse ignorée, lien physique du rc), relevées à
+    la première demande puis gardées pour l'appel."""
+    def __init__(self,forms): self.forms=forms; self.ids=None
+    def get(self):
+        if self.ids is None:
+            out=set()
+            for f in self.forms:
+                try: st=os.stat(f); out.add((st.st_dev,st.st_ino))
+                except OSError: pass
+            self.ids=frozenset(out)
+        return self.ids
+
+def _zids(zi):
+    """Identités d'une zone : _ZoneIds (relevées à la demande) ou ensemble déjà calculé (contrôles)."""
+    return zi.get() if isinstance(zi,_ZoneIds) else zi
+
+def _restore_zone_of(p,zones):
+    """Étiquette de la première zone qui contient `p` (chemin absolu), None hors zones. zones : [(étiquette, formes, identités)] —
+    par chemin (une des formes de `p` sous une forme de zone), puis par identité (`p` ou un de ses parents EST une racine de zone)."""
+    forms=_restore_path_forms(p)
+    for label,zf,_ in zones:
+        if any(_path_under(f,z) for f in forms for z in zf): return label
+    zs=[(label,_zids(zi)) for label,_,zi in zones]
+    if any(zi for _,zi in zs):
+        ids=_restore_ids_of(p)
+        for label,zi in zs:
+            if ids & zi: return label
+    return None
+
+def _borg_getfqdn(name=''):
+    """Copie de borg 1.2 platform/base.py getfqdn : nom canonique par getaddrinfo(AI_CANONNAME), sinon le nom tel quel."""
+    name=name.strip()
+    if not name or name=='0.0.0.0': name=socket.gethostname()
+    try: addrs=socket.getaddrinfo(name,None,0,socket.SOCK_DGRAM,0,socket.AI_CANONNAME)
+    except socket.error: return name
+    for addr in addrs:
+        if addr[3]: return addr[3]
+    return name
+
+class _BorgMarks(dict):
+    """Marqueurs STABLES de borg 1.2 (replace_placeholders) pour un chemin de dépôt, calculés seulement s'ils sont présents :
+    hostname, fqdn, reverse-fqdn, user, borgversion/borgmajor/borgminor/borgpatch (`ver` : version du borg du nick, un appel à
+    `BORG_EXE --version`). Les autres ({now}, {pid}, {uuid4}…) changent à chaque appel : KeyError -> pas de zone. `base` :
+    marqueurs de la machine déjà calculés, partagés entre les nicks d'un appel."""
+    def __init__(self,ver=None,base=None): super().__init__(); self._ver=ver; self._base=base
+    def __missing__(self,k):
+        import pwd
+        if self._base is not None and k in ('fqdn','reverse-fqdn','hostname','user'):
+            self[k]=self._base[k]; return self[k]
+        if k=='hostname': self['hostname']=socket.gethostname().split('.')[0]
+        elif k in ('fqdn','reverse-fqdn'):
+            fq=_borg_getfqdn(socket.gethostname())
+            self.update({'fqdn':fq,'reverse-fqdn':'.'.join(reversed(fq.split('.')))})
+        elif k=='user':
+            try: self['user']=pwd.getpwuid(os.getuid()).pw_name
+            except KeyError: raise KeyError(k) from None
+        elif k in ('borgversion','borgmajor','borgminor','borgpatch'):
+            v=self._ver() if self._ver else None
+            m=re.match(r'(\d+)\.(\d+)\.(\d+)',v or '')
+            if not m: raise KeyError(k)
+            t=tuple(int(x) for x in m.groups())
+            self.update({'borgversion':v,'borgmajor':'%d'%t[:1],'borgminor':'%d.%d'%t[:2],'borgpatch':'%d.%d.%d'%t[:3]})
+        if k not in self: raise KeyError(k)
+        return self[k]
+
+def _restore_local_repo(repo,base=None,ver=None,marks=None):
+    """Chemin d'un BORG_REPO LOCAL pour les zones de Restore, sinon None. Distant (`ssh://…`, `hôte:chemin`) : None. Relatif :
+    `base/<repo>` (dossier de travail de borg ; `~` n'est jamais développé en local), sinon None. `file://` et `::archive`
+    retirés ; marqueurs stables remplacés comme borg 1.2 (_BorgMarks) ; tout autre marqueur : None."""
+    r=(repo or '').strip()
+    if r.startswith('file://'): r=r[7:]
+    if not r or not r.startswith('/') and (r.startswith('ssh://') or re.match(r'[^/]*:',r)): return None
+    if '::' in r: r=r.split('::',1)[0]
+    if '{' in r or '}' in r:
+        try: r=r.format_map(_BorgMarks(ver,marks))
+        except (KeyError,ValueError,IndexError,AttributeError,TypeError): return None
+    if not r.startswith('/'):
+        if base is None or not r: return None
+        r=os.path.join(os.path.abspath(base),r)
+    r=os.path.normpath(r)
+    return None if r=='/' else r
+
+def _restore_borg_version(cfg):
+    """Version du borg d'un nick (BORG_EXE, environnement de boex) pour les marqueurs {borgversion}… d'un BORG_REPO — appelée
+    seulement si un tel marqueur est présent ; échec ou délai : None (pas de zone)."""
+    try:
+        p=subprocess.run([cfg.get('BORG_EXE','borg') or 'borg','--version'],env=_borg_child_env(cfg),capture_output=True,text=True,
+                         errors='replace',stdin=subprocess.DEVNULL,timeout=_BORG_VERSION_TIMEOUT)
+    except Exception: return None
+    return _version_from_output(p.stdout+'\n'+p.stderr) if p.returncode==0 else None
+
+def _restore_norm(name):
+    """Chemin d'une entrée du flux -> liste de ses composants (« . » retirés ; [] : la racine elle-même), None s'il n'est pas
+    normalisé : absolu, « .. », composant vide (décision : sautée, [WARN])."""
+    if not name or name.startswith('/'): return None
+    parts=[p for p in name.split('/') if p!='.']
+    if any(p in ('','..') for p in parts): return None
+    return parts
+
+class _RestoreStop(Exception):
+    """Écriture locale impossible à poursuivre (disque plein, quota, lecture seule, E/S) : flux interrompu (décision 12, code 2)."""
+
+class _SigTerm(KeyboardInterrupt):
+    """Revue 2 (row 25) : SIGTERM reçu pendant un Restore en mode sûr — nettoyage comme Ctrl-C, code 143."""
+
+def _sigterm_disarm():
+    """Revue 3 (row 50) : à l'entrée de tout nettoyage (Ctrl-C reçu, arrêt de borg, temporaire retiré) — si le gestionnaire SIGTERM de
+    _restore_sigterm est posé, SIGTERM est ignoré jusqu'à la sortie (un SIGTERM n'interrompt plus le nettoyage) ; sinon rien (un
+    gestionnaire d'application est laissé tel quel)."""
+    if threading.current_thread() is not threading.main_thread(): return
+    try:
+        if getattr(signal.getsignal(signal.SIGTERM),'_bh_restore',False): signal.signal(signal.SIGTERM,signal.SIG_IGN)
+    except (ValueError,OSError): pass
+
+@contextlib.contextmanager
+def _restore_sigterm():
+    """Revue 2 (row 25), revue 3 (row 49) : posé par la CLI SEULEMENT (point d'entrée de la commande Restore en mode sûr, jamais par
+    BorgHelper.restore() en bibliothèque, qui ne touche à aucun signal) — SIGTERM (délai de borgHelperWWW, arrêt d'un service)
+    devient _SigTerm, pour que chaque `finally`/`except BaseException` retire son temporaire et que borg soit arrêté. Seulement dans le
+    fil principal et si le gestionnaire actuel est SIG_DFL (un SIG_IGN hérité est respecté) ; le gestionnaire se désarme à la 1re
+    réception (SIG_IGN), comme tout nettoyage (_sigterm_disarm) ; en sortie : SIG_IGN puis SIG_DFL (sentinelle d'installation). Sortie
+    par SIGTERM : [INTERRUPTED], code 143 — sauf SIGTERM reçu pendant la sortie d'un Restore déjà fini (SystemExit en cours : son code
+    gardé). Limites (row 50) : SIGHUP non converti ; signal reçu pendant ce `finally` lui-même."""
+    installed=False
+    if threading.current_thread() is threading.main_thread():
+        try:
+            if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+                def _term(sig,frm):
+                    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+                    raise _SigTerm('SIGTERM')
+                _term._bh_restore=True
+                signal.signal(signal.SIGTERM,_term); installed=True
+        except (ValueError,OSError): installed=False
+    try: yield
+    except _SigTerm as e:
+        # revue 4 (row 55) : seulement la sortie d'un Restore FINI (marquée par _restore_run) — jamais un SystemExit déjà absorbé
+        # (`except SystemExit:` interne, SIGTERM reçu dans ce bloc : `__context__` aussi, indiscernable sinon — mesuré 3.10 et 3.14)
+        if isinstance(e.__context__,SystemExit) and getattr(e.__context__,'_bh_restore_end',False): raise e.__context__ from None
+        printer("\n[INTERRUPTED] Restore arrêté (SIGTERM)."); sys.exit(143)
+    finally:
+        if installed:
+            try: signal.signal(signal.SIGTERM,signal.SIG_IGN); signal.signal(signal.SIGTERM,signal.SIG_DFL)
+            except (ValueError,OSError): pass
+
+class _NoBorg(Exception):
+    """boex : interruption reçue avant que Popen ait rendu borg (rien à arrêter)."""
+
+class _SkipErr(OSError):
+    """Erreur d'un seul élément au errno d'arrêt (EDQUOT du fchown en root : quota du PROPRIÉTAIRE, revue 1 row 15) : élément sauté."""
+
+def _shown_path(p):
+    """Chemin d'archive affichable (revue 1, row 6) : caractères de contrôle (saut de ligne, ESC d'une séquence ANSI…) écrits
+    \\xNN — un nom de fichier ne fabrique jamais une ligne [ERREUR] ni ne pilote le terminal."""
+    # revue 2 (row 32) : tout caractère non imprimable (C0, C1 dont CSI 0x9b, U+0085/2028/2029 que splitlines coupe) ; octet non
+    # UTF-8 d'un nom (surrogate) : son octet
+    def esc(c):
+        o=ord(c)
+        if c.isprintable(): return c
+        if 0xdc80<=o<=0xdcff: return f"\\x{o-0xdc00:02x}"
+        return f"\\x{o:02x}" if o<256 else (f"\\u{o:04x}" if o<0x10000 else f"\\U{o:08x}")
+    return ''.join(esc(c) for c in (p or ''))
+
+_SKIP_SHOWN=50   # revue 1 (row 6, choix validé story 113) : chemins gardés et listés par raison ; au-delà, compte seul
+
+class _SkipLog:
+    """Éléments sautés par étiquette -> {(chemin, groupé): nombre} — un élément sous un lien ou une zone compte sous la racine de
+    celle-ci (« <racine>/… (N éléments) ») ; au plus _SKIP_SHOWN chemins par raison, les suivants comptés (« … et N autres ») :
+    mémoire et sortie bornées."""
+    def __init__(self): self.g={}; self.more={}
+    def add(self,label,path,grouped=False):
+        d=self.g.setdefault(label,{}); k=(path,grouped)
+        if k not in d and len(d)>=_SKIP_SHOWN: self.more[label]=self.more.get(label,0)+1; return
+        d[k]=d.get(k,0)+1
+    def __bool__(self): return bool(self.g)
+    def count(self): return sum(sum(d.values()) for d in self.g.values())+sum(self.more.values())
+    def report(self):
+        for lab,d in self.g.items():
+            m=self.more.get(lab,0); n=sum(d.values())+m; s='s' if n>1 else ''
+            printer(f"[WARN] {n} élément{s} sauté{s} : {lab}")
+            for (p,grp),c in d.items():
+                p=_shown_path(p)
+                if not grp: printer(f"  {p}")
+                elif p: printer(f"  {p}/… ({c} élément{'s' if c>1 else ''})")
+                else: printer(f"  (toute la sélection : {c} élément{'s' if c>1 else ''})")
+            if m: printer(f"  … et {m} autre{'s' if m>1 else ''}")
+
+def _argv_batches(items,limit=65536):
+    """Arguments en lots dont la taille cumulée (octets) reste sous `limit` — jamais E2BIG (revue 1, row 9)."""
+    out=[]; n=0
+    for x in items:
+        k=len(os.fsencode(x))+1
+        if out and n+k>limit: yield out; out=[]; n=0
+        out.append(x); n+=k
+    if out: yield out
+
+_O_DIRPATH=getattr(os,'O_PATH',os.O_RDONLY)|os.O_DIRECTORY|os.O_NOFOLLOW|getattr(os,'O_CLOEXEC',0)
+
+class _SafeWriter:
+    """1.0.214 (story 114) : écrivain du mode sûr de Restore -w/-W (dossier). Chaque entrée tar (flux de borg export-tar) :
+    - chemin normalisé (_restore_norm ; sinon sautée _RZ_ODD) ; à plat (-W) : nom seul, dossiers ignorés ;
+    - parents ouverts un par un depuis la destination (descripteurs, O_NOFOLLOW) et créés s'ils manquent — un lien rencontré :
+      élément sauté (lien créé par CETTE restauration : _RZ_UNDER, ou remplacé par un vrai dossier avec `links_as_dirs` ; lien
+      déjà présent : _RZ_LINK, toujours) ; jamais une écriture à travers un lien ;
+    - cible contrôlée AVANT écriture contre les zones : par chemin (la destination est résolue, aucun lien dessous : le chemin
+      écrit est le chemin réel) et par identité (st_dev, st_ino) de chaque dossier traversé et de la cible existante ;
+    - fichier : nom temporaire voisin (O_CREAT|O_EXCL|O_NOFOLLOW), contenu, propriétaire (root seulement), droits (setuid
+      compris), date, puis os.replace — jamais un fichier à moitié écrit sous son nom final ; lien symbolique, fifo, périphérique
+      (root), lien physique : créés sous le nom temporaire puis renommés ; métadonnées sans suivre de lien ;
+    - dossiers : droits, propriétaire et date posés en fin de flux (finish), du plus profond au moins profond.
+    Propriétaires : uid/gid numériques de l'archive (défaut), ou noms de l'archive cherchés sur la machine (`by_name`, numérique si
+    inconnu) ; compte ordinaire : jamais de chown (fichiers à lui). Lien physique dont le premier nom n'a pas été écrit (zone,
+    lien…) : noté dans `broken` (seconde lecture par Restore, décision 14)."""
+    def __init__(self,root,zones,flat=False,by_name=False,links_as_dirs=False,root_label=None):
+        self.zones=zones; self.flat=flat; self.by_name=by_name; self.links_as_dirs=links_as_dirs
+        self.root_label=root_label   # destination elle-même dans une zone : tout sauté, rien ouvert ni créé
+        # revue 1 (row 5) : formes compactes — clés jointes (« a/b »), identité en UN entier (st_dev<<64)|st_ino (revue 2, row 23 : jamais
+        # deux ensembles indépendants, leur produit accepterait un fichier d'un autre système de fichiers) ; la mémoire reste
+        # proportionnelle au nombre de dossiers, de liens et de fichiers écrits (limite documentée)
+        self.skips=_SkipLog(); self.n_ok=0; self.last=None; self.dirs=[]; self.made_links=set(); self.converted=0; self.made_dirs=[]
+        self.inos=set(); self.occupant={}; self.broken=[]; self.only=None; self.done_only=set(); self.seen_only=set(); self.chain=[]; self.tmp=None
+        self.is_root=os.geteuid()==0; self._uid={}; self._gid={}
+        self.zid={}
+        for label,_,zi in zones:
+            for i in _zids(zi): self.zid.setdefault(i,label)
+        self.zforms=[(label,z) for label,zf,_ in zones for z in zf]
+        self.root=os.path.realpath(root); self.rootfd=None
+        if root_label is None: self.rootfd=os.open(self.root,_O_DIRPATH)
+
+    def close(self):
+        for _,fd in self.chain: os.close(fd)
+        self.chain=[]
+        if self.rootfd is not None: os.close(self.rootfd); self.rootfd=None
+
+    # ── contrôles ──
+    def _zone_path(self,parts):
+        """(étiquette, racine de la zone en composants relatifs) si le chemin réel root/parts est sous une zone, sinon None."""
+        tgt=os.path.join(self.root,*parts)
+        for label,z in self.zforms:
+            if _path_under(tgt,z):
+                rel=os.path.relpath(z,self.root)
+                return label,([] if rel.startswith('..') or rel=='.' else rel.split('/'))
+        return None
+
+    def _owner(self,ti):
+        uid,gid=ti.uid,ti.gid
+        if self.by_name:
+            import pwd,grp
+            if ti.uname:
+                if ti.uname not in self._uid:
+                    try: self._uid[ti.uname]=pwd.getpwnam(ti.uname).pw_uid
+                    except KeyError: self._uid[ti.uname]=None
+                if self._uid[ti.uname] is not None: uid=self._uid[ti.uname]
+            if ti.gname:
+                if ti.gname not in self._gid:
+                    try: self._gid[ti.gname]=grp.getgrnam(ti.gname).gr_gid
+                    except KeyError: self._gid[ti.gname]=None
+                if self._gid[ti.gname] is not None: gid=self._gid[ti.gname]
+        return uid,gid
+
+    def _parent(self,dparts,shown):
+        """Descripteur du dossier parent `dparts` (créé au besoin, jamais à travers un lien) -> (fd, None) ou (None, saut) où saut =
+        (étiquette, racine relative à grouper). Chaîne de descripteurs gardée d'une entrée à la suivante (flux trié par dossier)."""
+        i=0
+        while i<len(self.chain) and i<len(dparts) and self.chain[i][0]==dparts[i]: i+=1
+        for _,fd in self.chain[i:]: os.close(fd)
+        del self.chain[i:]
+        fd=self.chain[-1][1] if self.chain else self.rootfd
+        for k in range(i,len(dparts)):
+            comp=dparts[k]
+            try: nfd=os.open(comp,_O_DIRPATH,dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(comp,0o777,dir_fd=fd)   # parent absent de l'archive (sélection d'un chemin) : mode par défaut, comme borg
+                self.made_dirs.append('/'.join(dparts[:k+1]))   # revue 1 (row 14) : retiré s'il reste vide quand rien n'est restauré
+                nfd=os.open(comp,_O_DIRPATH,dir_fd=fd)
+            except OSError as e:
+                if e.errno not in (_errno.ELOOP,_errno.ENOTDIR): raise
+                try: st=os.stat(comp,dir_fd=fd,follow_symlinks=False)
+                except OSError: raise e from None
+                here='/'.join(dparts[:k+1])
+                if not stat.S_ISLNK(st.st_mode): return None,(_RZ_NOTDIR,here.split('/'))
+                if here not in self.made_links: return None,(_RZ_LINK,here.split('/'))
+                if not self.links_as_dirs: return None,(_RZ_UNDER,here.split('/'))
+                os.unlink(comp,dir_fd=fd); self.made_links.discard(here)   # décision 8 : lien de CETTE restauration -> vrai dossier
+                os.mkdir(comp,0o777,dir_fd=fd); self.converted+=1
+                nfd=os.open(comp,_O_DIRPATH,dir_fd=fd)
+            st=os.fstat(nfd)
+            lab=self.zid.get((st.st_dev,st.st_ino))
+            if lab: os.close(nfd); return None,(lab,list(dparts[:k+1]))
+            self.chain.append((comp,nfd)); fd=nfd
+        return fd,None
+
+    def _walk(self,dparts):
+        """Descripteur neuf (à fermer) du dossier `dparts`, sans création ni lien suivi ; None si absent ou lien."""
+        fd=os.dup(self.rootfd)
+        for comp in dparts:
+            try: nfd=os.open(comp,_O_DIRPATH,dir_fd=fd)
+            except OSError: os.close(fd); return None
+            os.close(fd); fd=nfd
+        return fd
+
+    def _tmpname(self,leaf):
+        # revue 1 (row 11) : nom coupé en OCTETS (100 au plus : 80 caractères multi-octets dépassaient 255 octets, ENAMETOOLONG)
+        return f".{os.fsdecode(os.fsencode(leaf)[:100])}.bhr{secrets.token_hex(4)}"
+
+    def _meta(self,ti,name,pfd,fd=None,link=False):
+        """Propriétaire (root), droits, date — sur le descripteur `fd`, sinon sur `name` dans `pfd` sans suivre de lien."""
+        if self.is_root:
+            uid,gid=self._owner(ti)
+            try:
+                if fd is not None: os.fchown(fd,uid,gid)
+                else: os.chown(name,uid,gid,dir_fd=pfd,follow_symlinks=False)
+            except OSError as e:   # revue 1 (row 15) : quota du propriétaire dépassé -> cet élément sauté, la suite continue
+                if e.errno==_errno.EDQUOT: raise _SkipErr(e.errno,f"quota du propriétaire {uid} dépassé") from None
+                raise
+        if not link:
+            if fd is not None: os.fchmod(fd,ti.mode&0o7777)
+            else: os.chmod(name,ti.mode&0o7777,dir_fd=pfd)   # fifo/périphérique tout juste créé sous un nom temporaire (jamais un lien)
+        m=float(ti.mtime)
+        if fd is not None: os.utime(fd,(m,m))
+        else: os.utime(name,(m,m),dir_fd=pfd,follow_symlinks=False)
+
+    def _mk(self,pfd,tmp,make):
+        """Revue 2 (row 25) : temporaire noté AVANT sa création ; revue 3 (row 50) : son identité (st_dev, st_ino) notée juste après —
+        _drop_tmp ne retire que ce qu'il a créé (nom déjà pris : FileExistsError, y compris une interruption reçue avant le `except` :
+        identité jamais notée, rien retiré). Fenêtre restante : interruption entre la création et le relevé de l'identité (temporaire
+        laissé, jamais celui d'un autre)."""
+        self.tmp=(pfd,tmp,None)
+        try: r=make()
+        except FileExistsError: self.tmp=None; raise
+        try:
+            st=os.fstat(r) if isinstance(r,int) else os.stat(tmp,dir_fd=pfd,follow_symlinks=False)
+            self.tmp=(pfd,tmp,(st.st_dev,st.st_ino))
+        except OSError: pass
+        return r
+
+    def _commit(self,pfd,tmp,leaf):
+        os.replace(tmp,leaf,src_dir_fd=pfd,dst_dir_fd=pfd); self.tmp=None
+
+    def _drop_tmp(self):
+        if self.tmp:
+            pfd,tmp,ident=self.tmp; self.tmp=None
+            if ident is None: return   # revue 3 (row 50) : jamais un nom dont la création n'est pas prouvée
+            try:
+                st=os.stat(tmp,dir_fd=pfd,follow_symlinks=False)
+                if (st.st_dev,st.st_ino)==ident: os.unlink(tmp,dir_fd=pfd)
+            except OSError: pass
+
+    # ── une entrée ──
+    def entry(self,ti,tf):
+        name=ti.name; parts=_restore_norm(name)
+        if parts is None: self.skips.add(_RZ_ODD,name); return
+        if not parts: return   # « . » : la destination elle-même — jamais touchée
+        key=tuple(parts)
+        if self.only is not None:
+            if key not in self.only: return
+            self.seen_only.add(key)   # revue 2 (row 35) : vu à la seconde lecture (écrit ou sauté) : jamais recompté _RZ_HARD
+        if self.flat:
+            if ti.isdir(): return
+            parts=[parts[-1]]
+        shown='/'.join(key)
+        if self.root_label: self.skips.add(self.root_label,'',True); return
+        if ti.ischr() or ti.isblk():
+            if not self.is_root: self.skips.add(_RZ_DEV,shown); return
+        elif not (ti.isreg() or ti.isdir() or ti.issym() or ti.islnk() or ti.isfifo()):
+            self.skips.add(_RZ_TYPE,shown); return
+        zp=self._zone_path(parts)
+        if zp:
+            lab,zr=zp   # élément sous la racine d'une zone (ou cette racine) : compté sous elle ; à plat : chaque nom
+            if self.flat or not zr or (len(zr)==len(parts) and not ti.isdir()): self.skips.add(lab,shown)
+            else: self.skips.add(lab,'/'.join(zr),True)
+            return
+        try: self._entry(ti,tf,parts,key,shown)
+        except OSError as e:
+            self._drop_tmp()
+            if e.errno in _RESTORE_STOP_ERRNO and not isinstance(e,_SkipErr): raise _RestoreStop(f"{e.strerror or e} ({_shown_path(shown)})") from None
+            self.skips.add(f"erreur d'écriture ({e.strerror or type(e).__name__})",shown)
+        except KeyboardInterrupt:   # revue 3 (vgap3) : Ctrl-C (ou SIGTERM) -> Restore fini : nettoyage jamais interrompu par un SIGTERM
+            _sigterm_disarm(); self._drop_tmp(); raise
+        except BaseException:
+            self._drop_tmp(); raise
+
+    def _entry(self,ti,tf,parts,key,shown):
+        pfd,sk=self._parent(parts[:-1],shown)
+        if pfd is None:
+            lab,r=sk
+            if self.flat: self.skips.add(lab,shown)
+            else: self.skips.add(lab,'/'.join(r),True)
+            return
+        leaf=parts[-1]
+        try: st=os.stat(leaf,dir_fd=pfd,follow_symlinks=False)
+        except FileNotFoundError: st=None
+        if st is not None:
+            lab=self.zid.get((st.st_dev,st.st_ino))
+            if lab: self.skips.add(lab,shown); return
+        if ti.isdir():
+            if st is not None and stat.S_ISLNK(st.st_mode):
+                if shown in self.made_links and self.links_as_dirs:
+                    os.unlink(leaf,dir_fd=pfd); self.made_links.discard(shown); self.converted+=1; st=None
+                else:
+                    self.skips.add(_RZ_UNDER if shown in self.made_links else _RZ_LINK,shown,True); return
+            if st is not None and not stat.S_ISDIR(st.st_mode): os.unlink(leaf,dir_fd=pfd); st=None
+            if st is None: os.mkdir(leaf,0o700,dir_fd=pfd)
+            uid,gid=self._owner(ti)
+            self.dirs.append((shown,ti.mode&0o7777,uid,gid,ti.mtime))
+            self.n_ok+=1; self.last=shown; return
+        if st is not None and stat.S_ISDIR(st.st_mode):
+            try: os.rmdir(leaf,dir_fd=pfd)   # dossier vide remplacé (comme borg extract) ; non vide : jamais retiré
+            except OSError: self.skips.add(_RZ_FULLDIR,shown); return
+        tmp=self._tmpname(leaf)
+        if ti.isreg():
+            fd=self._mk(pfd,tmp,lambda: os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|getattr(os,'O_CLOEXEC',0),0o600,dir_fd=pfd))
+            try:
+                src=tf.extractfile(ti)
+                while True:
+                    b=src.read(1<<20)
+                    if not b: break
+                    mv=memoryview(b)
+                    while mv: mv=mv[os.write(fd,mv):]
+                self._meta(ti,None,pfd,fd=fd)
+            finally: os.close(fd)
+        elif ti.issym():
+            self._mk(pfd,tmp,lambda: os.symlink(ti.linkname,tmp,dir_fd=pfd))
+            self._meta(ti,tmp,pfd,link=True)
+        elif ti.isfifo():
+            self._mk(pfd,tmp,lambda: os.mkfifo(tmp,0o600,dir_fd=pfd))
+            self._meta(ti,tmp,pfd)
+        elif ti.ischr() or ti.isblk():
+            self._mk(pfd,tmp,lambda: os.mknod(tmp,0o600|(stat.S_IFCHR if ti.ischr() else stat.S_IFBLK),os.makedev(ti.devmajor,ti.devminor),dir_fd=pfd))
+            self._meta(ti,tmp,pfd)
+        elif ti.islnk():
+            if not self._hardlink(ti,pfd,tmp,parts,key,shown): return
+        self._commit(pfd,tmp,leaf)
+        self.n_ok+=1; self.last=shown
+        if self.only is not None: self.done_only.add(key)
+        if not ti.issym() and not ti.isdir():
+            try: nst=os.stat(leaf,dir_fd=pfd,follow_symlinks=False); self.inos.add((nst.st_dev<<64)|nst.st_ino)   # revue 2 (row 23) : la PAIRE
+            except OSError: pass
+        if self.flat: self.occupant[leaf]=shown
+        elif ti.issym(): self.made_links.add(shown)
+
+    def _hardlink(self,ti,pfd,tmp,parts,key,shown):
+        """Lien physique : second nom lié au fichier écrit par CETTE restauration pour le premier nom ; sinon (premier nom sauté,
+        lien, autre contenu à sa place) -> noté dans `broken` (seconde lecture : fichier indépendant, décision 14). Vrai si `tmp`
+        est prêt à renommer."""
+        mp=_restore_norm(ti.linkname)
+        if mp is None or not mp: self.skips.add(_RZ_ODD,shown); return False
+        if self.flat:
+            tparts=[mp[-1]]
+            ok=self.occupant.get(mp[-1])=='/'.join(mp)
+        else: tparts=mp; ok=True
+        mfd=self._walk(tparts[:-1]) if ok else None
+        if mfd is None:
+            if self.only is None: self.broken.append((key,'/'.join(mp)))   # seconde lecture : non écrit -> _RZ_HARD (Restore)
+            else: self.skips.add(_RZ_HARD,shown)   # revue 3 (row 44) : borg le réémet en lien vers le 1er nom sauté : listé
+            return False
+        try:
+            try: mst=os.stat(tparts[-1],dir_fd=mfd,follow_symlinks=False)
+            except OSError: mst=None
+            # revue 1 (row 10) : fifo et périphérique aussi (borg 1.2 les lie comme les fichiers)
+            if (mst is None or not (stat.S_ISREG(mst.st_mode) or stat.S_ISFIFO(mst.st_mode) or stat.S_ISCHR(mst.st_mode)
+                                    or stat.S_ISBLK(mst.st_mode)) or ((mst.st_dev<<64)|mst.st_ino) not in self.inos):
+                if self.only is None: self.broken.append((key,'/'.join(mp)))
+                else: self.skips.add(_RZ_HARD,shown)   # revue 3 (row 44)
+                return False
+            try: cur=os.stat(parts[-1],dir_fd=pfd,follow_symlinks=False)
+            except FileNotFoundError: cur=None
+            if cur is not None and (cur.st_dev,cur.st_ino)==(mst.st_dev,mst.st_ino):   # revue 1 (row 12) : déjà ce lien, rien à faire
+                self.n_ok+=1; self.last=shown
+                return False
+            self._mk(pfd,tmp,lambda: os.link(tparts[-1],tmp,src_dir_fd=mfd,dst_dir_fd=pfd,follow_symlinks=False))
+            return True
+        finally: os.close(mfd)
+
+    def finish(self):
+        """Droits, propriétaires et dates des dossiers de l'archive, du plus profond au moins profond (un dossier en lecture seule
+        n'empêche plus rien d'écrire) — sans suivre de lien."""
+        self.close()
+        if self.root_label is not None or not self.dirs: return
+        try: self.rootfd=os.open(self.root,_O_DIRPATH)
+        except OSError as e:   # revue 1 (row 14) : destination retirée ou remplacée pendant la restauration
+            self.skips.add(f"droits des dossiers non posés ({e.strerror or e})",''); return
+        try:
+            for shown,mode,uid,gid,mtime in sorted(self.dirs,key=lambda x: -x[0].count('/')):
+                key=shown.split('/'); pfd=self._walk(key[:-1])
+                if pfd is None: continue
+                try:
+                    try: fd=os.open(key[-1],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|getattr(os,'O_CLOEXEC',0),dir_fd=pfd)
+                    except OSError as e:
+                        # revue 1 (row 14) : dossier remplacé plus loin dans le flux par un fichier ou un lien (ENOTDIR, ELOOP) : rien à poser
+                        if e.errno not in (_errno.ENOTDIR,_errno.ELOOP,_errno.ENOENT):
+                            self.skips.add(f"droits du dossier non posés ({e.strerror or e})",shown)
+                        continue
+                    try:
+                        if self.is_root: os.fchown(fd,uid,gid)
+                        os.fchmod(fd,mode); m=float(mtime); os.utime(fd,(m,m))
+                    except OSError as e: self.skips.add(f"droits du dossier non posés ({e.strerror or e})",shown)
+                    finally: os.close(fd)
+                finally: os.close(pfd)
+        finally: self.close()
+
+    def rm_made_dirs(self):
+        """Revue 1 (row 14) : rien restauré -> dossiers créés comme parents par cette restauration retirés s'ils sont vides (le plus
+        profond d'abord, sans suivre de lien)."""
+        if self.rootfd is None: return
+        for p in sorted(self.made_dirs,key=lambda x: -x.count('/')):
+            k=p.split('/'); pfd=self._walk(k[:-1])
+            if pfd is None: continue
+            try: os.rmdir(k[-1],dir_fd=pfd)
+            except OSError: pass
+            finally: os.close(pfd)
+
+def _tar_stdout_cut(dst,span):
+    """Revue 2 (row 24), revue 3 (rows 38, 39) : tar de stdout coupé (borg en échec, Ctrl-C, SIGTERM) — le tampon du _Stream de tarfile
+    (jusqu'à 10 Kio de membres complets) vidé SANS fin d'archive ; puis, seulement à une frontière de membre, un en-tête GNU
+    `././@LongLink` (nom long) annonçant 8 Gio : tout lecteur échoue AVANT de créer quoi que ce soit de plus (mesuré,
+    work/s114/mesure-fin-tar2.txt : GNU tar « Unexpected EOF », code 2 ; tarfile « empty header ») — un faux membre ordinaire était
+    créé chez le lecteur, ou lu comme contenu du membre en cours. Membre en cours (`in_progress`) : rien ajouté, le contenu manquant
+    fait déjà échouer tout lecteur.
+    Revue 4 (row 53) : membre en cours = position du _Stream STRICTEMENT entre le début et la fin attendue du membre (`span`, notés
+    avant addfile : en-tête de tobuf + contenu en blocs) — un signal avant l'écriture de l'en-tête ou après addfile est à une
+    frontière (marqueur écrit). Row 54 : appelée APRÈS l'arrêt de borg, stdout en NON BLOQUANT — tube plein (lecteur figé) ou cassé :
+    coupe abandonnée et stdout redirigé vers /dev/null (la vidange finale de Python ne bloque jamais ni ne change le code de sortie).
+    Row 55 : TypeError/AttributeError de l'API privée _create_header -> aucun marqueur (le code reste celui de l'appelant)."""
+    import tarfile as tf_mod
+    try:
+        st=dst.fileobj; out=st.fileobj; fd=out.fileno()
+    except (OSError,AttributeError,ValueError): return
+    try: os.set_blocking(fd,False)
+    except OSError: pass
+    try:
+        pos=st.pos; out.write(st.buf); st.buf=b''   # _Stream non compressé (w|) : octets en attente, jamais les blocs de fin
+        if not (span is not None and span[0]<pos<span[1]):
+            mark=None
+            try:
+                h=tf_mod.TarInfo('././@LongLink'); h.type=tf_mod.GNUTYPE_LONGNAME; h.size=2**33-1
+                mark=h._create_header(h.get_info(),tf_mod.GNU_FORMAT,'utf-8','surrogateescape')
+            except (TypeError,AttributeError,ValueError): pass
+            if mark: out.write(mark)
+        out.flush()
+        os.set_blocking(fd,True)
+    except (OSError,AttributeError,ValueError): _stdout_discard(fd)   # EAGAIN (tube plein), EPIPE : abandon, reste jeté
+
+def _stdout_discard(fd=None):
+    """Revue 4 (rows 54, 56) : stdout du tar abandonné (lecteur figé ou parti) — /dev/null à sa place (bloquant) : la vidange finale
+    de Python et le __del__ du _Stream de tarfile n'écrivent plus sur le tube (jamais de blocage, d'« Exception ignored » ni de
+    code 120)."""
+    try:
+        if fd is None: fd=sys.stdout.buffer.fileno()
+        nul=os.open(os.devnull,os.O_WRONLY|getattr(os,'O_CLOEXEC',0))
+        try: os.dup2(nul,fd)
+        finally: os.close(nul)
+        os.set_blocking(fd,True)
+    except (OSError,AttributeError,ValueError): pass
+
+def _restore_tar_entry(ti,flat):
+    """Mode sûr, sortie tar/tgz/stdout (décision 9) : entrée du flux réécrite telle quelle, chemin normalisé — None si sautée
+    (non normalisée ; à plat : dossier). À plat : nom seul ; lien physique vers le nom seul de son premier nom (comme
+    tarfile.add de 1.0.212)."""
+    parts=_restore_norm(ti.name)
+    if not parts: return None
+    if flat:
+        if ti.isdir(): return None
+        ti.name=parts[-1]
+    else: ti.name='/'.join(parts)
+    if ti.islnk():
+        mp=_restore_norm(ti.linkname)
+        if not mp: return None
+        ti.linkname=mp[-1] if flat else '/'.join(mp)
+    return ti
 
 _BORG_ALWAYS=('Platform','Borg:')   # écartés de toute ligne (1.0.173, inchangé)
 _BORG_SYSINFO=('Platform','Linux:','Borg:','PID:','sys.argv:','SSH_ORIGINAL_COMMAND:','Borg server:')   # sysinfo() de borg 1.2 : après une trace
@@ -2676,7 +3302,7 @@ def _lower_priority():
 # _CLI_OPTAB[cmd] (ou de _CLI_EARLY[cmd]) hors communes -C -c -d -P, ni plus ni moins (contrôlé par CodecSelfTest) ; chaque
 # exemple est accepté par l'analyseur de main (_help_example_error : getopt, _cli_options, _cli_required).
 _CLI_SHORTOPTS="c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:"
-_CLI_LONGOPTS=["help","rebuild","keys","history"]
+_CLI_LONGOPTS=["help","rebuild","keys","history","fidele","creux","liens-en-dossiers","par-nom"]
 # Options acceptées par commande (seule source des options) — contenu inchangé depuis _cli_main (déplacé en 1.0.206).
 _CLI_OPTAB={k:v+'P' for k,v in {
     'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
@@ -2689,7 +3315,9 @@ _CLI_OPTAB={k:v+'P' for k,v in {
     'repohistory':'Ccdnj','archivehistory':'Ccdnj','status':'Ccdnj','borgcleanup':'CcdyD','bkpreconcile':'Ccdnj',
     'storage':'Ccdnj'}.items()}
 # Options longues de commande : réservées à une seule commande (_cli_options).
-_CLI_LONG_OWNER={'--rebuild':'index','--keys':'borgcleanup','--history':'borgcleanup'}
+_CLI_LONG_OWNER={'--rebuild':'index','--keys':'borgcleanup','--history':'borgcleanup',
+                 '--fidele':'restore','--creux':'restore','--liens-en-dossiers':'restore','--par-nom':'restore'}   # Restore : 1.0.214 (story 114)
+_RESTORE_LONG=('--fidele','--creux','--liens-en-dossiers','--par-nom')
 # Commandes traitées par _cli_main AVANT _CLI_OPTAB (aucune base, aucun rc) : options lues par leur branche.
 _CLI_EARLY={'codecselftest':'fl','perfbench':'nK'}
 _CLI_COMMON='CcdP'
@@ -2789,18 +3417,26 @@ _HELP={
         (("démonte MOUNTPOINT du nick","borgHelper -c UMount -n mon-serveur"),
          ("nick qui porte le nom de la machine","borgHelper -c UMount"))),
     'restore':_H('Restore',1,"Restaure un fichier ou une arborescence depuis une archive",
-        "-c Restore [-n nick] [-b archive|last] -f chemin (-w dest | -W dest | -L)",
+        "-c Restore [-n nick] [-b archive|last] -f chemin (-w dest | -W dest | -L) [--liens-en-dossiers | --fidele [--creux]] [--par-nom]",
         (_HN,('-b <archive|last>',"archive (défaut et last : la dernière de la base qui contient -f, sinon la dernière)"),
          ('-f <chemin>',"chemin exact ou glob (* et ? ; ** franchit /) — obligatoire"),
          ('-w <dest>',"restaure avec les sous-répertoires : répertoire, .tar/.tgz, ou - (tar sur stdout)"),
          ('-W <dest>',"restaure à plat : fichiers à la racine de dest (mêmes formes)"),
-         ('-L',"liste droits et propriétaires, sans restaurer")),
+         ('-L',"liste droits et propriétaires, sans restaurer"),
+         ('--liens-en-dossiers',"mode sûr : lien de l'archive avec des éléments dessous -> vrai dossier, éléments écrits dedans"),
+         ('--fidele',"mode fidèle : borg extract brut (attributs étendus, ACL) — AUCUNE protection (bases, dépôt, rc)"),
+         ('--creux',"avec --fidele : fichiers creux restaurés creux (un fichier préalloué revient creux aussi)"),
+         ('--par-nom',"propriétaires par nom de l'archive (numériques si inconnus ; défaut : uid/gid numériques)")),
         (("dans /tmp/restauration, depuis la dernière archive qui contient le fichier",
           "borgHelper -c Restore -n mon-serveur -f etc/nginx/nginx.conf -w /tmp/restauration"),
          ("glob -> tgz plat","borgHelper -c Restore -n mon-serveur -f 'home/user/*.log' -W /tmp/logs.tgz"),
          ("droits seulement, rien restauré","borgHelper -c Restore -n mon-serveur -f 'etc/nginx/*.conf' -L"),
-         ("tar vers stdout","borgHelper -c Restore -n mon-serveur -b srv-2026-06-04 -f home/user -w -")),
-        long=("Destination répertoire absente : créée ; inutilisable : refus, code 3, avant tout appel à borg.",
+         ("mode fidèle : attributs étendus et ACL, sans protection","borgHelper -c Restore -n mon-serveur -f home/user -w /tmp/r --fidele")),
+        long=("Défaut, mode sûr : chaque fichier écrit par borgHelper depuis borg export-tar, jamais à travers un lien ;",
+              "attributs étendus et ACL non restaurés (avis à chaque Restore) ; rien écrit dans les bases, les dépôts locaux,",
+              "les clés et dossiers de borg, le rc : éléments sautés, [WARN], code 1 ; élément sous un lien : sauté, code 1.",
+              "Flux interrompu (borg, réseau, disque plein) : fichiers finis gardés, code 2. --fidele : borg extract, CLI seulement.",
+              "Destination répertoire absente : créée ; inutilisable, ou fichier tar dans une zone : refus, code 3, avant borg.",
               "Un Index en cours se met en pause pendant la restauration. Code 2 aussi : erreur d'arguments.")),
     # ── INDEX ET RECHERCHE ──
     'index':_H('Index',2,"Indexe les changements entre archives et le contenu de la dernière",
@@ -3182,6 +3818,16 @@ def _cli_required(cmd,options,fs=True):
     elif cmd=='restore':
         if '-f' not in options: return "-f <chemin> obligatoire"
         if '-L' not in options and '-w' not in options and '-W' not in options: return "-w <dest> ou -W <dest> obligatoire (ou -L)"
+        # 1.0.214 (story 114, décisions 8 et 16) : --creux avec --fidele seulement ; --liens-en-dossiers : mode sûr seulement
+        if '-L' in options and any(o in options for o in _RESTORE_LONG): return "--fidele, --creux, --liens-en-dossiers, --par-nom : sans objet avec -L"
+        if '--creux' in options and '--fidele' not in options: return "--creux seulement avec --fidele"
+        if '--liens-en-dossiers' in options and '--fidele' in options: return "--liens-en-dossiers : mode sûr seulement (sans --fidele)"
+        # revue 1 de la story 114 (rows 2 et 17)
+        if '-b' in options and not options['-b'].strip(): return "-b vide refusé : nom d'archive exact attendu"
+        dst=options.get('-W',options.get('-w'))
+        if dst is not None and (dst=='-' or _is_tar_dest(dst)):
+            if '--liens-en-dossiers' in options: return "--liens-en-dossiers : sans objet vers un tar ou stdout"
+            if '--par-nom' in options and '--fidele' not in options: return "--par-nom : sans objet vers un tar ou stdout en mode sûr"
     elif cmd=='diffbkp':
         if '-b' in options and options['-b'].count(',')>1: return f"-b {options['-b']!r} : une ou deux archives (a ou a,b)"
     elif cmd=='delbkp':
@@ -7466,7 +8112,7 @@ class BorgRunner:
         except OSError: return False   # présent mais inaccessible (droits) : jamais « absent »
         return False
 
-    def boex(self,nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True,sshEnv=None):
+    def boex(self,nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True,stream=None,on_abort=None,sshEnv=None):
         cfg=self.cfgreaded(nick,debug=debug)
         if debug!=0: printer('Boex the first')
         varfut=_borg_child_env(cfg,forceEnv)   # 1.0.195 (story 72, D134) : codes hérités, même avec borg 1.4 (après forceEnv)
@@ -7501,10 +8147,12 @@ class BorgRunner:
             printer(f"{' '.join(commande)}")
             printer(f"+{rep} >{' '.join(commande)}")
             if arg[1] in "extract": sys.exit(4)
-        ps=subprocess.Popen(commande,encoding='utf-8',env=varfut,cwd=rep,bufsize=8192,
-                            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        killed=False; tree=None; meis=set()   # 1.0.179 (A91) : arbre relevé et _MEI* mappés de ce borg (s'il est tué)
+        if stream is not None: return self._boex_stream(commande,varfut,rep,stream,debug,on_abort)
+        killed=False; tree=None; meis=set(); ps=None   # 1.0.179 (A91) : arbre relevé et _MEI* mappés de ce borg (s'il est tué)
         try:
+            # 1.0.214 (story 114, revue 4 row 55) : Popen dans le try — Ctrl-C/SIGTERM juste après le lancement : borg arrêté
+            ps=subprocess.Popen(commande,encoding='utf-8',env=varfut,cwd=rep,bufsize=8192,
+                                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             stop=self._stop
             # 1.0.213 (story 115) : inp = passphrase de SSH_ENV = commande (sinon None : entrée fermée aussitôt, comme avant) ; donnée
             # au PREMIER appel seulement (communicate refuse une entrée ensuite : ValueError) ; une ligne courte : écrite dans le tube et entrée
@@ -7532,18 +8180,24 @@ class BorgRunner:
                                 try: inf,errs=ps.communicate(timeout=10)
                                 except subprocess.TimeoutExpired: inf,errs='',''   # tube tenu par un processus hors arbre (démon)
                             killed=True; BorgRunner._tls.kills=self._kills+1; break
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as _ki:
+            _sigterm_disarm()   # 1.0.214 (story 114, revue 3 row 50) : un SIGTERM n'interrompt plus l'arrêt de borg
             # 1.0.179 (A91 ; revue) : borg a reçu SIGINT du terminal (groupe) — SIGTERM à l'arbre et 5 s pour sortir proprement
             # (verrou rendu), puis SIGKILL à l'arbre relevé : l'enfant PyInstaller ne meurt pas d'un SIGKILL à la tête (mesuré)
             try:
+                if ps is None: raise _NoBorg()
                 tree=_kill_tree(ps,signal.SIGTERM,tree,meis)
                 # 5 s pour la tête ET l'arbre relevé (run complet story 42 : une tête morte aussitôt ne laissait aucun délai à
                 # l'enfant qui, lui, rend le verrou) ; 1.0.180 : _tree_wait (commun aux arrêts, arbre relu)
                 tree,_=_tree_wait(ps,tree,time.monotonic()+5,meis)
                 tree=_kill_tree(ps,signal.SIGKILL,tree,meis); ps.wait()
                 _tree_wait(ps,tree,time.monotonic()+5,meis)   # revue : arbre sorti avant la purge des _MEI
-            except KeyboardInterrupt: _kill_tree(ps,signal.SIGKILL,tree,meis); ps.wait()   # second Ctrl-C : tout de suite
+            except _NoBorg: pass   # interrompu avant la fin de Popen : aucun borg connu
+            except KeyboardInterrupt:   # second Ctrl-C : tout de suite
+                if ps is not None: _kill_tree(ps,signal.SIGKILL,tree,meis); ps.wait()
             _purge_mei_dirs(meis); _purge_mei_orphans()
+            # 1.0.214 (story 114, revue 3 row 40) : SIGTERM converti par Restore (sélection d'archive : borg list) -> 143
+            if isinstance(_ki,_SigTerm): printer("\n[INTERRUPTED] Restore arrêté (SIGTERM)."); sys.exit(143)
             printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
             sys.exit(130)
         ret={'stdout':[],'stderr':[]}
@@ -7562,6 +8216,71 @@ class BorgRunner:
         ret['exitcode']=ps.returncode
         if killed: ret['killed']=True
         if debug: printer(json.dumps(ret,indent=4))
+        return ret
+
+    def _boex_stream(self,commande,env,rep,stream,debug=0,on_abort=None):
+        """1.0.214 (story 114, mode sûr de Restore) : borg dont la SORTIE est lue en flux par `stream(fh)` (fichier binaire, jamais
+        gardée en mémoire ni sur disque) ; stderr lu à part (fil) ; `stream` rend None (lu jusqu'au bout : reste du flux vidé, borg
+        sort seul) ou l'exception qui a arrêté la lecture (disque plein, flux coupé : borg arrêté, arbre compris, comme boex) — dans
+        'stream_exc'. Exception non prévue ou Ctrl-C pendant la lecture : borg arrêté puis l'exception relancée (Ctrl-C : code 130,
+        comme boex ; SIGTERM converti par Restore, _SigTerm : code 143). `on_abort` (revue 2, row 25) : appelé AVANT l'arrêt de borg
+        sur Ctrl-C/SIGTERM (temporaire du tar retiré avant les secondes d'attente de l'arbre). Seul appelant : le mode sûr de Restore
+        (_restore_stream) ; aucun gestionnaire de signal posé ici (revue 3, row 49 : _restore_sigterm posé par la CLI seulement,
+        autour de la commande Restore ; en bibliothèque, aucun gestionnaire : SIGTERM garde son effet). Nettoyage (Ctrl-C/SIGTERM) :
+        SIGTERM ignoré dès son entrée si le gestionnaire de la CLI est posé (_sigterm_disarm).
+        Résultat : forme de boex (stdout vide)."""
+        ps=None; errs=[]; th=None
+        tree=None; meis=set(); killed=False; exc=None
+        def stop():
+            nonlocal tree,killed
+            if ps is None or ps.poll() is not None: return
+            tree=_kill_tree(ps,signal.SIGTERM,tree,meis); tree,done=_tree_wait(ps,tree,time.monotonic()+5,meis)
+            if not done:
+                tree=_kill_tree(ps,signal.SIGKILL,tree,meis); tree,_=_tree_wait(ps,tree,time.monotonic()+5,meis)
+            killed=True
+        try:
+            # revue 3 (row 50) : Popen dans le try — un SIGTERM juste après le lancement arrête borg (jamais orphelin)
+            ps=subprocess.Popen(commande,env=env,cwd=rep,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            th=threading.Thread(target=lambda: errs.append(ps.stderr.read()),daemon=True); th.start()
+            exc=stream(ps.stdout)
+            if exc is None:
+                while ps.stdout.read(1<<16): pass   # fin du tar (bourrage) : borg sort seul
+            else: stop()
+        except KeyboardInterrupt as e:
+            _sigterm_disarm()   # revue 3 (row 50) : nettoyage jamais interrompu par un SIGTERM
+            if on_abort is not None:
+                try: on_abort()
+                except BaseException: pass   # second Ctrl-C pendant le retrait : l'arrêt de borg suit quand même
+            try: stop()
+            except KeyboardInterrupt:
+                if ps is not None: _kill_tree(ps,signal.SIGKILL,tree,meis)
+            if ps is not None: ps.wait()
+            _purge_mei_dirs(meis); _purge_mei_orphans()
+            if isinstance(e,_SigTerm): printer("\n[INTERRUPTED] Restore arrêté (SIGTERM)."); sys.exit(143)
+            printer("\n[INTERRUPTED] Opération annulée par l'utilisateur.")
+            sys.exit(130)
+        except BaseException:
+            stop()
+            if ps is not None: ps.wait()
+            raise
+        finally:
+            if ps is not None:
+                try: ps.stdout.close()
+                except OSError: pass
+        ps.wait(); th.join(10)
+        if killed: _purge_mei_dirs(meis); _purge_mei_orphans()
+        ret={'stdout':[],'stderr':[]}
+        for _line in (errs[0] if errs else b'').decode('utf-8','replace').split('\n'):
+            if not _line.strip(): continue
+            if _line[0]=='{':
+                try: ret['stderr'].append(json.loads(_line)); continue
+                except json.JSONDecodeError: pass
+            ret['stderr'].append(_line)
+        ret['exitcode']=ps.returncode; ret['stream_exc']=exc
+        # revue 4 : « arrêté par nous » seulement si borg est mort du signal (code < 0, ou ≥ 128 : 143 de borg) — borg sorti seul
+        # pendant l'arrêt (EOF puis code 2 et son message) garde sa cause (course mesurée en contrôle ciblé : « empty file »)
+        if killed and (ps.returncode<0 or ps.returncode>=128): ret['killed']=True
+        if debug: printer(json.dumps({k:v for k,v in ret.items() if k!='stream_exc'},indent=4))
         return ret
 
 # ── BorgHelper — high-level service layer (DB + Borg combined) ────────────────
@@ -8814,7 +9533,7 @@ class BorgHelper:
                 bid=self._lastbkp_or_stop(nick,debug=debug)[0]
                 print(f"Archive (dernière) : {bid}",flush=True)
         fmt='{mode} {user:8} {group:8} {size:>12} {isomtime} {path}{NL}'
-        args=['list','--format',fmt,f'::{bid}']
+        args=['list','--format',fmt,f'::{_borg_literal(bid)}']   # 1.0.214 (revue 2 de la story 114, row 29) : nom littéral
         if '*' in ftor or '?' in ftor: args+=_borg_glob_args(ftor)
         else: args.append(ftor)
         rb=self.borg.boex(nick,args,debug=debug,retjson=False)
@@ -8824,71 +9543,409 @@ class BorgHelper:
         else: printer(self._borg_fail_msg(nick,'borg list',_rb_errmsg(rb,'borg list')))   # 1.0.175 (A70)
         sys.exit(rb['exitcode'])
 
-    def restore(self,nick,bid,ftor,where,flat=False,debug=0):
+    def _restore_zones(self,nick=None,quiet=False):
+        """1.0.214 (story 114 ; définition de la story 99, décisions 1, 4, 6 et 11) : zones protégées du mode sûr de Restore,
+        [(étiquette, formes, identités)] — CACHE_DIR (celui des bases, et toute clé CACHE_DIR de section), le rc, le dépôt LOCAL et
+        la clé de borg (BORG_KEY_FILE) de CHAQUE nick du rc utilisé (pas les autres rc servis par borgHelperWWW), `.cache/borg` et
+        `.config/borg` du dossier personnel pwd (celui d'un borg lancé par boex, sans HOME) et de HOME, et les clés BORG_BASE_DIR,
+        BORG_CACHE_DIR, BORG_CONFIG_DIR, BORG_SECURITY_DIR, BORG_KEYS_DIR du rc. Dépôt ou clé RELATIFS : sous le dossier courant
+        (celui de borg export-tar). Limite : un BORG_EXE enveloppe qui exporte ses propres dossiers de borg — inconnus ici.
+        Formes (realpath, liens compris) résolues à l'appel, juste avant l'écriture ; identités relevées à la première demande."""
+        import pwd
+        raw=[(_RZ_BASES,os.path.abspath(self.db.cache_dir)),(_RZ_RC,os.path.abspath(self.borg.cfgfile))]
+        marks=_BorgMarks(); vers={}; cwd=os.getcwd(); told=set()
+        def ver(cfg,n=None):
+            try: exe=cfg.get('BORG_EXE','borg') or 'borg'
+            except (configparser.Error,ValueError) as e:   # revue 3 (row 46) : BORG_EXE illisible -> version inconnue, pas de zone
+                if not quiet and n not in told:   # revue 4 (row 55) : dit, une fois par nick
+                    told.add(n); printer(f"[WARN] zones du nick {n} : BORG_EXE illisible ({_etxt(e)}) — dépôt à {{borgversion}} non protégé")
+                return None
+            if exe not in vers: vers[exe]=_restore_borg_version(cfg)
+            return vers[exe]
+        try: homes=[pwd.getpwuid(os.getuid()).pw_dir]
+        except KeyError: homes=[]
+        homes.append(os.environ.get('HOME') or '')
+        for h in homes:
+            if h: raw+=[(_RZ_BORG,os.path.join(h,'.cache','borg')),(_RZ_BORG,os.path.join(h,'.config','borg'))]
+        for n in (self.borg.cfgreadnicks() or '').split(','):
+            if not n: continue
+            try: raw+=self._restore_nick_zones(n,cwd,ver,marks,quiet)
+            except Exception as e:   # revue 1 (row 16) : un nick illisible n'arrête pas la restauration des autres
+                if not quiet: printer(f"[WARN] zones du nick {n} inconnues ({_etxt(e)}) — ses dossiers ne sont pas protégés")
+        zones=[]
+        for label,pth in raw:
+            forms=frozenset(_restore_path_forms(pth))
+            if '/' in forms or any(forms==f for _,f,_ in zones): continue   # « / » : jamais une zone (tout serait sauté)
+            zones.append((label,forms,_ZoneIds(forms)))
+        return zones
+
+    def _restore_nick_zones(self,n,cwd,ver,marks,quiet=False):
+        """Zones d'un nick du rc (_restore_zones) : CACHE_DIR de section, dépôt LOCAL, BORG_KEY_FILE, BORG_*_DIR. Revue 2 (row 26) :
+        lecture CLÉ PAR CLÉ — une clé illisible (configparser, `%` mal formé) ou à octet NUL est seule ignorée, dite par un [WARN], les
+        autres zones du nick gardées. Relatifs : sous `cwd` (dossier de travail de borg export-tar). Revue 2 (row 27) : borg lancé par
+        borgHelper ne reçoit JAMAIS les clés BORG_*_DIR du rc (_BORG_RC_ENV_KEYS) — fermé par défaut, les deux lectures possibles
+        protégées : `<cwd>/<valeur>` et `expanduser(<valeur>)` ; CACHE_DIR : règle de borgHelper (expanduser)."""
+        out=[]
+        cfg=self.borg.cfgread(n)
+        if cfg is None: return out
+        def g(k):   # revue 3 (row 47) : UNE lecture par clé ([WARN] dit une fois ; `quiet` : relecture juste avant l'écriture)
+            try: v=(cfg.get(k) or '').strip()
+            except (configparser.Error,ValueError) as e:
+                if not quiet: printer(f"[WARN] zones du nick {n} : {k} illisible ({_etxt(e)}) — non protégé")
+                return ''
+            if '\x00' in v:
+                if not quiet: printer(f"[WARN] zones du nick {n} : {k} contient un octet NUL — non protégé")
+                return ''
+            return v
+        for k in ('CACHE_DIR','cache_dir'):   # revue 4 (row 55) : clés du rc SENSIBLES à la casse (cfgread : optionxform=str) — les deux
+            v=g(k)
+            if v: out.append((_RZ_BASES,os.path.abspath(os.path.expanduser(v))))
+        r=_restore_local_repo(g('BORG_REPO'),base=cwd,ver=lambda: ver(cfg,n),marks=marks)
+        if r: out.append((_RZ_REPO,r))
+        v=g('BORG_KEY_FILE')
+        if v: out.append((_RZ_KEY,os.path.join(cwd,v)))
+        for k in ('BORG_BASE_DIR','BORG_CACHE_DIR','BORG_CONFIG_DIR','BORG_SECURITY_DIR','BORG_KEYS_DIR'):
+            v=g(k)
+            if not v: continue
+            for p in dict.fromkeys((os.path.join(cwd,v),os.path.abspath(os.path.expanduser(v)))):
+                out+=([(_RZ_BORG,os.path.join(p,'.cache','borg')),(_RZ_BORG,os.path.join(p,'.config','borg'))]
+                      if k=='BORG_BASE_DIR' else [(_RZ_BORG,p)])
+        return out
+
+    def _restore_tar_zone(self,nick,tarpath,zones=None):
+        """Fichier tar de Restore (mode sûr) dans une zone protégée -> [ERREUR], code 3, rien écrit (décision 5 de la story 99 ;
+        avant borg et juste avant l'écriture). Revue 2 (row 35) : `zones` calculées une fois par Restore ([WARN] d'un nick dit une fois)."""
+        lab=_restore_zone_of(tarpath,zones if zones is not None else self._restore_zones(nick))
+        if lab: printer(f"[ERREUR] destination {tarpath} : dans une zone protégée ({lab}) — fichier tar refusé, rien écrit"); sys.exit(3)
+
+    def restore(self,nick,bid,ftor,where,flat=False,debug=0,fidele=False,sparse=False,links_as_dirs=False,by_name=False):
+        """Restore -w/-W (dossier, .tar/.tgz, `-` : tar sur stdout). 1.0.214 (story 114, décision 16) : défaut = mode SÛR
+        (borg export-tar lu en flux, chaque entrée écrite par borgHelper, zones protégées sautées) ; `fidele` = borg extract brut de
+        1.0.212, sans aucune protection (`sparse` : --sparse, seulement avec `fidele`). `links_as_dirs` (mode sûr) : lien de
+        l'archive avec des éléments dessous remplacé par un vrai dossier ; `by_name` : propriétaires par nom (deux modes).
+        Codes : 0 tout restauré, 1 éléments sautés (ou avertissement de borg), 2 refus d'options ou flux interrompu, 3 destination
+        inutilisable ou erreur d'écriture du tar (comme avant)."""
         cfg=self.borg.cfgreaded(nick,debug=debug)
         stdout_mode=(where=='-')
         out=sys.stderr if stdout_mode else sys.stdout
+        # 1.0.214 (story 114, décisions 3, 8, 16) : combinaisons refusées aussi pour la bibliothèque (la CLI les refuse avant, _cli_required)
+        if sparse and not fidele: printer("[ERREUR] Restore : --creux seulement avec --fidele"); sys.exit(2)
+        if links_as_dirs and fidele: printer("[ERREUR] Restore : --liens-en-dossiers : mode sûr seulement (sans --fidele)"); sys.exit(2)
+        # revue 1 (rows 2 et 17) : nom d'archive vide ou blanc (« :: » viserait le dépôt) ; options sans objet vers un tar ou stdout
+        if bid is not None and (not isinstance(bid,str) or not bid.strip()):
+            printer("[ERREUR] Restore : -b vide refusé : nom d'archive exact attendu"); sys.exit(2)
+        if where=='-' or _is_tar_dest(where):
+            if links_as_dirs: printer("[ERREUR] Restore : --liens-en-dossiers : sans objet vers un tar ou stdout"); sys.exit(2)
+            if by_name and not fidele: printer("[ERREUR] Restore : --par-nom : sans objet vers un tar ou stdout en mode sûr"); sys.exit(2)
         if self.borg.repoLocalAbsent(nick): self._borg_stop(nick)   # 1.0.172 (A60) : avant tout verrou
+        # revue 3 (row 49) : aucun gestionnaire de signal ici (bibliothèque) — la CLI pose _restore_sigterm autour de la commande
+        return self._restore_run(nick,bid,ftor,where,flat,debug,fidele,sparse,links_as_dirs,by_name,None)
+
+    def _restore_run(self,nick,bid,ftor,where,flat,debug,fidele,sparse,links_as_dirs,by_name,zones):
+        """Suite de restore() (destination, zones, sélection d'archive, avis, verrou, écriture)."""
+        stdout_mode=(where=='-')
+        out=sys.stderr if stdout_mode else sys.stdout
+        tar_dest=stdout_mode or _is_tar_dest(where)
         # 1.0.173 (story 36, A63 ; revue : -W aussi, décision de l'utilisateur) : destination « dossier » (-w, -W hors tar et
         # stdout) vérifiée AVANT la sélection d'archive (borg list), le verrou et borg — pas un dossier, non traversable, ou
         # création impossible : message, code 3, jamais de trace (avant : FileNotFoundError, NotADirectoryError,
         # PermissionError, FileExistsError envoyées à Sentry)
-        if not (stdout_mode or _is_tar_dest(where)):
+        if not tar_dest:
             pb=_restore_dest_problem(where)
             if pb: printer(f"[ERREUR] destination {where} : {pb}"); sys.exit(3)
+        if not fidele and not stdout_mode:
+            # revue 2 (rows 28, 35) : zones calculées UNE fois, en tête — destination dans une zone (chemin ou identité) : avant toute
+            # sélection d'archive (borg list) et tout verrou, sans avis ni commande --fidele ; fichier tar dans une zone : code 3
+            zones=self._restore_zones(nick)
+            if tar_dest: self._restore_tar_zone(nick,where,zones)
+            else:
+                wl=_restore_zone_of(where,zones)
+                if wl: printer(f"[WARN] rien restauré : destination dans une zone protégée ({wl})"); sys.exit(1)
         if bid is None:
             bid=self._find_last_archive_with_file(nick,ftor,debug=debug)
             if bid: print(f"Archive sélectionnée depuis l'index : {bid}",file=out,flush=True)
             else:
                 bid=self._lastbkp_or_stop(nick,debug=debug)[0]
                 print(f"Archive sélectionnée (dernière) : {bid}",file=out,flush=True)
+        # décisions 4 et 16 : avis TOUJOURS dit (-w, -W, tar, stdout), code inchangé ; mode sûr : commande complète du mode fidèle
+        if fidele: printer(_RESTORE_FIDELE_NOTE)
+        else:
+            printer(_RESTORE_SAFE_NOTE)
+            printer(_RESTORE_FIDELE_CMD
+                    +_restore_cli_line(self.borg.cfgfile,nick,bid,ftor,where,flat,fidele=True,extra=['--par-nom'] if by_name else ()))
         self.db.set_priority_lock(nick)
-        self.db.wait_index_idle(nick)
         try:
-            if stdout_mode or _is_tar_dest(where):
-                self._restore_to_tar(nick,bid,ftor,where,flat=flat,debug=debug)
-            elif flat:
-                import tempfile,shutil
-                with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
-                    rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
-                    if rb['exitcode'] not in (0,1): self._extract_fail(nick,rb)
-                    _print_boex_stderr(rb)
-                    try: os.makedirs(where,exist_ok=True)   # 1.0.173 : course après la vérification -> message, jamais de trace
-                    except OSError as e: printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
-                    try:
-                        for root,_,files in os.walk(tmpdir):
-                            for f in files: shutil.copy2(os.path.join(root,f),os.path.join(where,f))
-                    except OSError as e:
-                        import errno as _errno
-                        if e.errno==_errno.ENOSPC: printer(f"[ERREUR] Espace disque insuffisant : {e.filename or where}")
-                        else: printer(f"[ERREUR] Copie impossible : {e}")
-                        sys.exit(3)
-                    print(f"Restauré (plat) dans {where}",flush=True)
-                sys.exit(rb['exitcode'])
-            else:
-                # 1.0.173 (story 36, A63, décision de l'utilisateur) : dossier absent créé (comme -W), juste avant borg (son
-                # répertoire de travail) ; borg en échec -> dossiers créés ici retirés s'ils sont restés vides (-W ne crée qu'après
-                # un extract réussi : jamais de dossier vide laissé par un échec, /restore de borgHelperWWW compris)
-                try: made=_makedirs_tracked(where)
-                except OSError as e:
-                    printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
-                rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=where,debug=debug)
-                if rb['exitcode'] not in (0,1): _rmdirs_if_empty(made); self._extract_fail(nick,rb)
-                _print_boex_stderr(rb)
-                sys.exit(rb['exitcode'])
+            self.db.wait_index_idle(nick)   # revue 3 (row 41) : dans le try — verrou rendu même interrompu pendant l'attente
+            if fidele: self._restore_fidele(nick,bid,ftor,where,flat=flat,debug=debug,sparse=sparse,by_name=by_name)
+            elif tar_dest: self._restore_safe_tar(nick,bid,ftor,where,flat=flat,debug=debug,zones=zones)
+            else: self._restore_safe_dir(nick,bid,ftor,where,flat=flat,debug=debug,links_as_dirs=links_as_dirs,by_name=by_name,zones=zones)
+        except SystemExit as x:   # revue 4 (row 55) : sortie de fin de Restore (son code gardé par _restore_sigterm si SIGTERM suit)
+            x._bh_restore_end=True; raise
         finally:
             self.db.clear_priority_lock(nick)
+
+    @staticmethod
+    def _export_tar_args(bid,sel):
+        """borg export-tar de la sélection vers stdout (tar brut, sans filtre) : `--exclude */log/*` et sélection comme
+        _borg_extract_args (chemin, ou motifs d'un joker) ; `sel` liste : chemins exacts `pp:` (seconde lecture des liens physiques)."""
+        base=['export-tar','--exclude','*/log/*',f'::{_borg_literal(bid)}','-']   # revue 1 (row 2) : nom littéral
+        if isinstance(sel,list): return base+sel
+        return base+(_borg_glob_args(sel) if ('*' in sel or '?' in sel) else [sel])
+
+    def _restore_stream(self,nick,args,consume,debug=0,on_abort=None):
+        """borg lancé par boex, sortie lue en flux par `consume(fh)` (-> None, ou exception qui arrête la lecture : borg arrêté) ;
+        résultat boex + 'stream_exc'."""
+        return self.borg.boex(nick,args,debug=debug,retjson=False,stream=consume,on_abort=on_abort)
+
+    def _restore_safe_dir(self,nick,bid,ftor,where,flat=False,debug=0,links_as_dirs=False,by_name=False,zones=None):
+        """Mode sûr, destination dossier (-w arborescence, -W à plat) : zones relues juste avant l'écriture ; destination dans une
+        zone, par chemin ou par identité (elle ou un parent existant : montage bind de CACHE_DIR…) -> aucun borg, rien créé,
+        `[WARN] rien restauré`, code 1 (revue 1, rows 1 et 7) ; sinon créée (retirée, avec les parents créés par l'écrivain, si rien
+        n'est restauré) puis _SafeWriter. Flux interrompu (borg en échec, tué, réseau ; disque plein) : fichiers finis gardés,
+        [ERREUR] avec le dernier élément écrit et le nombre restauré, code 2 (décision 12). Liens physiques dont le premier nom n'a
+        pas été écrit : seconde lecture de ces seuls chemins, par lots (borg les rend alors en fichiers complets), [WARN] « lien
+        physique rompu » pour chaque nom écrit, les autres listés sautés ; échec de cette lecture : flux interrompu, code 2 (décision 14)."""
+        import tarfile as tf_mod
+        # revue 3 (row 43) : zones RECALCULÉES juste avant l'écrivain (le contrôle en tête de Restore précède borg list et l'attente de
+        # l'Index : une zone apparue entre-temps est vue) ; [WARN] des nicks déjà dits en tête (`quiet`), sauf appel direct
+        zones=self._restore_zones(nick,quiet=zones is not None)
+        wl=_restore_zone_of(where,zones)
+        if wl: printer(f"[WARN] rien restauré : destination dans une zone protégée ({wl})"); sys.exit(1)
+        made=[]
+        try: made=_makedirs_tracked(where)
+        except OSError as e:
+            printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
+        try: w=_SafeWriter(where,zones,flat=flat,by_name=by_name,links_as_dirs=links_as_dirs)
+        except OSError as e:
+            _rmdirs_if_empty(made); printer(f"[ERREUR] destination {where} : {e.strerror or e}"); sys.exit(3)
+        def consume(fh):
+            try:
+                tf=tf_mod.open(fileobj=fh,mode='r|')
+                for ti in tf:
+                    w.entry(ti,tf); tf.members=[]   # jamais toute la liste en mémoire (tarfile garde chaque membre lu)
+            except (tf_mod.TarError,EOFError,_RestoreStop,OSError) as e: return e
+            return None
+        def run(sel):
+            r=self._restore_stream(nick,self._export_tar_args(bid,sel),consume,debug=debug); e=r.get('stream_exc')
+            return r,e,(e is not None or not _borg_ok(r))
+        def cause(r,e):   # revue 1 : borg arrêté par nous (lecture en échec) -> la cause de la lecture, pas « borg … code -15 »
+            if isinstance(e,_RestoreStop): return str(e)
+            if e is not None and (r.get('killed') or _borg_ok(r)): return _etxt(e)
+            return _rb_errmsg(r,'borg export-tar')
+        bad=None
+        try:
+            rb,exc,failed=run(ftor)
+            if failed: bad=(rb,exc)
+            elif w.broken:
+                w.only={k for k,_ in w.broken}
+                for batch in _argv_batches([f"pp:{'/'.join(k)}" for k in sorted(w.only)]):
+                    r2,e2,f2=run(batch)
+                    if f2: bad=(r2,e2); break
+                    if r2['exitcode']==1: _print_boex_stderr(r2)
+            for k,m in w.broken:   # revue 1 (row 4) : dit APRÈS la seconde lecture, pour les noms écrits seulement
+                if k in w.done_only: printer(f"[WARN] lien physique rompu : {_shown_path('/'.join(k))} écrit comme fichier indépendant (premier nom {_shown_path(m)} non restauré)")
+                elif k not in w.seen_only: w.skips.add(_RZ_HARD,'/'.join(k))   # revue 2 (row 35) : vu et sauté : déjà compté
+            if bad is not None and not w.n_ok:
+                w.rm_made_dirs(); w.close(); _rmdirs_if_empty(made)
+                if not w.skips:
+                    if isinstance(bad[1],_RestoreStop): printer(f"[ERREUR] flux interrompu : {bad[1]} — rien restauré")   # borg arrêté par nous : pas son échec
+                    else: printer(self._borg_fail_msg(nick,'borg export-tar',cause(*bad)))
+                    sys.exit(2)
+            if not w.n_ok and bad is None:   # revue 2 (row 33) : rien restauré sans échec (tout sauté) : parents créés retirés aussi
+                w.rm_made_dirs(); w.close(); _rmdirs_if_empty(made)
+            w.finish()
+        finally: w.close()
+        if bad is not None:
+            n=w.n_ok; s='s' if n>1 else ''
+            where_=f" après « {_shown_path(w.last)} »" if w.last else ''   # revue 1 (row 14) : jamais « après « None » »
+            printer(f"[ERREUR] flux interrompu{where_} : {n} élément{s} restauré{s} (fichiers finis gardés) — {cause(*bad)}")
+            w.skips.report(); sys.exit(2)
+        _print_boex_stderr(rb)
+        if w.converted: print(f"{w.converted} lien{'s' if w.converted>1 else ''} de l'archive remplacé{'s' if w.converted>1 else ''} par un dossier (--liens-en-dossiers)",flush=True)
+        if w.n_ok: print(f"Restauré {'(plat) ' if flat else ''}dans {where} : {w.n_ok} élément{'s' if w.n_ok>1 else ''}",flush=True)
+        elif not w.skips: print(f"Rien restauré : aucun élément de la sélection ({where} non créé s'il n'existait pas)",flush=True)   # row 45
+        w.skips.report()
+        sys.exit(max(rb['exitcode'],1 if (w.skips or w.broken) else 0))
+
+    def _restore_safe_tar(self,nick,bid,ftor,tarpath,flat=False,debug=0,zones=None):
+        """Mode sûr, sortie tar/tgz ou stdout (décision 9) : flux de borg export-tar réécrit entrée par entrée (tarfile en écriture,
+        chemins normalisés ; à plat : nom seul, dossiers omis) — aucun dossier temporaire, aucune extraction. Zones sans objet (rien
+        écrit sur le serveur hors du fichier de sortie) ; fichier de sortie dans une zone : refusé, code 3. Fichier neuf écrit sous
+        un nom temporaire voisin puis renommé (.tar existant : copie complétée puis renommée ; illisible : refus, code 3, avant borg).
+        Fin du tar écrite SEULEMENT si le flux et borg ont réussi (revue 1, row 3) : sinon stdout laissé tronqué (le lecteur voit la
+        coupure), temporaire retiré, code 2. Écriture impossible (disque plein…) : code 3, comme 1.0.212. Toute sortie (Ctrl-C ;
+        SIGTERM converti par la CLI, _restore_sigterm) retire le temporaire et, sur stdout, coupe le tar (rows 8, 38, 39)."""
+        import tarfile as tf_mod
+        stdout_mode=(tarpath=='-'); skips=_SkipLog(); cnt=[0]; tmp=None
+        st={'fobj':None,'made':False,'dst':None,'ident':None,'span':None,'cut':False}
+        def drop():
+            _sigterm_disarm()
+            if stdout_mode:   # revue 3 (row 39) : Ctrl-C/SIGTERM aussi — coupe du tar de stdout (row 38), une fois ; revue 4
+                # (row 54) : jamais avant l'arrêt de borg (pas d'on_abort sur stdout), non bloquante
+                if st['dst'] is not None and not st['cut']: st['cut']=True; _tar_stdout_cut(st['dst'],st['span'])
+                return
+            if st['dst'] is not None:   # fichier : tar fermé avant son temporaire (gzip jamais finalisé à la
+                try: st['dst'].close()                      # fin du processus sur un fichier fermé — « Exception ignored »,
+                except Exception: pass                      # Python 3.14) ; temporaire retiré ensuite
+                st['dst']=None
+            f=st['fobj']
+            if not stdout_mode and f is not None and not f.closed:
+                try: f.close()
+                except OSError: pass
+            if st['made']:   # revue 3 (row 50) : retiré seulement si c'est bien le fichier créé ici (identité notée)
+                st['made']=False
+                try:
+                    s_=os.stat(tmp,follow_symlinks=False)
+                    if st['ident'] is not None and (s_.st_dev,s_.st_ino)==st['ident']: os.unlink(tmp)
+                except OSError: pass
+        if stdout_mode: mode='w|'; st['fobj']=sys.stdout.buffer
+        else:
+            # revue 3 (row 43) : zones RECALCULÉES juste avant l'écriture (le contrôle en tête de Restore précède borg list et
+            # l'attente de l'Index), sans répéter les [WARN]
+            self._restore_tar_zone(nick,tarpath,self._restore_zones(nick,quiet=zones is not None))   # revue 4 : [WARN] en appel direct
+            is_gz=tarpath.endswith('.tgz') or tarpath.endswith('.tar.gz')
+            exists=os.path.lexists(tarpath); keep_mode=None
+            if exists:   # revue 3 (row 42) : vide = fichier RÉGULIER de taille 0 (droits repris) ; tout autre objet (fifo…) : refus
+                try: s0=os.stat(tarpath)
+                except OSError: s0=None; exists=False   # revue 4 (row 55) : lien cassé (stat en échec) : remplacé, comme avant
+                if s0 is not None and not stat.S_ISREG(s0.st_mode):
+                    printer(f"[ERREUR] {tarpath} : pas un fichier ordinaire — rien écrit"); sys.exit(3)
+                if s0 is not None and s0.st_size==0: exists=False; keep_mode=stat.S_IMODE(s0.st_mode)
+            if is_gz and exists:
+                print(f"[ERREUR] {tarpath} existe déjà — impossible d'ajouter à un fichier gzip.",file=sys.stderr)
+                print(f"  Supprimez-le manuellement ou choisissez un autre nom.",file=sys.stderr)
+                sys.exit(3)
+            mode='w:gz' if is_gz else ('a' if exists else 'w')
+            ap=os.path.abspath(tarpath)
+            tmp=os.path.join(os.path.dirname(ap),f".{os.fsdecode(os.fsencode(os.path.basename(ap))[:100])}.bhr{secrets.token_hex(4)}")
+        try:
+            if not stdout_mode:
+                try:
+                    st['made']=True   # revue 3 (row 50) : posé AVANT la création ; nom déjà pris : jamais le nôtre
+                    try: fd=os.open(tmp,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|getattr(os,'O_CLOEXEC',0),0o666)
+                    except FileExistsError: st['made']=False; raise
+                    s_=os.fstat(fd); st['ident']=(s_.st_dev,s_.st_ino)
+                    if keep_mode is not None: os.fchmod(fd,keep_mode)
+                    st['fobj']=os.fdopen(fd,'r+b')
+                    if mode=='a':   # .tar existant : copie, complétée, puis renommée — l'original intact si la suite échoue
+                        sfd=os.open(tarpath,os.O_RDONLY|getattr(os,'O_CLOEXEC',0))
+                        try:
+                            os.fchmod(fd,os.fstat(sfd).st_mode&0o7777)
+                            while True:
+                                b=os.read(sfd,1<<20)
+                                if not b: break
+                                st['fobj'].write(b)
+                        finally: os.close(sfd)
+                        st['fobj'].flush(); st['fobj'].seek(0)
+                except OSError as e:
+                    drop()
+                    if e.errno==_errno.ENOSPC: print(f"[ERREUR] Espace disque insuffisant : {e.filename or tarpath}",file=sys.stderr)
+                    else: print(f"[ERREUR] Écriture impossible : {e}",file=sys.stderr)
+                    sys.exit(3)
+            try: dst=st['dst']=tf_mod.open(fileobj=st['fobj'],mode=mode)   # revue 1 (row 13) : AVANT borg — un .tar existant illisible est dit
+            except (tf_mod.TarError,EOFError,OSError) as e:
+                drop()
+                if mode=='a': printer(f"[ERREUR] {tarpath} : tar existant illisible ({_etxt(e)}) — rien écrit")
+                else: print(f"[ERREUR] Écriture impossible : {e}",file=sys.stderr)
+                sys.exit(3)
+            wexc=[]
+            def consume(fh):
+                try:
+                    src=tf_mod.open(fileobj=fh,mode='r|')
+                    for ti in src:
+                        nm=ti.name; t=_restore_tar_entry(ti,flat)
+                        if t is None:
+                            if not (flat and ti.isdir()) and _restore_norm(nm)!=[]: skips.add(_RZ_ODD,nm)
+                            src.members=[]; continue
+                        if stdout_mode:   # revue 4 (row 53) : début et fin attendue du membre (coupe : rien ajouté entre les deux)
+                            p0=dst.fileobj.pos
+                            st['span']=(p0,p0+len(t.tobuf(dst.format,dst.encoding,dst.errors))+(-(-t.size//512)*512 if t.isreg() else 0))
+                        try: dst.addfile(t,src.extractfile(ti) if t.isreg() else None)
+                        except (tf_mod.TarError,EOFError) as e: return e   # flux de borg coupé au milieu d'un fichier
+                        except OSError as e:
+                            wexc.append('pipe' if isinstance(e,BrokenPipeError) or e.errno==_errno.EPIPE else e); return e
+                        st['span']=None; src.members=[]; dst.members=[]; cnt[0]+=1
+                except (tf_mod.TarError,EOFError) as e: return e
+                except OSError as e:
+                    wexc.append('pipe' if isinstance(e,BrokenPipeError) or e.errno==_errno.EPIPE else e); return e
+                return None
+            rb=self._restore_stream(nick,self._export_tar_args(bid,ftor),consume,debug=debug,on_abort=None if stdout_mode else drop)
+            exc=rb.get('stream_exc')
+            if wexc and wexc[0]=='pipe': st['cut']=True; _stdout_discard(); sys.exit(0)   # lecteur de stdout parti (| head) : comme 1.0.212
+            if wexc:
+                drop(); e=wexc[0]
+                if getattr(e,'errno',None)==_errno.ENOSPC: print(f"[ERREUR] Espace disque insuffisant : {e.filename or tarpath}",file=sys.stderr)
+                else: print(f"[ERREUR] Écriture impossible : {e}",file=sys.stderr)
+                sys.exit(3)
+            if exc is not None or not _borg_ok(rb):
+                drop()   # jamais la fin du tar (row 3) : stdout coupé (row 38), fichier temporaire retiré
+                c=_etxt(exc) if exc is not None and (rb.get('killed') or _borg_ok(rb)) else _rb_errmsg(rb,'borg export-tar')
+                printer(self._borg_fail_msg(nick,'borg export-tar',c))
+                if stdout_mode: printer("[ERREUR] flux interrompu : tar de stdout tronqué (sans fin d'archive)")
+                sys.exit(2)
+            try:
+                dst.close(); st['dst']=None   # fin du tar : flux et borg réussis seulement
+                if not stdout_mode: st['fobj'].close(); os.replace(tmp,tarpath); st['made']=False
+                else: sys.stdout.buffer.flush()
+            except BrokenPipeError: st['cut']=True; _stdout_discard(); sys.exit(0)
+            except OSError as e:
+                drop(); print(f"[ERREUR] Écriture impossible : {e}",file=sys.stderr); sys.exit(3)
+        except BaseException:
+            drop(); raise
+        _print_boex_stderr(rb)
+        if not stdout_mode: print(f"Restauré {'(plat) ' if flat else ''}dans {tarpath} : {cnt[0]} élément{'s' if cnt[0]>1 else ''}",flush=True)
+        skips.report()
+        sys.exit(max(rb['exitcode'],1 if skips else 0))
 
     def _extract_fail(self,nick,rb):
         """1.0.175 (story 38, A70) : borg extract en échec (code >= 2) -> une ligne « nick: borg extract a échoué : … » (cause
         d'abord, ni trace ni bandeau), code de borg — Restore -w, -W, tar. Avant : stderr brut de borg (20 lignes sur un plantage)."""
         printer(self._borg_fail_msg(nick,'borg extract',_rb_errmsg(rb,'borg extract'))); sys.exit(rb['exitcode'])
 
-    def _restore_to_tar(self,nick,bid,ftor,tarpath,flat=False,debug=0):
+    def _restore_fidele(self,nick,bid,ftor,where,flat=False,debug=0,sparse=False,by_name=False):
+        """1.0.214 (story 114, décision 16) : mode FIDÈLE (--fidele, CLI seulement) = Restore de 1.0.212 tel quel — borg extract
+        brut (dans la destination pour -w, dans un dossier temporaire pour -W et le tar), AUCUNE protection ; `sparse` (--creux) :
+        --sparse ; `by_name` (--par-nom) : --numeric-ids retiré (borg cherche les noms de l'archive)."""
+        stdout_mode=(where=='-')
+        xa=_borg_extract_args(bid,ftor,sparse=sparse,numeric=not by_name)
+        if stdout_mode or _is_tar_dest(where):
+            self._restore_to_tar(nick,bid,ftor,where,flat=flat,debug=debug,xargs=xa)
+        elif flat:
+            import tempfile,shutil
+            with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
+                rb=self.borg.boex(nick,xa,rep=tmpdir,debug=debug)
+                if rb['exitcode'] not in (0,1): self._extract_fail(nick,rb)
+                _print_boex_stderr(rb)
+                try: os.makedirs(where,exist_ok=True)   # 1.0.173 : course après la vérification -> message, jamais de trace
+                except OSError as e: printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
+                try:
+                    for root,_,files in os.walk(tmpdir):
+                        for f in files: shutil.copy2(os.path.join(root,f),os.path.join(where,f))
+                except OSError as e:
+                    if e.errno==_errno.ENOSPC: printer(f"[ERREUR] Espace disque insuffisant : {e.filename or where}")
+                    else: printer(f"[ERREUR] Copie impossible : {e}")
+                    sys.exit(3)
+                print(f"Restauré (plat) dans {where}",flush=True)
+            sys.exit(rb['exitcode'])
+        else:
+            # 1.0.173 (story 36, A63, décision de l'utilisateur) : dossier absent créé (comme -W), juste avant borg (son
+            # répertoire de travail) ; borg en échec -> dossiers créés ici retirés s'ils sont restés vides (-W ne crée qu'après
+            # un extract réussi : jamais de dossier vide laissé par un échec, /restore de borgHelperWWW compris)
+            try: made=_makedirs_tracked(where)
+            except OSError as e:
+                printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
+            rb=self.borg.boex(nick,xa,rep=where,debug=debug)
+            if rb['exitcode'] not in (0,1): _rmdirs_if_empty(made); self._extract_fail(nick,rb)
+            _print_boex_stderr(rb)
+            sys.exit(rb['exitcode'])
+
+    def _restore_to_tar(self,nick,bid,ftor,tarpath,flat=False,debug=0,xargs=None):
+        """Mode fidèle (1.0.212) : borg extract dans un dossier temporaire puis tar/tgz/stdout (limite connue : archive à racines
+        imbriquées — borg suit les liens de l'archive qu'il vient de créer, écritures hors du dossier temporaire ; mode sûr : non)."""
         import tempfile,tarfile as tf_mod
         stdout_mode=(tarpath=='-')
         with tempfile.TemporaryDirectory(prefix='borghelper_restore_') as tmpdir:
-            rb=self.borg.boex(nick,_borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
+            rb=self.borg.boex(nick,xargs or _borg_extract_args(bid,ftor),rep=tmpdir,debug=debug)
             if rb['exitcode'] not in (0,1): self._extract_fail(nick,rb)
             _print_boex_stderr(rb)
             if stdout_mode:
@@ -13799,9 +14856,20 @@ _FOG_WL={'borgHelper':{
     '_proc_argv|open':(1,'/proc'), '_proc_environ|open':(1,'/proc'), '_proc_uid|open':(1,'/proc'), '_group_pids|open':(1,'/proc'),
     '_proc_tmpdirs|open':(1,'/proc'), '_mei_mapped|open':(1,'/proc'),
     'BorgRunner.repoLocalAbsent|os.open':(1,'dossier d\'un dépôt borg (montage autofs)'),
-    'BorgHelper.restore|shutil.copy2':(1,'fichiers restaurés vers la destination de Restore (destination dans CACHE_DIR non refusée : '
-                                         'revue 94 row 11, reportée)'),
-    'BorgHelper._restore_to_tar|.open':(2,'archive tar de destination'),
+    'BorgHelper._restore_fidele|shutil.copy2':(1,'Restore --fidele -W : fichiers restaurés vers la destination (1.0.214 : mode fidèle '
+                                         'sans protection, décision 16 de la story 114 ; avant : BorgHelper.restore)'),
+    'BorgHelper._restore_to_tar|.open':(2,'archive tar de destination (mode fidèle)'),
+    # 1.0.214 (story 114) : mode sûr de Restore — destination de l'utilisateur, jamais une base (zones protégées sautées)
+    'BorgHelper._restore_safe_dir.consume|.open':(1,'flux tar de borg export-tar (tube, fileobj)'),
+    'BorgHelper._restore_safe_tar|os.open':(2,'tar de sortie : temporaire voisin (O_EXCL) et .tar existant copié (lecture)'),
+    'BorgHelper._restore_safe_tar|.open':(1,'tar de sortie (fileobj du temporaire ou stdout), ouvert avant borg (revue 1 row 13)'),
+    'BorgHelper._restore_safe_tar.consume|.open':(1,'flux tar de borg export-tar (tube, fileobj)'),
+    '_SafeWriter.__init__|os.open':(1,'destination de Restore (dossier, O_PATH)'),
+    '_stdout_discard|os.open':(1,'/dev/null mis à la place de stdout abandonné (Restore -w -, lecteur figé ou parti ; revue 4 de la story 114)'),
+    '_SafeWriter._entry|os.open':(1,'fichier restauré : temporaire voisin O_CREAT|O_EXCL|O_NOFOLLOW (zone contrôlée avant)'),
+    '_SafeWriter._parent|os.open':(3,'dossiers parents sous la destination (O_PATH|O_NOFOLLOW)'),
+    '_SafeWriter._walk|os.open':(1,'dossier sous la destination (O_PATH|O_NOFOLLOW)'),
+    '_SafeWriter.finish|os.open':(2,'destination et dossiers restaurés (droits et dates en fin de flux, O_NOFOLLOW)'),
     'BorgHelper._storage_collect|open':(1,'rc')},
   'borgHelperWWW':{
     '_rc_parse_master|open':(1,'rc'), '_rc_cache_dir|open':(1,'rc'), '_rc_www_section_warn|open':(1,'rc'),
@@ -14194,7 +15262,7 @@ def codec_selftest(pattern=None,list_only=False):
             for k,h in _HELP.items():
                 want=set(_CLI_EARLY[k]) if k in _CLI_EARLY else set(_CLI_OPTAB[k])-set('CcdP')
                 wantl={o for o,c in _CLI_LONG_OWNER.items() if c==k}
-                got=[re.match(r'(--[a-z]+|-[A-Za-z])( |$)',f) for f,_d in h['opts']]
+                got=[re.match(r'(--[a-z][a-z-]*|-[A-Za-z])( |$)',f) for f,_d in h['opts']]   # 1.0.214 : --liens-en-dossiers, --par-nom
                 if not all(got): bad.append((k,'forme')); continue
                 got=[m.group(1) for m in got]
                 if ({g[1] for g in got if not g.startswith('--')},{g for g in got if g.startswith('--')})!=(want,wantl) \
@@ -23319,6 +24387,7 @@ def codec_selftest(pattern=None,list_only=False):
             """za : dépôt LOCAL introuvable ; zr : dépôt distant dont borg échoue (« Connection closed by remote host », code 2) ;
             zk : comme za sans KEEP_* ; borg factice qui note chaque appel (jamais de vrai borg)."""
             d=os.path.join(tmp,sub); os.makedirs(os.path.join(d,'mnt-a')); os.makedirs(os.path.join(d,'mnt-r')); os.makedirs(os.path.join(d,'dest'))
+            os.makedirs(os.path.join(d,'repo-zw'))
             fb=os.path.join(d,'borg'); calls=os.path.join(d,'calls')
             # borg factice programmable : fichier `mode` (défaut fail) — fail (texte, code du fichier `rcode`, défaut 2), json (ligne
             # ERROR sur deux lignes), list1 (1er `list` OK : archives a, b ; puis fail), keyok, keywarn, mountwarn, prunefail
@@ -23359,9 +24428,62 @@ if mode=='kill': sys.exit(0)
 if mode=='extract' and sub=='list':
     print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
 if mode=='extract' and sub=='extract': open('restored','w').write('x'); sys.exit(0)
+# 1.0.214 (story 114) : mode sûr de Restore — borg export-tar : tar sur stdout (un fichier `restored`) ; revue 1 : tar2 (fichiers a
+# et b), tarodd (chemins non normalisés ../x, /abs, a//b puis ok), tarcut (a complet, puis b coupé au milieu de son contenu, code 2)
+# revue 3 : tarcutb (a complet puis borg en échec, aucune fin), tarcutp (a puis membre p de 300 o coupé), tarempty (aucun membre),
+# tarhard3 (seconde lecture : ok2/h2 RÉÉMIS en lien vers cache/h1), listslow (borg list --json qui attend : SIGTERM), PID noté ;
+# vgap3 : tarnl (noms piégés x<LF>y puis b<ESC>), tarhard4 (tarhard2 aux noms piégés : cache/h<LF>1, ok2/h<ESC>2) ; revue 4 : tarbig
+# (32 membres de 32 Kio puis 60 s d'attente, PID noté : lecteur de stdout figé ou parti)
+if mode in ('tarslow','listslow','tarbig'): open(d+'/borg-pid','w').write(str(os.getpid()))
+if mode=='listslow' and sub=='list':
+    import time; time.sleep(60); sys.exit(0)
+if mode in ('tar2','tarodd','tarcut','tarhard','tarhard2','tarsub','tarslow','tarcutb','tarcutp','tarempty','tarhard3','tarnl','tarhard4','tarbig') and sub=='list':
+    print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
+# revue 2 : tarhard (cache/h1 puis ok2/h2 lien physique ; seconde lecture pp: en échec), tarhard2 (seconde lecture : ok2/h2 complet,
+# contenu H2), tarsub (n/f), tarslow (a écrit puis 60 s d'attente : SIGTERM), tarodd + lien physique h -> ../x
+H4='ok2/h'+chr(27)+'2'; F4='cache/h'+chr(10)+'1'
+if mode=='tarbig' and sub=='export-tar':
+    import tarfile,io,time
+    for i in range(32):
+        buf=io.BytesIO(); t=tarfile.open(fileobj=buf,mode='w',format=tarfile.GNU_FORMAT)   # w (jamais w| : vidé par blocs de 10 Kio)
+        ti=tarfile.TarInfo('g%02d'%i); ti.size=32768; ti.mtime=1500000000; t.addfile(ti,io.BytesIO(b'g'*32768))
+        sys.stdout.buffer.write(buf.getvalue()[:512+32768]); sys.stdout.buffer.flush()
+    time.sleep(60); sys.exit(0)
+if mode in ('tarhard','tarhard2','tarhard3','tarhard4') and sub=='export-tar' and any(x.startswith('pp:') for x in a):
+    if mode=='tarhard': sys.stderr.write('Connection closed by remote host'+chr(10)); sys.exit(2)
+    import tarfile,io
+    buf=io.BytesIO(); t=tarfile.open(fileobj=buf,mode='w',format=tarfile.GNU_FORMAT)
+    ti=tarfile.TarInfo(H4 if mode=='tarhard4' else 'ok2/h2')
+    if mode=='tarhard3': ti.type=tarfile.LNKTYPE; ti.linkname='cache/h1'; t.addfile(ti)
+    else: ti.size=2; t.addfile(ti,io.BytesIO(b'H2'))
+    t.close(); sys.stdout.buffer.write(buf.getvalue()); sys.exit(0)
+if mode in ('extract','tar2','tarodd','tarcut','tarhard','tarhard2','tarsub','tarslow','tarcutb','tarcutp','tarempty','tarhard3','tarnl','tarhard4') and sub=='export-tar':
+    import tarfile,io,time
+    names=dict(extract=['restored'],tar2=['a','b'],tarodd=['../x','/abs','a//b','ok'],tarcut=['a'],tarhard=['cache/h1'],tarhard2=['cache/h1'],
+               tarsub=['n/f'],tarslow=['a','b'],tarcutb=['a'],tarcutp=['a'],tarempty=[],tarhard3=['cache/h1'],
+               tarnl=['x'+chr(10)+'y','b'+chr(27)],tarhard4=[F4])[mode]
+    buf=io.BytesIO(); t=tarfile.open(fileobj=buf,mode='w',format=tarfile.GNU_FORMAT)
+    for nm in names:   # tarslow : b de 8704 o -> 10240 o en tout, la lecture (par 10 Kio) de borgHelper s'arrête entre deux membres
+        sz=8704 if (mode=='tarslow' and nm=='b') else 1
+        ti=tarfile.TarInfo(nm); ti.size=sz; ti.mtime=1500000000; t.addfile(ti,io.BytesIO(nm[-1:].encode()*sz))
+    if mode in ('tarcutb','tarcutp'):   # sans fin d'archive ; tarcutp : en-tête de p (300 o annoncés), 100 écrits
+        extra=b''
+        if mode=='tarcutp': ti=tarfile.TarInfo('p'); ti.size=300; extra=ti.tobuf(tarfile.GNU_FORMAT)+b'p'*100
+        sys.stdout.buffer.write(buf.getvalue()+extra); sys.stdout.buffer.flush()
+        sys.stderr.write('Connection closed by remote host'+chr(10)); sys.exit(2)
+    if mode in ('tarhard','tarhard2','tarhard3','tarodd','tarhard4'):
+        ti=tarfile.TarInfo(dict(tarodd='h',tarhard4=H4).get(mode,'ok2/h2')); ti.type=tarfile.LNKTYPE
+        ti.linkname=dict(tarodd='../x',tarhard4=F4).get(mode,'cache/h1'); t.addfile(ti)
+    if mode=='tarslow':
+        sys.stdout.buffer.write(buf.getvalue()); sys.stdout.buffer.flush(); open(d+'/slow-started','w').close(); time.sleep(60); sys.exit(0)
+    if mode=='tarcut':   # sans fin d'archive : en-tête de b (5000 octets annoncés), 100 écrits, puis borg en échec
+        ti=tarfile.TarInfo('b'); ti.size=5000
+        sys.stdout.buffer.write(buf.getvalue()+ti.tobuf(tarfile.GNU_FORMAT)+b'x'*100); sys.stdout.buffer.flush()
+        sys.stderr.write('Connection closed by remote host'+chr(10)); sys.exit(2)
+    t.close(); sys.stdout.buffer.write(buf.getvalue()); sys.exit(0)
 if mode=='extractfail' and sub=='list':
     print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
-if mode=='extractfail' and sub=='extract': sys.stderr.write('Archive b does not exist'+chr(10)); sys.exit(2)
+if mode=='extractfail' and sub in ('extract','export-tar'): sys.stderr.write('Archive b does not exist'+chr(10)); sys.exit(2)
 # 1.0.176 (story 39, A77) : warn1 — chaque lecture réussit avec un avertissement (code 1) ; createkill/createmute2 — borg create tué
 # (SIGKILL) ou en code 2 sans un mot (mesuré : Bkp « success » avant 1.0.176)
 if mode=='warn1':
@@ -23421,7 +24543,7 @@ fail()
                 f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_PASSPHRASE=pw\nDB_KDF=light\nSER_NAME=h\nSER_LOGIN=x\n"
                         f"GLOB_ARCH=*\nBORG_EXE={fb}\nKEEP_DAILY=3\n\n"
                         f"[za]\nBORG_REPO={d}/nulle-part\nMOUNTPOINT={d}/mnt-a\n\n[zr]\nBORG_REPO=ssh://h.invalid/./r\nMOUNTPOINT={d}/mnt-r\n\n"
-                        f"[zk]\nBORG_REPO={d}/nulle-part-k\n\n[zp]\nBORG_REPO={d}/repo-{{hostname}}\n\n[zw]\nBORG_REPO={d}\n")
+                        f"[zk]\nBORG_REPO={d}/nulle-part-k\n\n[zp]\nBORG_REPO={d}/repo-{{hostname}}\n\n[zw]\nBORG_REPO={d}/repo-zw\n")   # zw : 1.0.214, dépôt sous d (avant : d lui-même, zone de Restore qui couvrait les destinations)
             os.chmod(rc,0o600)
             nodsn=os.path.join(tmp,'sentry-vide'); open(nodsn,'w').close()
             env=dict(os.environ,BORGHELPERC_SENTRY_FILE=nodsn); env.pop('BORGHELPERC_SENTRY_DSN',None)
@@ -23476,9 +24598,13 @@ fail()
             def clean(o): return not any(x in o for x in ('Traceback','Platform:','sys.argv','secret-argv','Exception ignored',"{'stdout'","'exitcode'"))
             mode('crash')
             dest=os.path.join(d,'dest')
-            for lbl,a,what in (('Restore -w',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'w')],'borg extract'),
-                               ('Restore -W',['-c','Restore','-f','x','-b','b','-W',os.path.join(dest,'W')],'borg extract'),
-                               ('Restore tar',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'t.tgz')],'borg extract'),
+            # 1.0.214 (story 114) : mode sûr (défaut) -> borg export-tar ; --fidele -> borg extract (1.0.212)
+            for lbl,a,what in (('Restore -w',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'w')],'borg export-tar'),
+                               ('Restore -W',['-c','Restore','-f','x','-b','b','-W',os.path.join(dest,'W')],'borg export-tar'),
+                               ('Restore tar',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'t.tgz')],'borg export-tar'),
+                               ('Restore -w --fidele',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'w'),'--fidele'],'borg extract'),
+                               ('Restore -W --fidele',['-c','Restore','-f','x','-b','b','-W',os.path.join(dest,'W'),'--fidele'],'borg extract'),
+                               ('Restore tar --fidele',['-c','Restore','-f','x','-b','b','-w',os.path.join(dest,'t.tgz'),'--fidele'],'borg extract'),
                                ('ListPerms',['-c','Restore','-f','x','-b','b','-L'],'borg list'),('Key',['-c','Key'],'borg key export'),
                                ('Index',['-c','Index'],'borg list')):
                 code,out,err=cli(*a,'-n','zr'); o=out+err
@@ -23489,7 +24615,9 @@ fail()
             il=os.path.join(d,'cache','rc-zr-index-last.json')
             try: rec=json.load(open(il)); bad.update({} if (rec['code'],rec['outcome'])==(2,'error') and cause in rec['message'] else {'index_last':rec})
             except (OSError,ValueError,KeyError) as e: bad['index_last']=repr(e)
-            if os.path.exists(os.path.join(dest,'w')): bad['dossier -w laissé']=True
+            for x in ('w','W','t.tgz'):
+                if os.path.exists(os.path.join(dest,x)): bad[f'{x} laissé']=True
+            if [x for x in os.listdir(dest) if '.bhr' in x]: bad['temporaire laissé']=os.listdir(dest)   # revue 1 (M30)
             if os.path.exists(calls): os.unlink(calls)
             code,out,err=cli('-c','Index','-n','za')
             za_files=[f for f in (os.listdir(os.path.join(d,'cache')) if os.path.isdir(os.path.join(d,'cache')) else ()) if '-za-' in f and f.endswith('.db')]
@@ -26676,8 +27804,11 @@ sys.exit(0)
                     refused('non traversable',nt,'accès refusé')
                 finally: os.chmod(ro,0o700); os.chmod(nt,0o700)
             tarp=os.path.join(d,'ajout.tar'); import tarfile as _tf
-            with _tf.open(tarp,'w'): pass   # cible tar EXISTANTE (mode ajout) : un fichier, jamais « pas un dossier »
-            code,o=run('-w',tarp,'-b','b'); res['tar existant']=(code==0 and 'pas un dossier' not in o,code,o[-150:])
+            with _tf.open(tarp,'w') as t0:   # cible tar EXISTANTE (mode ajout) : un fichier, jamais « pas un dossier »
+                ti0=_tf.TarInfo('premier'); ti0.size=1; t0.addfile(ti0,io.BytesIO(b'p'))
+            code,o=run('-w',tarp,'-b','b')
+            with _tf.open(tarp) as t0: nm0=t0.getnames()   # 1.0.214 (revue 1, M31) : ajout, membre d'avant gardé
+            res['tar existant']=(code==0 and 'pas un dossier' not in o and nm0==['premier','restored'] and not [x for x in os.listdir(d) if '.bhr' in x],code,nm0,o[-150:])
             flat=os.path.join(d,'plat','x'); code,o=run('-W',flat,'-b','b')
             res['-W absent']=(code==0 and os.path.isfile(os.path.join(flat,'restored')),code,o[-150:])
             mode('extractfail'); dest=os.path.join(d,'echec','a','b'); code,o=run('-w',dest,'-b','b')
@@ -26687,6 +27818,869 @@ sys.exit(0)
             if not ok: print(f"  {[(k,v) for k,v in res.items() if not v[0]]}")
             return ok
         check("destination de Restore : -w absent créé (± -b), refus avant borg (fichier, lien, sans droits, -W aussi), échec -> rien laissé",_restore_dest)
+        # ── 1.0.214 (story 114) : Restore, mode sûr (borg export-tar lu en flux, borgHelper écrit) — écrivain sur flux tar fabriqué ──
+        import tarfile as _s114_tf
+        def _s114_tar(entries):
+            """Flux tar en mémoire : (nom, type, extra) — type f (contenu), d, l (cible), h (premier nom), p (fifo), c (périphérique)."""
+            buf=io.BytesIO()
+            with _s114_tf.open(fileobj=buf,mode='w',format=_s114_tf.GNU_FORMAT) as t:
+                for e in entries:
+                    nm,ty=e[0],e[1]; x=e[2] if len(e)>2 else b''
+                    ti=_s114_tf.TarInfo(nm); ti.mtime=1500000000; ti.mode=0o644; ti.uid=os.getuid(); ti.gid=os.getgid()
+                    if ty=='d': ti.type=_s114_tf.DIRTYPE; ti.mode=0o750; t.addfile(ti)
+                    elif ty=='l': ti.type=_s114_tf.SYMTYPE; ti.linkname=x; t.addfile(ti)
+                    elif ty=='h': ti.type=_s114_tf.LNKTYPE; ti.linkname=x; t.addfile(ti)
+                    elif ty=='p': ti.type=_s114_tf.FIFOTYPE; t.addfile(ti)
+                    elif ty=='c': ti.type=_s114_tf.CHRTYPE; ti.devmajor=1; ti.devminor=3; t.addfile(ti)
+                    else:
+                        if len(e)>3: ti.mode=e[3]
+                        ti.size=len(x); t.addfile(ti,io.BytesIO(x))
+            return buf.getvalue()
+        def _s114_feed(root,zones,entries,**kw):
+            """_SafeWriter sur un flux fabriqué -> (writer, exception d'arrêt ou None) ; dossiers finis (finish) sauf arrêt."""
+            if not kw.get('root_label'): os.makedirs(root,exist_ok=True)   # comme Restore (_makedirs_tracked avant l'écrivain)
+            w=_SafeWriter(root,zones,**kw); exc=None
+            try:
+                tf=_s114_tf.open(fileobj=io.BytesIO(_s114_tar(entries)),mode='r|')
+                for ti in tf: w.entry(ti,tf); tf.members=[]
+            except _RestoreStop as e: exc=e
+            finally:
+                if exc is None: w.finish()
+                w.close()
+            return w,exc
+        def _s114_skips(w):
+            """{étiquette: {(chemin, groupé): n}} -> {étiquette: sorted([chemin ou chemin/…])}."""
+            return {lab:sorted(p+('/…' if g else '') for p,g in d) for lab,d in w.skips.g.items()}
+        def _s114_zone_env(sub):
+            d=os.path.join(tmp,sub); os.makedirs(os.path.join(d,'cache')); os.makedirs(os.path.join(d,'repo')); os.makedirs(os.path.join(d,'bcache'))
+            with open(os.path.join(d,'cache','x.db'),'w') as f: f.write('base vivante')
+            with open(os.path.join(d,'key'),'w') as f: f.write('clé')
+            rc=os.path.join(d,'rc')
+            fb=os.path.join(d,'borg-bruyant')   # revue 1 (F15) : BORG_EXE factice qui note tout appel, jamais le vrai borg du PATH
+            with open(fb,'w') as f: f.write(f"#!/bin/sh\necho \"$@\" >> {shlex.quote(os.path.join(d,'borg-appelé'))}\nexit 2\n")
+            os.chmod(fb,0o700)
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nBORG_EXE={fb}\n\n[n1]\nBORG_REPO={os.path.join(d,'repo')}\n\n"
+                        f"[n2]\nBORG_REPO=ssh://h.invalid/./r\nBORG_KEY_FILE={os.path.join(d,'key')}\n\n[n3]\nBORG_REPO=ssh://h.invalid/./s\n"
+                        f"BORG_CACHE_DIR={os.path.join(d,'bcache')}\n\n[n4]\nBORG_REPO=ssh://h.invalid/./t\nBORG_CONFIG_DIR={os.path.join(d,'bconf')}\n"
+                        f"BORG_SECURITY_DIR=rel/sec\nBORG_KEYS_DIR=~/cles\n")
+            os.chmod(rc,0o600)
+            return d,rc,BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+        def _s114_zones():
+            """Zones (bases, rc, dépôt local et clé de CHAQUE nick, BORG_CACHE_DIR du rc) sautées au moment d'écrire, par chemin et par
+            identité (lien physique du rc ; dossier traversé dont (st_dev, st_ino) est une zone) ; le reste écrit ; zones intactes
+            (contenu, aucun fichier neuf) ; destination dans une zone -> rien créé, tout sauté ; fichier tar dans une zone : refus
+            code 3 avant borg (CLI)."""
+            d,rc,b=_s114_zone_env('s114zones'); res={}
+            zones=b._restore_zones('n1')
+            os.link(rc,os.path.join(d,'alias-rc')); os.makedirs(os.path.join(d,'idz')); st=os.stat(os.path.join(d,'idz'))
+            zones=zones+[('zone témoin (identité)',frozenset({'/nulle-part/s114'}),frozenset({(st.st_dev,st.st_ino)}))]
+            before={p:open(os.path.join(d,p),'rb').read() for p in ('rc','cache/x.db','key')}
+            w,exc=_s114_feed(d,zones,[('cache','d'),('cache/x.db','f',b'ecrase'),('cache/neuf.txt','f',b'n'),('rc','f',b'[pirate]'),
+                                      ('repo/config','f',b'c'),('key','f',b'k'),('bcache/f','f',b'b'),('alias-rc','f',b'a'),
+                                      ('idz/f','f',b'i'),('ok','d'),('ok/f','f',b'ok')])
+            sk=_s114_skips(w)
+            res['étiquettes']=(sk=={_RZ_BASES:['cache/…'],_RZ_RC:['alias-rc','rc'],_RZ_REPO:['repo/…'],_RZ_KEY:['key'],
+                                    _RZ_BORG:['bcache/…'],'zone témoin (identité)':['idz/…']} and w.skips.count()==9,sk)
+            res['écrit']=(exc is None and open(os.path.join(d,'ok','f')).read()=='ok' and w.n_ok==2,exc,w.n_ok)
+            res['zones intactes']=(all(open(os.path.join(d,p),'rb').read()==v for p,v in before.items())
+                                   and sorted(os.listdir(os.path.join(d,'cache')))==['x.db'] and os.listdir(os.path.join(d,'repo'))==[]
+                                   and os.listdir(os.path.join(d,'bcache'))==[] and os.listdir(os.path.join(d,'idz'))==[],)
+            sub=os.path.join(d,'cache','sous'); lab=_restore_zone_of(sub,zones)
+            w2,_=_s114_feed(sub,zones,[('a','f',b'x'),('b','d')],root_label=lab)
+            res['destination dans une zone (écrivain)']=(lab=='bases de borgHelper' and not os.path.exists(sub) and _s114_skips(w2)=={_RZ_BASES:['/…']}
+                                                         and w2.skips.count()==2,lab,_s114_skips(w2))
+            env=dict(os.environ,BORGHELPERC_SENTRY_FILE=os.path.join(tmp,'rb-nodsn')); env.pop('BORGHELPERC_SENTRY_DSN',None)
+            open(os.path.join(tmp,'rb-nodsn'),'a').close()
+            called=os.path.join(d,'borg-appelé')
+            def cli(*a):
+                if os.path.exists(called): os.unlink(called)
+                return subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc,'-c','Restore','-n','n2','-b','a','-f','x',*a],
+                                      capture_output=True,text=True,env=env,timeout=120,stdin=subprocess.DEVNULL)
+            r=cli('-w',os.path.join(d,'cache','t.tgz'))
+            res['tar dans une zone']=(r.returncode==3 and 'dans une zone protégée (bases de borgHelper)' in r.stderr
+                                      and not os.path.exists(os.path.join(d,'cache','t.tgz')) and not os.path.exists(called),r.returncode,r.stderr[-200:])
+            # revue 1 (rows 1, 7) : destination dans une zone en CLI (chemin) -> aucun borg, rien créé, code 1 ; fichier tar lien physique du rc
+            r=cli('-w',sub)
+            res['destination dans une zone (CLI)']=(r.returncode==1 and '[WARN] rien restauré : destination dans une zone protégée (bases de borgHelper)' in r.stderr
+                                                   and not os.path.exists(sub) and not os.path.exists(called),r.returncode,r.stderr[-200:])
+            os.link(rc,os.path.join(d,'alias.tar')); r=cli('-w',os.path.join(d,'alias.tar'))
+            res['tar par identité (lien physique du rc)']=(r.returncode==3 and 'dans une zone protégée (fichier rc)' in r.stderr
+                                                          and open(rc,'rb').read()==before['rc'] and not os.path.exists(called),r.returncode,r.stderr[-200:])
+            # identité de la destination : sans montage bind (pas de root), zone témoin dont l'identité est celle de d/idz, sous un autre
+            # chemin ; la destination d/idz/sous (absente) a pour parent existant d/idz -> aucun borg (boex refusé), rien créé, code 1
+            idsub=os.path.join(d,'idz','sous'); res['identité _restore_zone_of']=(_restore_zone_of(idsub,zones)=='zone témoin (identité)',)
+            # revue 2 (rows 28, 37) : preuve par le BORG_EXE factice (aucun appel noté), sans -b compris (jamais de borg list), ni avis
+            # ni commande --fidele ; toute exception capturée dans `res` (sous-contrôle attribuable)
+            for bid_ in ('a',None):
+                if os.path.exists(called): os.unlink(called)
+                e=io.StringIO(); c='aucun'
+                try:
+                    with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,**k: zones),contextlib.redirect_stderr(e), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        try: b.restore('n2',bid_,'x',idsub)
+                        except SystemExit as x: c=x.code
+                except Exception as x: c=f"{type(x).__name__}: {x}"
+                res[f'destination par identité (Restore, -b {bid_})']=(c==1 and '[WARN] rien restauré : destination dans une zone protégée (zone témoin (identité))' in e.getvalue()
+                                                                     and not os.path.exists(idsub) and not os.path.exists(called) and '--fidele' not in e.getvalue(),c,e.getvalue()[-300:])
+            r=cli('-w',os.path.join(d,'bconf','sous'))   # revue 2 (row 37) : destination sous une zone ABSENTE (BORG_CONFIG_DIR de n4)
+            res['destination sous une zone absente (CLI)']=(r.returncode==1 and '[WARN] rien restauré : destination dans une zone protégée (dossiers de borg)' in r.stderr
+                                                           and not os.path.exists(os.path.join(d,'bconf')) and not os.path.exists(called),r.returncode,r.stderr[-200:])
+            # zone dont la racine est ABSENTE (BORG_CONFIG_DIR) et dossiers de borg de HOME ; BORG_*_DIR relatif ou à « ~ » : sous le
+            # dossier courant, comme borg (revue 1, row 16)
+            home=os.path.join(d,'home'); os.makedirs(os.path.join(home,'.config'))
+            with mock.patch.dict(os.environ,{'HOME':home}): z2=b._restore_zones('n4')
+            forms={f for _,zf,_ in z2 for f in zf}
+            # revue 2 (row 27) : borg de borgHelper ne reçoit pas ces clés -> les deux lectures protégées (dossier courant, expanduser)
+            res['BORG_*_DIR : deux formes']=(os.path.join(os.getcwd(),'rel','sec') in forms and os.path.join(os.getcwd(),'~','cles') in forms
+                                             and os.path.join(home,'cles') in forms and os.path.join(d,'bconf') in forms,)
+            w3,_=_s114_feed(d,z2,[('bconf','d'),('bconf/x','f',b'x'),('home/.config/borg/x','f',b'x'),('home/ok','f',b'ok')])
+            res['zone absente, HOME']=(_s114_skips(w3)=={_RZ_BORG:['bconf/…','home/.config/borg/…']} and not os.path.exists(os.path.join(d,'bconf'))
+                                       and not os.path.exists(os.path.join(home,'.config','borg')) and open(os.path.join(home,'ok')).read()=='ok',_s114_skips(w3))
+            # nick illisible : [WARN], les zones des autres nicks gardées (revue 1, row 16)
+            orig=b.borg.cfgread; e=io.StringIO()
+            def boom(n):
+                if n=='n3': raise RuntimeError('boom')
+                return orig(n)
+            with mock.patch.object(b.borg,'cfgread',boom),contextlib.redirect_stderr(e): z3=b._restore_zones('n1')
+            # revue 2 (row 26) : clé illisible ou à octet NUL -> cette clé seule ignorée et dite, les autres zones du nick gardées
+            class _C(dict):
+                def get(self,k,dflt=None):
+                    if k=='BORG_KEY_FILE': raise configparser.InterpolationSyntaxError(k,'n5',"'%' must be followed by '%' or '('")
+                    return dict.get(self,k,dflt)
+            e5=io.StringIO()
+            with mock.patch.object(b.borg,'cfgreadnicks',lambda: 'n5'),contextlib.redirect_stderr(e5), \
+                 mock.patch.object(b.borg,'cfgread',lambda n: _C(CACHE_DIR=os.path.join(d,'c5'),BORG_SECURITY_DIR='a\x00b',BORG_REPO=os.path.join(d,'r5'))):
+                z5=b._restore_zones('n5')
+            f5={f for _,zf,_ in z5 for f in zf}
+            res['clé illisible ou NUL']=(os.path.join(d,'c5') in f5 and os.path.join(d,'r5') in f5 and not any('\x00' in f for f in f5)
+                                         and '[WARN] zones du nick n5 : BORG_KEY_FILE illisible (' in e5.getvalue()
+                                         and '[WARN] zones du nick n5 : BORG_SECURITY_DIR contient un octet NUL — non protégé' in e5.getvalue(),sorted(f5),e5.getvalue()[-300:])
+            # revue 3 (rows 46, 47) : BORG_EXE illisible avec {borgversion} dans BORG_REPO -> les autres zones gardées ; clé illisible dite
+            # UNE fois ; relecture `quiet` : aucun [WARN]
+            class _C2(dict):
+                def get(self,k,dflt=None):
+                    if k in ('BORG_EXE','CACHE_DIR'): raise configparser.InterpolationSyntaxError(k,'n6',"'%' must be followed by '%' or '('")
+                    return dict.get(self,k,dflt)
+            e6=io.StringIO()
+            with mock.patch.object(b.borg,'cfgreadnicks',lambda: 'n6'),contextlib.redirect_stderr(e6), \
+                 mock.patch.object(b.borg,'cfgread',lambda n: _C2(BORG_REPO=os.path.join(d,'r6-{borgversion}'),BORG_KEY_FILE=os.path.join(d,'k6'))):
+                z6=b._restore_zones('n6'); n6=len(e6.getvalue()); z6q=b._restore_zones('n6',quiet=True)
+            f6={f for _,zf,_ in z6 for f in zf}
+            res['BORG_EXE illisible, [WARN] une fois']=(os.path.join(d,'k6') in f6 and e6.getvalue().count('[WARN] zones du nick n6 : CACHE_DIR illisible')==1
+                                                       and e6.getvalue().count('[WARN] zones du nick n6 : BORG_EXE illisible (')==1   # revue 4 (row 55)
+                                                       and 'inconnues' not in e6.getvalue() and len(e6.getvalue())==n6 and len(z6q)==len(z6),sorted(f6),e6.getvalue()[-300:])
+            # revue 4 (row 55) : clés du rc sensibles à la casse — `cache_dir` en minuscules protégé aussi
+            with mock.patch.object(b.borg,'cfgreadnicks',lambda: 'n7'),contextlib.redirect_stderr(io.StringIO()), \
+                 mock.patch.object(b.borg,'cfgread',lambda n: dict(cache_dir=os.path.join(d,'c7'))):
+                z7=b._restore_zones('n7')
+            res['cache_dir en minuscules']=(any(lab==_RZ_BASES and os.path.join(d,'c7') in zf for lab,zf,_ in z7),[(lab,sorted(zf)) for lab,zf,_ in z7][-2:])
+            res['nick illisible']=('[WARN] zones du nick n3 inconnues (boom) — ses dossiers ne sont pas protégés' in e.getvalue()
+                                   and any(lab=='dépôt borg local' for lab,_,_ in z3) and not any(os.path.join(d,'bcache') in f for _,f,_ in z3),e.getvalue()[-200:])
+            hn=socket.gethostname().split('.')[0]
+            table=[(('/a/r',),'/a/r'),(('ssh://h/r',),None),(('h:/r',),None),(('file:///a/r',),'/a/r'),(('/a/r::arch',),'/a/r'),
+                   (('rel','/b'),'/b/rel'),(('rel',),None),(('/a/{hostname}/r',),f'/a/{hn}/r'),(('/a/{now}/r',),None),(('/',),None),
+                   (('/a/{{x}}',),'/a/{x}'),(('',),None)]
+            got=[_restore_local_repo(*a) for a,_ in table]
+            res['_restore_local_repo']=(got==[w_ for _,w_ in table],got)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore mode sûr : zone contrôlée à l'écriture (bases, rc, dépôt, clé, dossiers de borg ; chemin et identité), destination ou tar dans une zone",_s114_zones)
+        def _s114_links():
+            """Jamais d'écriture à travers un lien : lien de l'archive créé tel quel, éléments dessous sautés (_RZ_UNDER, groupés sous
+            le lien) ; --liens-en-dossiers : vrai dossier à sa place, éléments écrits dedans ; lien DÉJÀ présent dans la destination
+            (parent ou dossier de l'archive) : sauté même avec l'option, lien gardé ; fichier de l'archive sur un lien présent : le lien
+            remplacé, sa cible intacte ; cible hors destination jamais touchée."""
+            d=os.path.join(tmp,'s114links'); out=os.path.join(d,'dehors'); os.makedirs(out)
+            with open(os.path.join(out,'cible'),'w') as f: f.write('dehors')
+            res={}; ent=[('l','l',out),('l/x','f',b'x'),('l/sub','d'),('l/sub/y','f',b'y')]
+            r1=os.path.join(d,'r1'); w,_=_s114_feed(r1,[],ent)
+            res['défaut']=(os.path.islink(os.path.join(r1,'l')) and os.readlink(os.path.join(r1,'l'))==out and _s114_skips(w)=={_RZ_UNDER:['l/…']}
+                          and w.skips.count()==3 and sorted(os.listdir(out))==['cible'],_s114_skips(w),os.listdir(out))
+            r2=os.path.join(d,'r2'); w,_=_s114_feed(r2,[],ent,links_as_dirs=True)
+            res['--liens-en-dossiers']=(not os.path.islink(os.path.join(r2,'l')) and open(os.path.join(r2,'l','sub','y')).read()=='y'
+                                        and open(os.path.join(r2,'l','x')).read()=='x' and not w.skips and w.converted==1
+                                        and sorted(os.listdir(out))==['cible'],_s114_skips(w),w.converted)
+            r3=os.path.join(d,'r3'); os.makedirs(r3); os.symlink(out,os.path.join(r3,'pl')); os.symlink(os.path.join(out,'cible'),os.path.join(r3,'fl'))
+            w,_=_s114_feed(r3,[],[('pl','d'),('pl/y','f',b'y'),('fl','f',b'remplace')],links_as_dirs=True)
+            res['lien présent']=(os.path.islink(os.path.join(r3,'pl')) and _s114_skips(w)=={_RZ_LINK:['pl/…']} and w.skips.count()==2
+                                 and not os.path.islink(os.path.join(r3,'fl')) and open(os.path.join(r3,'fl')).read()=='remplace'
+                                 and open(os.path.join(out,'cible')).read()=='dehors' and sorted(os.listdir(out))==['cible'],_s114_skips(w))
+            # revue 1 (M15, row 14) : dossier de l'archive remplacé plus loin par un lien vers l'extérieur -> droits et date du dossier
+            # jamais posés à travers le lien (finish en O_NOFOLLOW), aucun saut parasite
+            os.chmod(out,0o755); os.utime(out,(1111111111,1111111111)); before=os.stat(out)
+            r4=os.path.join(d,'r4'); w,_=_s114_feed(r4,[],[('x','d'),('x','l',out)])
+            after=os.stat(out)
+            res['dossier remplacé par un lien']=(os.path.islink(os.path.join(r4,'x')) and stat.S_IMODE(after.st_mode)==0o755
+                                                 and int(after.st_mtime)==1111111111 and not w.skips,oct(after.st_mode),after.st_mtime,_s114_skips(w))
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore mode sûr : lien jamais traversé (lien de l'archive -> éléments sautés, --liens-en-dossiers -> vrai dossier ; lien présent -> sauté)",_s114_links)
+        def _s114_atomic():
+            """Écriture atomique : contenu, droits (setuid de son propre fichier), date posés sur le temporaire puis renommage ; disque
+            plein (ENOSPC simulé au 2e bloc de `a`, temporaire déjà en partie écrit) -> _RestoreStop, fichier existant intact sous son
+            nom, aucun temporaire ; erreur d'écriture d'un fichier (EFBIG) -> ce fichier sauté et dit, la suite écrite ; dossiers : droits
+            et date en fin de flux ; temporaire ouvert en O_EXCL|O_NOFOLLOW (lien piégé sous son nom : jamais écrit à travers, élément
+            sauté) ; nom de 62 caractères de 4 octets (248 octets) écrit (temporaire coupé en octets, revue 1 row 11)."""
+            d=os.path.join(tmp,'s114atom'); os.makedirs(d); res={}
+            with open(os.path.join(d,'a'),'w') as f: f.write('ancien')
+            big=b'z'*(3<<20); real=os.write; n=[0]
+            def full(fd,b):
+                n[0]+=1
+                if n[0]>=3: raise OSError(_errno.ENOSPC,'No space left on device')   # 1 : ok ; 2 : 1er bloc de a ; 3 : 2e bloc
+                return real(fd,b)
+            with mock.patch('os.write',full): w,exc=_s114_feed(d,[],[('ok','f',b'premier'),('a','f',big)])
+            left=[x for x in os.listdir(d) if '.bhr' in x]
+            res['disque plein']=(isinstance(exc,_RestoreStop) and open(os.path.join(d,'a')).read()=='ancien' and not left
+                                 and open(os.path.join(d,'ok')).read()=='premier' and w.n_ok==1 and w.last=='ok',exc,left,w.n_ok)
+            def efbig(fd,b): raise OSError(_errno.EFBIG,'File too large')
+            d2=os.path.join(tmp,'s114atom2'); os.makedirs(d2)
+            with mock.patch('os.write',efbig): w,exc=_s114_feed(d2,[],[('g','f',b'x'),('h','l','g')])
+            res['erreur d\'un fichier']=(exc is None and os.path.islink(os.path.join(d2,'h')) and not os.path.exists(os.path.join(d2,'g'))
+                                        and _s114_skips(w)=={"erreur d'écriture (File too large)":['g']}
+                                        and not [x for x in os.listdir(d2) if '.bhr' in x],exc,_s114_skips(w))
+            d4=os.path.join(tmp,'s114atom4'); out=os.path.join(d4,'dehors'); os.makedirs(out); os.makedirs(os.path.join(d4,'r'))
+            with open(os.path.join(out,'cible'),'w') as f: f.write('dehors')
+            os.symlink(os.path.join(out,'cible'),os.path.join(d4,'r','.f.bhr00000000'))
+            with mock.patch('secrets.token_hex',lambda n=None: '00000000'): w,exc=_s114_feed(os.path.join(d4,'r'),[],[('f','f',b'pirate')])
+            res['temporaire piégé']=(open(os.path.join(out,'cible')).read()=='dehors' and not os.path.exists(os.path.join(d4,'r','f'))
+                                     and _s114_skips(w)=={"erreur d'écriture (File exists)":['f']},_s114_skips(w))
+            # revue 3 (row 50) : nom noté sans identité prouvée (interruption avant le relevé, ou nom déjà pris) -> jamais retiré
+            d6=os.path.join(tmp,'s114atom6'); os.makedirs(d6); open(os.path.join(d6,'autrui'),'w').close()
+            w6=_SafeWriter(d6,[]); w6.tmp=(w6.rootfd,'autrui',None); w6._drop_tmp(); w6.close()
+            res['temporaire sans identité']=(os.path.exists(os.path.join(d6,'autrui')),)
+            long='\U0001F600'*62; d5=os.path.join(tmp,'s114atom5'); w,exc=_s114_feed(d5,[],[(long,'f',b'x')])
+            res['nom long']=(exc is None and not w.skips and os.listdir(d5)==[long],_s114_skips(w))
+            d3=os.path.join(tmp,'s114atom3'); w,exc=_s114_feed(d3,[],[('s','d'),('s/f','f',b'contenu',0o4750)])
+            st=os.stat(os.path.join(d3,'s','f')); sd=os.stat(os.path.join(d3,'s'))
+            res['métadonnées']=(open(os.path.join(d3,'s','f')).read()=='contenu' and stat.S_IMODE(st.st_mode)==0o4750
+                               and int(st.st_mtime)==1500000000 and stat.S_IMODE(sd.st_mode)==0o750 and int(sd.st_mtime)==1500000000,
+                               oct(st.st_mode),oct(sd.st_mode),st.st_mtime,sd.st_mtime)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore mode sûr : écriture atomique (temporaire voisin puis renommage ; disque plein -> existant intact, aucun temporaire)",_s114_atomic)
+        def _s114_misc():
+            """Chemins non normalisés (absolu, « .. », composant vide) sautés et dits, « ./ » retiré, « . » ignoré ; périphérique en
+            compte ordinaire sauté ; dossier non vide à la place d'un fichier sauté, dossier vide remplacé ; fifo créé ; lien physique
+            lié au premier nom écrit, rompu (premier nom dans une zone) -> noté pour la seconde lecture ; à plat : nom seul, lien
+            recréé comme lien, même nom : le dernier gagne."""
+            d=os.path.join(tmp,'s114misc'); os.makedirs(os.path.join(d,'plein','x')); os.makedirs(os.path.join(d,'vide')); res={}
+            zd=os.path.join(d,'z'); os.makedirs(zd); zones=[('zone témoin',frozenset(_restore_path_forms(zd)),frozenset())]
+            with open(os.path.join(zd,'m'),'w') as f: f.write('vivant')   # revue 1 (M16) : premier nom PRÉSENT mais non écrit par Restore
+            ents=[('.','d'),('/abs','f',b'a'),('a/../b','f',b'b'),('a//c','f',b'c'),('./ok','f',b'ok'),('plein','f',b'p'),('vide','f',b'v'),
+                  ('fifo','p'),('h2','h','ok'),('h2','h','ok'),('p2','h','fifo'),('z/m','f',b'm'),('h3','h','z/m')]
+            if os.geteuid()!=0: ents.append(('dev','c'))
+            w,exc=_s114_feed(d,zones,ents)
+            sk=_s114_skips(w)
+            want={_RZ_ODD:['/abs','a/../b','a//c'],_RZ_FULLDIR:['plein'],'zone témoin':['z/…']}
+            if os.geteuid()!=0: want[_RZ_DEV]=['dev']
+            res['sauts']=(sk==want,sk)
+            sto=os.stat(os.path.join(d,'ok')); sth=os.stat(os.path.join(d,'h2'))
+            res['écrits']=(open(os.path.join(d,'vide')).read()=='v' and stat.S_ISFIFO(os.lstat(os.path.join(d,'fifo')).st_mode)
+                          and (sto.st_ino,sto.st_nlink)==(sth.st_ino,2) and os.listdir(os.path.join(d,'plein'))==['x'],)
+            res['lien physique rompu']=(w.broken==[(('h3',),'z/m')] and not os.path.exists(os.path.join(d,'h3'))
+                                        and os.stat(os.path.join(zd,'m')).st_nlink==1 and open(os.path.join(zd,'m')).read()=='vivant',w.broken)
+            stp=os.lstat(os.path.join(d,'p2')); stf=os.lstat(os.path.join(d,'fifo'))
+            res['fifo lié, lien en double']=(stat.S_ISFIFO(stp.st_mode) and stp.st_ino==stf.st_ino and not [x for x in os.listdir(d) if '.bhr' in x],)
+            # revue 2 (row 23) : identité d'un premier nom = la PAIRE (st_dev, st_ino) — deux systèmes de fichiers simulés : f2 noté sur
+            # un dev+1 ; un lien vers f1 vu sur dev+1 (même ino que f1, autre dev) n'est jamais accepté (lien rompu, rien lié)
+            pd=os.path.join(tmp,'s114dev'); os.makedirs(pd); realstat=os.stat; mode_={'dev':None}
+            def fstat_(path,*a,**k):
+                r=realstat(path,*a,**k)
+                if mode_['dev']==path: return os.stat_result((r.st_mode,r.st_ino,r.st_dev+1)+tuple(r)[3:])
+                return r
+            wd=_SafeWriter(pd,[]); tfd=_s114_tf.open(fileobj=io.BytesIO(_s114_tar([('f1','f',b'1'),('f2','f',b'2'),('h','h','f1')])),mode='r|')
+            try:
+                for ti in tfd:
+                    mode_['dev']={'f2':'f2','h':'f1'}.get(ti.name)
+                    with mock.patch('os.stat',fstat_): wd.entry(ti,tfd)
+            finally: wd.close()
+            res['identité par paire (dev, ino)']=(wd.broken==[(('h',),'f1')] and not os.path.exists(os.path.join(pd,'h'))
+                                                 and os.stat(os.path.join(pd,'f1')).st_nlink==1,wd.broken)
+            # revue 1 (row 15) : EDQUOT du changement de propriétaire (root simulé) -> élément sauté, la suite écrite
+            qd=os.path.join(tmp,'s114quota'); os.makedirs(qd); wq=_SafeWriter(qd,[]); wq.is_root=True
+            def quota(*a,**k): raise OSError(_errno.EDQUOT,'Disk quota exceeded')
+            tq=_s114_tf.open(fileobj=io.BytesIO(_s114_tar([('q1','f',b'1'),('q2','l','q1')])),mode='r|')
+            try:
+                with mock.patch('os.fchown',quota),mock.patch('os.chown',lambda *a,**k: None):
+                    for ti in tq: wq.entry(ti,tq)
+            finally: wq.close()
+            res['EDQUOT du propriétaire']=(_s114_skips(wq)=={f"erreur d'écriture (quota du propriétaire {os.getuid()} dépassé)":['q1']}
+                                           and os.path.islink(os.path.join(qd,'q2')) and not [x for x in os.listdir(qd) if '.bhr' in x],_s114_skips(wq))
+            # revue 1/2 (rows 6, 32) : chemins affichés échappés, liste bornée à 50 par raison ; lots d'arguments
+            # vgap3 : nom piégé EN TÊTE (parmi les 50 affichés) — report() l'affiche échappé, jamais brut
+            sl=_SkipLog(); e=io.StringIO()
+            sl.add('r',"a\nb\x1b[31m\u2028\x9b\udce9")
+            for i in range(51): sl.add('r',f"n{i}")
+            with contextlib.redirect_stderr(e): sl.report()
+            res['affichage et plafond']=(sl.count()==52 and '[WARN] 52 éléments sautés : r' in e.getvalue() and '  … et 2 autres' in e.getvalue()
+                                         and e.getvalue().count('\n  n')==49 and '\n  a\\x0ab\\x1b[31m\\u2028\\x9b\\xe9\n' in e.getvalue()
+                                         and not any(ch in e.getvalue() for ch in '\x1b\x9b\u2028')
+                                         and _shown_path("a\nb\x1b[31m\u2028\x9b\udce9")=='a\\x0ab\\x1b[31m\\u2028\\x9b\\xe9',e.getvalue()[-200:])
+            res['lots d\'arguments']=([len(x) for x in _argv_batches(['a'*40000,'b'*40000,'c'])]==[1,2],)
+            p=os.path.join(tmp,'s114plat')
+            w,exc=_s114_feed(p,[],[('a','d'),('a/n','f',b'1'),('b/n','f',b'2'),('b/l','l','../a/n'),('b/h','h','b/n')],flat=True)
+            res['à plat']=(sorted(os.listdir(p))==['h','l','n'] and open(os.path.join(p,'n')).read()=='2' and os.readlink(os.path.join(p,'l'))=='../a/n'
+                          and os.stat(os.path.join(p,'h')).st_ino==os.stat(os.path.join(p,'n')).st_ino and not w.skips,sorted(os.listdir(p)),_s114_skips(w))
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore mode sûr : chemins non normalisés, périphérique, dossier présent, fifo, liens physiques (rompu -> seconde lecture), à plat",_s114_misc)
+        def _s114_opts():
+            """Options de Restore (décisions 3, 8, 16) : --creux sans --fidele, --liens-en-dossiers avec --fidele, une option longue de
+            Restore avec -L ou sur une autre commande -> code 2 avant tout borg (journal du borg factice vide) ; bibliothèque : mêmes refus
+            avant verrou ; _borg_extract_args : --sparse avec --creux, --numeric-ids retiré par --par-nom ; _restore_cli_line : commande
+            relue par shlex identique, -C absolu, archive exacte, --fidele en dernier, jamais de passphrase."""
+            d,rc,calls,cli=_bf_env('s114opts'); res={}
+            for a,msg in ((['-w',os.path.join(d,'o'),'--creux'],'--creux seulement avec --fidele'),
+                          (['-w',os.path.join(d,'o'),'--fidele','--liens-en-dossiers'],'--liens-en-dossiers : mode sûr seulement'),
+                          (['-L','--par-nom'],'--fidele, --creux, --liens-en-dossiers, --par-nom : sans objet avec -L'),
+                          (['-w',os.path.join(d,'o.tar'),'--liens-en-dossiers'],'--liens-en-dossiers : sans objet vers un tar ou stdout'),
+                          (['-w','-','--par-nom'],'--par-nom : sans objet vers un tar ou stdout en mode sûr'),
+                          (['-w',os.path.join(d,'o'),'-b',' '],"-b vide refusé : nom d'archive exact attendu")):
+                if os.path.exists(calls): os.unlink(calls)
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x',*a)
+                # revue 1 (M25) : refus de la CLI (ligne de syntaxe de _usage_error), jamais celui de la bibliothèque
+                res[' '.join(a[-2:])]=(code==2 and f"[ERREUR] Restore : {msg}" in err and '  syntaxe : borgHelper -c Restore' in err
+                                      and not os.path.exists(calls) and not os.path.exists(os.path.join(d,'o')),code,err[-200:])
+            res['--par-nom --fidele vers un tar accepté']=(_cli_required('restore',{'-f':'x','-w':'t.tar','--par-nom':'','--fidele':''}) is None,)
+            code,out,err=cli('-c','Stats','-n','zw','--fidele'); res['autre commande']=(code==2 and '--fidele réservé à Restore' in err,code,err[-150:])
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            def nolock(*a,**k): raise AssertionError('verrou pris')
+            for kw,dest,msg in ((dict(sparse=True),'o2','--creux seulement avec --fidele'),
+                                (dict(fidele=True,links_as_dirs=True),'o2','--liens-en-dossiers : mode sûr seulement (sans --fidele)'),
+                                (dict(links_as_dirs=True),'o2.tgz','--liens-en-dossiers : sans objet vers un tar ou stdout'),
+                                (dict(by_name=True),'o2.tar','--par-nom : sans objet vers un tar ou stdout en mode sûr'),
+                                (dict(bid=''),'o2',"-b vide refusé : nom d'archive exact attendu")):
+                e=io.StringIO(); c='aucun'; kw=dict(kw); bid=kw.pop('bid','b')
+                with mock.patch.object(BorgHelperDB,'set_priority_lock',nolock),contextlib.redirect_stderr(e),contextlib.redirect_stdout(io.StringIO()):
+                    try: b.restore('zw',bid,'x',os.path.join(d,dest),**kw)
+                    except SystemExit as x: c=x.code
+                res[f"bibliothèque {kw} {bid!r}"]=(c==2 and f'[ERREUR] Restore : {msg}' in e.getvalue(),c,e.getvalue()[-150:])
+            # revue 1 (row 2) : nom d'archive littéral pour borg (accolades doublées), export-tar et extract
+            res['nom littéral']=(b._export_tar_args('a{x}','p')[3]=='::a{{x}}' and _borg_extract_args('a{x}','p')[-2]=='::a{{x}}',)
+            # vgap3 (row 29) : Restore -L passe aussi le nom d'archive littéral à borg list (accolades doublées)
+            if os.path.exists(calls): os.unlink(calls)
+            code,out,err=cli('-c','Restore','-n','zw','-b','a{user:.0}','-f','x','-L')
+            try: lg=open(calls).read().split('\n')
+            except OSError: lg=[]
+            res['-L : nom littéral']=([l_ for l_ in lg if l_.startswith('list ')] and all(l_.split()[-2:]==['::a{{user:.0}}','x'] for l_ in lg if l_.startswith('list ')),lg)
+            xa=_borg_extract_args('a','etc/x',sparse=True,numeric=False)
+            res['extract']=(xa[:3]==['extract','--sparse','--exclude'] and '--numeric-ids' not in xa
+                            and _borg_extract_args('a','etc/x')[:3]==['extract','--numeric-ids','--exclude'],xa)
+            line=_restore_cli_line('rel/rc','zw','srv-2026 x',"a b/c'd",'rel dest',fidele=True)
+            want=[os.path.realpath(__file__),'-C',os.path.join(os.getcwd(),'rel','rc'),'-c','Restore','-n','zw','-b','srv-2026 x','-f',"a b/c'd",'-w',
+                  os.path.join(os.getcwd(),'rel dest'),'--fidele']
+            res['commande, exe liste']=(shlex.split(_restore_cli_line(rc,'zw','a','x','/d',exe=['/usr/bin/python3','/o/bh']))[:3]==['/usr/bin/python3','/o/bh','-C'],)
+            res['commande']=(shlex.split(line)==want and 'BORG_PASSPHRASE' not in line and 'pw' not in shlex.split(line),line)
+            res['commande -W stdout']=(shlex.split(_restore_cli_line(rc,'zw','a','x','-',flat=True))[-2:]==['-W','-'],)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore : options --fidele, --creux, --liens-en-dossiers, --par-nom (refus code 2 avant borg, bibliothèque comprise) ; commande CLI équivalente",_s114_opts)
+        def _s114_flux():
+            """Revue 1 (rows 3, 4, 13, 14 ; M13) — de bout en bout, borg factice (_bf_env) : disque plein (ENOSPC simulé sur le 2e
+            fichier) -> SystemExit 2, « [ERREUR] flux interrompu après « a » : 1 élément restauré (fichiers finis gardés) — … », a
+            gardé, aucun temporaire ; au 1er fichier -> « … — rien restauré », destination créée retirée ; tar : chemins non normalisés
+            (../x, /abs, a//b) sautés et listés, code 1 ; flux de borg coupé -> stdout SANS fin d'archive, code 2, fichier tar jamais
+            créé ni temporaire laissé ; .tar existant illisible -> code 3 avant tout borg, fichier intact. Attentes en dur.
+            Revue 3 (vgap3) : chaque sous-contrôle dans sa section (sec) — une exception le note en échec, les suivants sont évalués ;
+            borg factice des SIGTERM réels arrêté par son PID (vérifié) en fin de term_run, survivant ou non."""
+            d,rc,calls,cli=_bf_env('s114flux'); res={}
+            @contextlib.contextmanager
+            def sec(name):
+                try: yield
+                except (Exception,SystemExit) as x: res[f'{name} (exception)']=(False,f"{type(x).__name__}: {x}")   # Ctrl-C : arrête le selftest (1.0.160)
+            mode=lambda m: open(os.path.join(d,'mode'),'w').write(m)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            def lib(dest,fail_at=None,err=_errno.ENOSPC,data=None,**kw):
+                """Restore en processus ; os.write en échec (`err`) à partir du `fail_at`-ième appel, ou pour le contenu `data`."""
+                real=os.write; n=[0]
+                def full(fd,bb):
+                    n[0]+=1
+                    if (fail_at is not None and n[0]>=fail_at) or (data is not None and bytes(bb)==data): raise OSError(err,os.strerror(err))
+                    return real(fd,bb)
+                e=io.StringIO(); c='aucun'
+                try:
+                    with mock.patch('os.write',full),contextlib.redirect_stderr(e),contextlib.redirect_stdout(io.StringIO()):
+                        try: b.restore('zw','b','x',dest,**kw)
+                        except SystemExit as x: c=x.code
+                except BaseException as x: c=f"{type(x).__name__}: {x}"   # revue 2 (row 37) : attribuable au sous-contrôle
+                return c,e.getvalue()
+            nodsn=dict(os.environ,BORGHELPERC_SENTRY_FILE=os.path.join(tmp,'rb-nodsn')); nodsn.pop('BORGHELPERC_SENTRY_DSN',None)   # row 37
+            nobhr=lambda p=d: not [x for x in os.listdir(p) if '.bhr' in x]
+            with sec('disque plein'):
+                mode('tar2')
+                e1=os.path.join(d,'e1'); c,o=lib(e1,2)
+                res['disque plein au 2e fichier']=(c==2 and '[ERREUR] flux interrompu après « a » : 1 élément restauré (fichiers finis gardés) — No space left on device (b)' in o
+                                                   and os.listdir(e1)==['a'] and open(os.path.join(e1,'a')).read()=='a',c,o[-300:])
+                e2=os.path.join(d,'e2','sous'); c,o=lib(e2,1)
+                res['disque plein au 1er fichier']=(c==2 and '[ERREUR] flux interrompu : No space left on device (a) — rien restauré' in o
+                                                    and not os.path.exists(os.path.join(d,'e2')),c,o[-300:])
+            with sec('noms piégés affichés'):   # vgap3 : [ERREUR] … après « nom » et (nom) échappés (_shown_path)
+                mode('tarnl'); en=os.path.join(d,'enl'); c,o=lib(en,data=b'\x1b')
+                res['noms piégés affichés']=(c==2 and '[ERREUR] flux interrompu après « x\\x0ay » : 1 élément restauré (fichiers finis gardés) — No space left on device (b\\x1b)' in o
+                                             and '\x1b' not in o and 'x\ny' not in o,c,o[-300:])
+            with sec('tar non normalisé'):
+                mode('tarodd')
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',os.path.join(d,'odd.tar'))
+                try:
+                    with _s114_tf.open(os.path.join(d,'odd.tar')) as t: names=t.getnames()
+                except (OSError,_s114_tf.TarError) as x: names=repr(x)
+                res['tar non normalisé']=(code==1 and names==['ok'] and "[WARN] 4 éléments sautés : chemin d'archive non normalisé (absolu, « .. » ou composant vide)" in err
+                                          and all(f"\n  {p}  " in err+'  ' or f"\n  {p}\n" in err for p in ('../x','/abs','a//b','h')),code,names,err[-400:])   # h : lien physique vers ../x
+            def reader(data):
+                """(membres lus, a levé, fichiers créés par tarfile.extractall) d'un tar reçu sur stdout."""
+                got=[]; raised=False
+                with tempfile.TemporaryDirectory(dir=tmp) as xd:
+                    try:
+                        with _s114_tf.open(fileobj=io.BytesIO(data),mode='r|') as t:
+                            for m in t: got.append(m.name); t.extract(m,xd)
+                    except _s114_tf.TarError: raised=True
+                    made_=sorted(os.listdir(xd))
+                return got,raised,made_
+            def stdout_run(m):
+                mode(m)
+                r=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc,'-c','Restore','-n','zw','-b','b','-f','x','-w','-'],
+                                 capture_output=True,env=nodsn,timeout=120,stdin=subprocess.DEVNULL,cwd=d)
+                return r,r.stderr.decode('utf-8','replace')
+            MARK=b'././@LongLink'
+            with sec('stdout coupé dans un membre'):
+                # revue 2/3 (rows 24, 38) : coupe AU MILIEU d'un membre (b : 5000 o annoncés) -> rien ajouté, le contenu manquant suffit
+                r,er=stdout_run('tarcut'); got,raised,made_=reader(r.stdout)
+                res['stdout coupé dans un membre']=(r.returncode==2 and got[:1]==['a'] and raised and MARK not in r.stdout and not r.stdout.endswith(b'\0'*1024)
+                                                   and 'zw: borg export-tar a échoué : Connection closed by remote host' in er
+                                                   and "[ERREUR] flux interrompu : tar de stdout tronqué (sans fin d'archive)" in er,r.returncode,len(r.stdout),er[-300:])
+            with sec('stdout coupé entre deux membres'):
+                # revue 3 (row 38) : coupe ENTRE deux membres -> marqueur ././@LongLink : le lecteur échoue sans rien créer de plus que a
+                r,er=stdout_run('tarcutb'); got,raised,made_=reader(r.stdout)
+                res['stdout coupé entre deux membres']=(r.returncode==2 and got==['a'] and raised and made_==['a'] and r.stdout.count(MARK)==1,r.returncode,got,made_,len(r.stdout))
+                # vgap3 : GNU tar (taille annoncée 2**33-1 : « Unexpected EOF ») échoue aussi, sans créer plus que a
+                gt=shutil.which('tar'); gv=''
+                if gt:
+                    try: gv=subprocess.run([gt,'--version'],capture_output=True,text=True,timeout=30,stdin=subprocess.DEVNULL).stdout
+                    except (OSError,subprocess.SubprocessError): gv=''
+                if 'GNU tar' in gv:
+                    with tempfile.TemporaryDirectory(dir=tmp) as xd:
+                        g=subprocess.run([gt,'-xf','-','-C',xd],input=r.stdout,capture_output=True,timeout=60)
+                        gm=sorted(os.listdir(xd))
+                    res['stdout coupé : GNU tar en échec']=(g.returncode!=0 and gm==['a'],g.returncode,gm,g.stderr[-200:])
+                else: print(f"  (GNU tar absent : « stdout coupé : GNU tar en échec » non vérifié — {gt or 'aucun tar'})")
+            with sec('stdout coupé dans un petit membre'):
+                # revue 3 (row 38) : coupe dans un membre de 300 o (≤ 512) -> rien ajouté (un marqueur y serait lu comme contenu, tar valide)
+                r,er=stdout_run('tarcutp'); got,raised,made_=reader(r.stdout)
+                res['stdout coupé dans un petit membre']=(r.returncode==2 and got[:1]==['a'] and raised and MARK not in r.stdout,r.returncode,got,len(r.stdout))
+            with sec('tar coupé'):
+                mode('tarcut')
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',os.path.join(d,'cut.tar'))
+                res['tar coupé']=(code==2 and not os.path.exists(os.path.join(d,'cut.tar')) and nobhr(),code,err[-200:])
+            with sec('tar existant illisible'):
+                with open(os.path.join(d,'bad.tar'),'w') as f: f.write('pas un tar')
+                if os.path.exists(calls): os.unlink(calls)
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',os.path.join(d,'bad.tar'))
+                res['tar existant illisible']=(code==3 and f"[ERREUR] {os.path.join(d,'bad.tar')} : tar existant illisible (" in err and not os.path.exists(calls)
+                                               and open(os.path.join(d,'bad.tar')).read()=='pas un tar' and nobhr(),code,err[-200:])
+            with sec('tar existant vide'):
+                # revue 2 (row 36) : .tar existant VIDE tenu pour absent
+                open(os.path.join(d,'vide.tar'),'w').close(); mode('tar2')
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',os.path.join(d,'vide.tar'))
+                try:
+                    with _s114_tf.open(os.path.join(d,'vide.tar')) as t: nv=t.getnames()
+                except (OSError,_s114_tf.TarError) as x: nv=repr(x)
+                res['tar existant vide']=(code==0 and nv==['a','b'],code,nv,err[-200:])
+            with sec('temporaire du tar piégé'):
+                # revue 2 (row 37) : temporaire du tar piégé (lien sous son nom) -> jamais écrit à travers, code 3, cible intacte ;
+                # dans son propre dossier (vgap3 : une régression ne laisse rien dans d), piège retiré quoi qu'il arrive
+                pd=os.path.join(d,'piege'); out_=os.path.join(d,'dehors'); os.makedirs(pd); os.makedirs(out_)
+                with open(os.path.join(out_,'cible'),'w') as f: f.write('dehors')
+                trap=os.path.join(pd,'.x.tar.bhr00000000'); os.symlink(os.path.join(out_,'cible'),trap)
+                try:
+                    with mock.patch('secrets.token_hex',lambda n=None: '00000000'): c,o=lib(os.path.join(pd,'x.tar'))
+                    res['temporaire du tar piégé']=(c==3 and open(os.path.join(out_,'cible')).read()=='dehors' and not os.path.exists(os.path.join(pd,'x.tar'))
+                                                    and os.path.islink(trap),c,o[-200:])
+                finally:
+                    for f_ in (trap,os.path.join(pd,'x.tar')):
+                        try: os.unlink(f_)
+                        except OSError: pass
+            # revue 2 (rows 8, 25) : Ctrl-C et SIGTERM pendant le flux d'un tar -> aucun temporaire ; SIGTERM : code 143
+            _st=globals().get('_SigTerm')   # témoin sur du code d'avant : absent -> sous-contrôle en échec, les autres évalués
+            _rs=globals().get('_restore_sigterm')
+            ours=lambda: getattr(signal.getsignal(signal.SIGTERM),'_bh_restore',False)
+            for exc_,want in ((KeyboardInterrupt('test'),'KeyboardInterrupt: test'),((_st or RuntimeError)('SIGTERM'),143 if _st else 'absent')):
+                nm_=f'interruption du tar ({type(exc_).__name__})'
+                with sec(nm_):
+                    # revue 3 (row 49) : conversion par la CLI seulement — émulée ici par _restore_sigterm autour de l'appel
+                    with mock.patch.object(BorgHelper,'_restore_stream',lambda *a,_e=exc_,**k: (_ for _ in ()).throw(_e)):
+                        if _rs is not None and _st is not None and isinstance(exc_,_st):
+                            e_=io.StringIO()
+                            try:
+                                with contextlib.redirect_stderr(e_),contextlib.redirect_stdout(io.StringIO()),_rs(): b.restore('zw','b','x',os.path.join(d,'k.tar'))
+                                c='aucun'
+                            except SystemExit as x: c=x.code
+                            except BaseException as x: c=f"{type(x).__name__}: {x}"
+                            o=e_.getvalue()
+                        else: c,o=lib(os.path.join(d,'k.tar'))
+                    res[nm_]=(c==want and nobhr() and not os.path.exists(os.path.join(d,'k.tar')),c,o[-200:])
+            with sec('SIGTERM : désarmé à la réception, SIG_DFL ensuite'):
+                # vgap3 : le gestionnaire de la CLI passe SIGTERM à SIG_IGN dès la 1re réception ; SIG_DFL rendu en sortie de _restore_sigterm.
+                # Jamais de SIGTERM à soi-même sans le gestionnaire de _restore_sigterm posé (sinon SIG_DFL tuerait le selftest)
+                # gestionnaire du selftest (_rb_sig) remplacé par SIG_DFL le temps du sous-contrôle (comme la CLI), rendu ensuite
+                seen=[]; c='aucun'; prev=signal.signal(signal.SIGTERM,signal.SIG_DFL)
+                try:
+                    try:
+                        with contextlib.redirect_stderr(io.StringIO()),_rs():
+                            if ours():
+                                try:
+                                    os.kill(os.getpid(),signal.SIGTERM)
+                                    for _ in range(50): time.sleep(0.01)
+                                except _st: seen.append(signal.getsignal(signal.SIGTERM))
+                            else: seen.append('gestionnaire non posé')
+                    except SystemExit as x: c=x.code
+                    after=signal.getsignal(signal.SIGTERM)
+                finally: signal.signal(signal.SIGTERM,prev)
+                res['SIGTERM : désarmé à la réception, SIG_DFL ensuite']=(seen==[signal.SIG_IGN] and c=='aucun' and after is signal.SIG_DFL,seen,c,after)
+            with sec('Ctrl-C puis SIGTERM pendant le nettoyage'):
+                # vgap3 : Ctrl-C pendant l'écriture de b (dossier), SIGTERM reçu pendant le retrait du temporaire -> ignoré (nettoyage
+                # désarmé à son entrée) : temporaire retiré, code 130, SIG_DFL rendu ensuite
+                mode('tar2'); kd=os.path.join(d,'kc'); os.makedirs(kd); real_w=os.write; real_u=os.unlink; sent=[]
+                def w_ki(fd,bb):
+                    if bytes(bb)==b'b': raise KeyboardInterrupt('ctrl-c')
+                    return real_w(fd,bb)
+                def u_term(p,*a,**k):
+                    if '.bhr' in str(p) and not sent:
+                        h_=signal.getsignal(signal.SIGTERM); sent.append(h_)
+                        if h_ is signal.SIG_IGN or ours():
+                            os.kill(os.getpid(),signal.SIGTERM)
+                            for _ in range(20): time.sleep(0.01)
+                    return real_u(p,*a,**k)
+                e_=io.StringIO(); c='aucun'; prev=signal.signal(signal.SIGTERM,signal.SIG_DFL)
+                try:
+                    try:
+                        with mock.patch('os.write',w_ki),mock.patch('os.unlink',u_term),contextlib.redirect_stderr(e_),contextlib.redirect_stdout(io.StringIO()),_rs():
+                            b.restore('zw','b','x',kd)
+                    except SystemExit as x: c=x.code
+                    except BaseException as x: c=f"{type(x).__name__}: {x}"
+                    after=signal.getsignal(signal.SIGTERM)
+                finally: signal.signal(signal.SIGTERM,prev)
+                res['Ctrl-C puis SIGTERM pendant le nettoyage']=(c==130 and sent==[signal.SIG_IGN] and nobhr(kd) and os.listdir(kd)==['a']
+                                                                  and after is signal.SIG_DFL,c,sent,os.listdir(kd),e_.getvalue()[-200:])
+            # vrai SIGTERM au processus pendant le flux (borg factice qui attend) : 143, aucun temporaire, [INTERRUPTED]
+            def term_run(m,args,marker,burst=False,ign=False,cwd=d,noread=False,settle=0.3):
+                """CLI lancée, SIGTERM dès que le borg factice a noté son PID (et `marker`), puis (code, stdout, stderr, borg parti).
+                `burst` : SIGTERM répétés (toutes les 20 ms, 1 s) ; `ign` : CLI lancée avec SIGTERM ignoré (hérité), arrêtée par SIGKILL
+                après 1,5 s ; `noread` (revue 4, row 54) : stdout jamais lu (tube plein) — code None si la CLI n'est pas sortie 20 s après
+                le SIGTERM (puis tuée). Le borg factice est toujours tué en fin (PID vérifié : sa ligne de commande), après le constat."""
+                mode(m); pidf=os.path.join(d,'borg-pid')
+                for f_ in (pidf,marker):
+                    if f_ and os.path.exists(f_): os.unlink(f_)
+                pre=(lambda: signal.signal(signal.SIGTERM,signal.SIG_IGN)) if ign else None
+                ps=subprocess.Popen([sys.executable,os.path.realpath(__file__),'-C',rc,'-c','Restore','-n','zw','-f','x',*args],
+                                    stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=nodsn,stdin=subprocess.DEVNULL,cwd=cwd,start_new_session=True,
+                                    preexec_fn=pre)
+                alive=None; so=b''; se=''
+                try:
+                    t0=time.monotonic()
+                    while not (os.path.exists(pidf) and (marker is None or os.path.exists(marker))) and time.monotonic()-t0<60 and ps.poll() is None: time.sleep(0.1)
+                    time.sleep(settle); os.kill(ps.pid,signal.SIGTERM)
+                    if noread:
+                        try: ps.wait(timeout=20); nr_code=ps.returncode
+                        except subprocess.TimeoutExpired: nr_code=None
+                        if nr_code is None: os.killpg(ps.pid,signal.SIGKILL); ps.wait()
+                    if burst:
+                        for _ in range(50):
+                            if ps.poll() is not None: break
+                            try: os.kill(ps.pid,signal.SIGTERM)
+                            except OSError: break
+                            time.sleep(0.02)
+                    if ign:
+                        time.sleep(1.5); alive=ps.poll() is None
+                        os.killpg(ps.pid,signal.SIGKILL)
+                    so,se=ps.communicate(timeout=60); se=se.decode('utf-8','replace')
+                finally:
+                    if ps.poll() is None:
+                        try: os.killpg(ps.pid,signal.SIGKILL)
+                        except OSError: pass
+                        ps.wait()
+                    try: bp=int(open(pidf).read())
+                    except (OSError,ValueError): bp=None
+                    gone=False
+                    if bp:   # revue 3 (row 51) : le borg factice (time.sleep 60) a bien été arrêté
+                        for _ in range(50):
+                            try:
+                                with open(f'/proc/{bp}/stat') as f_: zomb=f_.read().split(') ')[-1].startswith('Z')
+                            except OSError: gone=True; break
+                            if zomb: gone=True; break
+                            time.sleep(0.1)
+                        # vgap3 : toujours tué en fin, par son PID — seulement si c'est bien le borg factice (ligne de commande)
+                        try:
+                            with open(f'/proc/{bp}/cmdline','rb') as f_: cl=f_.read().split(b'\0')
+                        except OSError: cl=[]
+                        if os.fsencode(os.path.join(d,'borg')) in cl:
+                            try: os.kill(bp,signal.SIGKILL)
+                            except OSError: pass
+                if noread: return nr_code,so,se,gone
+                return (ps.returncode,so,se,gone) if not ign else (ps.returncode,so,se,gone,alive)
+            started=os.path.join(d,'slow-started')
+            with sec('vrai SIGTERM'):
+                c,so,se,gone=term_run('tarslow',['-b','b','-w',os.path.join(d,'slow.tar')],started)
+                res['vrai SIGTERM']=(c==143 and gone and '[INTERRUPTED] Restore arrêté (SIGTERM).' in se
+                                     and nobhr() and not os.path.exists(os.path.join(d,'slow.tar')),c,gone,se[-300:])
+            with sec('vrai SIGTERM, stdout'):
+                # revue 3 (row 39) : SIGTERM pendant -w - : stdout coupé (a et b livrés, marqueur), lecteur en échec, borg arrêté
+                c,so,se,gone=term_run('tarslow',['-b','b','-w','-'],started); got,raised,made_=reader(so)
+                res['vrai SIGTERM, stdout']=(c==143 and gone and got==['a','b'] and raised and made_==['a','b'] and so.count(MARK)==1,c,gone,got,len(so),se[-200:])
+            with sec('SIGTERM répétés'):
+                # vgap3 : SIGTERM en rafale (pendant le nettoyage aussi) -> temporaire retiré, borg arrêté, nettoyage fini ([INTERRUPTED]
+                # dit après) ; code 143, ou fin PAR le signal (-15, 143 pour un shell) si un SIGTERM arrive après la sortie (SIG_DFL rendu)
+                c,so,se,gone=term_run('tarslow',['-b','b','-w',os.path.join(d,'rafale.tar')],started,burst=True)
+                res['SIGTERM répétés']=(c in (143,-signal.SIGTERM) and gone and '[INTERRUPTED] Restore arrêté (SIGTERM).' in se
+                                        and nobhr() and not os.path.exists(os.path.join(d,'rafale.tar')),c,gone,se[-300:])
+            with sec('SIGTERM ignoré hérité'):
+                # vgap3 : CLI lancée avec SIGTERM ignoré -> l'ignore toujours (aucun 143) ; arrêtée par SIGKILL (dossier à part : son temporaire)
+                igd=os.path.join(d,'ign'); os.makedirs(igd)
+                c,so,se,gone,alive=term_run('tarslow',['-b','b','-w',os.path.join(igd,'i.tar')],started,ign=True)
+                res['SIGTERM ignoré hérité']=(alive is True and c==-signal.SIGKILL and '[INTERRUPTED]' not in se,alive,c,se[-200:])
+            with sec('SIGTERM pendant la sélection'):
+                # revue 3 (row 40) : SIGTERM pendant la sélection d'archive (borg list, boex non-flux) : 143, message SIGTERM, borg arrêté
+                c,so,se,gone=term_run('listslow',['-w',os.path.join(d,'sel')],None)
+                res['SIGTERM pendant la sélection']=(c==143 and gone and '[INTERRUPTED] Restore arrêté (SIGTERM).' in se and 'annulée par l\'utilisateur' not in se,c,gone,se[-300:])
+            hz=lambda h: [('zone témoin',frozenset({os.path.join(h,'cache')}),frozenset())]
+            with sec('seconde lecture en échec'):
+                # revue 2 (rows 4, 35, 37) : seconde lecture des liens physiques en échec -> code 2, cause dite, aucun « lien physique rompu »,
+                # le second nom listé sauté ; réussie mais écriture du second nom en échec -> compté UNE fois ; parents créés retirés (row 33)
+                mode('tarhard'); h=os.path.join(d,'h1d'); os.makedirs(h)
+                with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,_h=h,**k: hz(_h)): c,o=lib(h)
+                res['seconde lecture en échec']=(c==2 and '[ERREUR] flux interrompu : 0 élément restauré (fichiers finis gardés) — Connection closed by remote host' in o
+                                                and 'lien physique rompu' not in o and '[WARN] 1 élément sauté : lien physique : premier nom indisponible' in o
+                                                and '  ok2/h2' in o and not os.path.exists(os.path.join(h,'ok2')),c,o[-400:])
+            with sec('seconde lecture, un seul compte'):
+                mode('tarhard2'); h=os.path.join(d,'h2d'); os.makedirs(h)
+                with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,_h=h,**k: hz(_h)): c,o=lib(h,err=_errno.EFBIG,data=b'H2')
+                res['seconde lecture, un seul compte']=(c==1 and '[WARN] 1 élément sauté : erreur d\'écriture (File too large)' in o
+                                                       and 'lien physique : premier nom indisponible' not in o and 'lien physique rompu' not in o,c,o[-400:])
+            with sec('lien physique rompu : noms piégés'):
+                # vgap3 : [WARN] lien physique rompu — les deux noms échappés (_shown_path)
+                mode('tarhard4'); h=os.path.join(d,'h4d'); os.makedirs(h)
+                with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,_h=h,**k: hz(_h)): c,o=lib(h)
+                res['lien physique rompu : noms piégés']=(c==1 and '[WARN] lien physique rompu : ok2/h\\x1b2 écrit comme fichier indépendant (premier nom cache/h\\x0a1 non restauré)' in o
+                                                          and '\x1b' not in o and 'h\n1' not in o,c,o[-300:])
+            with sec('rien restauré : parents retirés'):
+                mode('tarsub'); e3=os.path.join(d,'e3')
+                c,o=lib(e3,err=_errno.EFBIG,data=b'f')
+                res['rien restauré : parents retirés']=(c==1 and not os.path.exists(e3) and "[WARN] 1 élément sauté : erreur d'écriture (File too large)" in o,c,o[-300:])
+            with sec('seconde lecture : lien réémis'):
+                # revue 3 (row 44) : seconde lecture, borg réémet le second nom en lien vers le premier sauté -> listé, compté une fois
+                mode('tarhard3'); h=os.path.join(d,'h3d'); os.makedirs(h)
+                with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,_h=h,**k: hz(_h)): c,o=lib(h)
+                res['seconde lecture : lien réémis']=(c==1 and '[WARN] 1 élément sauté : lien physique : premier nom indisponible' in o and '\n  ok2/h2' in o
+                                                     and 'lien physique rompu' not in o,c,o[-300:])
+            with sec('sélection vide'):
+                # revue 3 (row 45) : sélection vide -> « Rien restauré », destination créée retirée, code de borg (0)
+                mode('tarempty'); e4=os.path.join(d,'e4'); c,o=lib(e4)
+                res['sélection vide']=(c==0 and not os.path.exists(e4),c,o[-200:])
+                e=io.StringIO(); c='aucun'
+                with mock.patch('os.write',os.write),contextlib.redirect_stderr(io.StringIO()),contextlib.redirect_stdout(e):
+                    try: b.restore('zw','b','x',e4)
+                    except SystemExit as x: c=x.code
+                res['sélection vide : message']=("Rien restauré : aucun élément de la sélection" in e.getvalue() and 'Restauré dans' not in e.getvalue(),e.getvalue()[-200:])
+            with sec('verrou rendu pendant l\'attente'):
+                # revue 3 (row 41) : verrou de priorité rendu même interrompu pendant l'attente de l'Index
+                def stop_wait(*a,**k): raise KeyboardInterrupt('attente')
+                mode('tar2')
+                with mock.patch.object(BorgHelperDB,'wait_index_idle',stop_wait): c,o=lib(os.path.join(d,'e5'))
+                res['verrou rendu pendant l\'attente']=(c=='KeyboardInterrupt: attente' and not b.db.check_priority_lock('zw'),c)
+            with sec('bibliothèque : aucun gestionnaire'):
+                # revue 3 (row 49) : la bibliothèque ne touche à aucun signal (gestionnaire SIGTERM inchangé pendant restore())
+                seen=[]; before_h=signal.getsignal(signal.SIGTERM)
+                def peek(*a,**k): seen.append(signal.getsignal(signal.SIGTERM)); raise KeyboardInterrupt('vu')
+                with mock.patch.object(BorgHelper,'_restore_stream',peek): c,o=lib(os.path.join(d,'e6'))
+                res['bibliothèque : aucun gestionnaire']=(seen==[before_h] and signal.getsignal(signal.SIGTERM) is before_h,seen,before_h)
+            # revue 3 (rows 42, 43) : .tar « vide » = fichier ordinaire de 0 o (droits repris) ; fifo : refus, intacte ; .tgz vide accepté ;
+            # zone apparue entre le contrôle en tête et l'écriture : vue (zones recalculées), aucun borg
+            with sec('.tar vide 0600'):
+                v6=os.path.join(d,'v600.tar'); open(v6,'w').close(); os.chmod(v6,0o600); mode('tar2')
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',v6)
+                res['.tar vide 0600']=(code==0 and stat.S_IMODE(os.stat(v6).st_mode)==0o600 and os.path.getsize(v6)>0,code,oct(os.stat(v6).st_mode),err[-200:])
+            with sec('fifo nommée .tar'):
+                ff=os.path.join(d,'fifo.tar'); os.mkfifo(ff)
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',ff)
+                res['fifo nommée .tar']=(code==3 and f"[ERREUR] {ff} : pas un fichier ordinaire — rien écrit" in err and stat.S_ISFIFO(os.lstat(ff).st_mode),code,err[-200:])
+            with sec('.tgz vide'):
+                vg=os.path.join(d,'vide.tgz'); open(vg,'w').close(); mode('tar2')
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',vg)
+                try:
+                    with _s114_tf.open(vg) as t: ng=t.getnames()
+                except (OSError,_s114_tf.TarError) as x: ng=repr(x)
+                res['.tgz vide']=(code==0 and ng==['a','b'],code,ng,err[-200:])
+            def zones_late(zp):
+                n_=[0]
+                def f(self,nick=None,**k):
+                    n_[0]+=1
+                    return [] if n_[0]==1 else [('zone apparue',frozenset({zp}),frozenset())]
+                return f,n_
+            with sec('zone apparue avant l\'écriture'):
+                zz=os.path.join(d,'zz'); f,n_=zones_late(zz)
+                if os.path.exists(calls): os.unlink(calls)
+                with mock.patch.object(BorgHelper,'_restore_zones',f): c,o=lib(zz)
+                try: lg=open(calls).read()
+                except OSError: lg=''
+                res['zone apparue avant l\'écriture']=(c==1 and '[WARN] rien restauré : destination dans une zone protégée (zone apparue)' in o
+                                                       and 'export-tar' not in lg and n_[0]==2 and not os.path.exists(zz),c,n_[0],lg,o[-200:])
+            # vgap3 : fichier tar dans une zone — chacun des deux contrôles prouvé : en tête (aucun avis, aucun verrou, aucun borg) ;
+            # juste avant l'écriture (zone apparue après le début : avis dit, verrou pris puis rendu, aucun export-tar, rien écrit)
+            def lib_lock(dest,zf):
+                locks=[]; e_=io.StringIO(); c='aucun'
+                real_l=BorgHelperDB.set_priority_lock
+                def lk(self_,*a,**k): locks.append(a); return real_l(self_,*a,**k)
+                if os.path.exists(calls): os.unlink(calls)
+                with mock.patch.object(BorgHelper,'_restore_zones',zf),mock.patch.object(BorgHelperDB,'set_priority_lock',lk),\
+                     contextlib.redirect_stderr(e_),contextlib.redirect_stdout(io.StringIO()):
+                    try: b.restore('zw','b','x',dest)
+                    except SystemExit as x: c=x.code
+                try: lg=open(calls).read()
+                except OSError: lg=''
+                return c,e_.getvalue(),locks,lg
+            with sec('tar dans une zone : contrôle en tête'):
+                zt=os.path.join(d,'zt'); os.makedirs(zt); mode('tar2')
+                c,o,locks,lg=lib_lock(os.path.join(zt,'t.tar'),lambda self,nick=None,**k: [('zone témoin',frozenset({zt}),frozenset())])
+                res['tar dans une zone : contrôle en tête']=(c==3 and f"[ERREUR] destination {os.path.join(zt,'t.tar')} : dans une zone protégée (zone témoin) — fichier tar refusé, rien écrit" in o
+                                                           and _RESTORE_SAFE_NOTE not in o and locks==[] and lg=='' and os.listdir(zt)==[],c,locks,lg,o[-300:])
+            with sec('tar dans une zone : contrôle avant l\'écriture'):
+                zt2=os.path.join(d,'zt2'); os.makedirs(zt2); f,n_=zones_late(zt2)
+                c,o,locks,lg=lib_lock(os.path.join(zt2,'t.tar'),f)
+                res['tar dans une zone : contrôle avant l\'écriture']=(c==3 and f"[ERREUR] destination {os.path.join(zt2,'t.tar')} : dans une zone protégée (zone apparue) — fichier tar refusé, rien écrit" in o
+                                                                      and _RESTORE_SAFE_NOTE in o and locks==[('zw',)] and not b.db.check_priority_lock('zw')
+                                                                      and 'export-tar' not in lg and os.listdir(zt2)==[] and n_[0]==2,c,locks,n_[0],lg,o[-300:])
+            # revue 4 (row 53) : coupe de stdout en processus (stdout = fichier), interruption injectée aux deux bords d'un membre :
+            # avant l'écriture de son en-tête, et après addfile avant la remise à zéro -> frontière : marqueur, lecteur en échec
+            def lib_out(m,patches=()):
+                mode(m); of=os.path.join(d,f'out-{m}.bin'); e_=io.StringIO(); c='aucun'
+                with open(of,'wb') as fb:
+                    w_=io.TextIOWrapper(fb,encoding='utf-8')
+                    try:
+                        with contextlib.ExitStack() as es:
+                            for p_ in patches: es.enter_context(p_)
+                            es.enter_context(contextlib.redirect_stderr(e_)); es.enter_context(contextlib.redirect_stdout(w_))
+                            try: b.restore('zw','b','x','-')
+                            except SystemExit as x: c=x.code
+                    except BaseException as x: c=f"{type(x).__name__}: {x}"
+                    try: w_.flush()
+                    except (OSError,ValueError): pass
+                    w_.detach()
+                return c,open(of,'rb').read(),e_.getvalue()
+            real_add=_s114_tf.TarFile.addfile
+            for when,want_got in (('avant',['a']),('après',['a','b'])):
+                nm_=f'stdout : interruption {when} addfile'
+                with sec(nm_):
+                    def add_ki(self_,ti,f=None,_w=when):
+                        if ti.name=='b' and _w=='avant': raise KeyboardInterrupt('avant')
+                        r_=real_add(self_,ti,f)
+                        if ti.name=='b' and _w=='après': raise KeyboardInterrupt('après')
+                        return r_
+                    c,data,o=lib_out('tar2',[mock.patch.object(_s114_tf.TarFile,'addfile',add_ki)])
+                    got,raised,made_=reader(data)
+                    res[nm_]=(c==130 and got==want_got and raised and made_==want_got and data.count(MARK)==1,c,got,raised,len(data),o[-200:])
+            with sec('stdout : marqueur impossible'):
+                # revue 4 (row 55) : _create_header (API privée) en échec -> aucun marqueur, code 2, aucune trace
+                real_ch=_s114_tf.TarInfo._create_header
+                def ch_fail(info,*a,**k):
+                    if info.get('name')=='././@LongLink': raise TypeError('api changée')
+                    return real_ch(info,*a,**k)
+                c,data,o=lib_out('tarcutb',[mock.patch.object(_s114_tf.TarInfo,'_create_header',staticmethod(ch_fail))])
+                res['stdout : marqueur impossible']=(c==2 and MARK not in data and 'Traceback' not in o and 'TypeError' not in o,c,len(data),o[-200:])
+            with sec('stdout : lecteur figé, SIGTERM'):
+                # revue 4 (row 54) : stdout jamais lu (tube plein) -> SIGTERM : sortie en 143 en quelques secondes, borg arrêté
+                t0=time.monotonic()
+                c,so,se,gone=term_run('tarbig',['-b','b','-w','-'],None,noread=True,settle=1.5)
+                res['stdout : lecteur figé, SIGTERM']=(c==143 and gone and '[INTERRUPTED] Restore arrêté (SIGTERM).' in se and 'Traceback' not in se and 'Exception ignored' not in se,
+                                                     c,gone,round(time.monotonic()-t0,1),se[-300:])
+            with sec('stdout : lecteur parti'):
+                # revue 4 (row 56) : lecteur qui ferme après 1000 octets (| head -c) -> code 0 comme 1.0.212, jamais 120, borg arrêté
+                mode('tarbig'); pidf=os.path.join(d,'borg-pid')
+                if os.path.exists(pidf): os.unlink(pidf)
+                ps=subprocess.Popen([sys.executable,os.path.realpath(__file__),'-C',rc,'-c','Restore','-n','zw','-b','b','-f','x','-w','-'],
+                                    stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=nodsn,stdin=subprocess.DEVNULL,cwd=d,start_new_session=True)
+                try:
+                    ps.stdout.read(1000); ps.stdout.close()
+                    try: se=ps.stderr.read().decode('utf-8','replace'); ps.wait(timeout=30)
+                    except subprocess.TimeoutExpired: se='(délai)'
+                finally:
+                    if ps.poll() is None:
+                        os.killpg(ps.pid,signal.SIGKILL); ps.wait()
+                try: bp=int(open(pidf).read())
+                except (OSError,ValueError): bp=None
+                alive_=False
+                if bp:
+                    for _ in range(50):
+                        try:
+                            with open(f'/proc/{bp}/stat') as f_: alive_=not f_.read().split(') ')[-1].startswith('Z')
+                        except OSError: alive_=False
+                        if not alive_: break
+                        time.sleep(0.1)
+                    try:
+                        with open(f'/proc/{bp}/cmdline','rb') as f_:
+                            if os.fsencode(os.path.join(d,'borg')) in f_.read().split(b'\0'): os.kill(bp,signal.SIGKILL)
+                    except OSError: pass
+                res['stdout : lecteur parti']=(ps.returncode==0 and bp is not None and not alive_ and 'Traceback' not in se and 'Exception ignored' not in se,
+                                              ps.returncode,bp,alive_,se[-300:])
+            with sec('.tar lien cassé'):
+                # revue 4 (row 55) : .tar qui est un lien cassé -> remplacé par le tar (comme avant), cible jamais créée
+                lc=os.path.join(d,'casse.tar'); os.symlink(os.path.join(d,'cible-absente'),lc); mode('tar2')
+                code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',lc)
+                try:
+                    with _s114_tf.open(lc) as t: nl=t.getnames()
+                except (OSError,_s114_tf.TarError) as x: nl=repr(x)
+                res['.tar lien cassé']=(code==0 and not os.path.islink(lc) and nl==['a','b'] and not os.path.lexists(os.path.join(d,'cible-absente')),code,nl,err[-200:])
+            with sec('tar : [WARN] des zones en appel direct'):
+                # revue 4 (row 55) : _restore_safe_tar appelé sans zones -> relecture NON silencieuse ; par restore() : silencieuse
+                qs=[]
+                def zq(self,nick=None,quiet=False): qs.append(quiet); return []
+                mode('tar2')
+                with mock.patch.object(BorgHelper,'_restore_zones',zq),contextlib.redirect_stderr(io.StringIO()),contextlib.redirect_stdout(io.StringIO()):
+                    try: b._restore_safe_tar('zw','b','x',os.path.join(d,'direct.tar'))
+                    except SystemExit: pass
+                    q1=list(qs); qs.clear()
+                    try: b.restore('zw','b','x',os.path.join(d,'direct2.tar'))
+                    except SystemExit: pass
+                res['tar : [WARN] des zones en appel direct']=(q1==[False] and qs==[False,True],q1,qs)
+            with sec('SIGTERM après un SystemExit absorbé'):
+                # revue 4 (row 55) : SIGTERM reçu dans un `except SystemExit:` interne -> 143 (pas le code absorbé) ; SIGTERM pendant la
+                # sortie d'un Restore fini (verrou rendu) -> son code
+                def kill_me():
+                    os.kill(os.getpid(),signal.SIGTERM)
+                    for _ in range(50): time.sleep(0.01)
+                prev=signal.signal(signal.SIGTERM,signal.SIG_DFL); ca=cf='aucun'
+                try:
+                    try:
+                        with contextlib.redirect_stderr(io.StringIO()),_rs():
+                            try: sys.exit(2)
+                            except SystemExit: kill_me()
+                    except SystemExit as x: ca=x.code
+                    real_cl=BorgHelperDB.clear_priority_lock
+                    def cl_term(self_,*a,**k): r_=real_cl(self_,*a,**k); kill_me(); return r_
+                    try:
+                        with mock.patch.object(BorgHelper,'_restore_safe_tar',lambda *a,**k: sys.exit(5)),mock.patch.object(BorgHelperDB,'clear_priority_lock',cl_term), \
+                             contextlib.redirect_stderr(io.StringIO()),contextlib.redirect_stdout(io.StringIO()),_rs():
+                            b.restore('zw','b','x',os.path.join(d,'fin.tar'))
+                    except SystemExit as x: cf=x.code
+                finally: signal.signal(signal.SIGTERM,prev)
+                res['SIGTERM après un SystemExit absorbé']=(ca==143 and cf==5,ca,cf)
+            with sec('boex : interrompu au lancement'):
+                # revue 4 (row 55) : Popen dans le try de boex — interruption avant que borg soit connu : 130, aucune trace
+                e_=io.StringIO(); c='aucun'
+                def popen_ki(*a,**k): raise KeyboardInterrupt('lancement')
+                with mock.patch('subprocess.Popen',popen_ki),contextlib.redirect_stderr(e_),contextlib.redirect_stdout(io.StringIO()):
+                    try: b.borg.boex('zw',['list','--json'])
+                    except SystemExit as x: c=x.code
+                    except BaseException as x: c=f"{type(x).__name__}: {x}"
+                res['boex : interrompu au lancement']=(c==130 and "[INTERRUPTED] Opération annulée par l'utilisateur." in e_.getvalue(),c,e_.getvalue()[-200:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore mode sûr de bout en bout (borg factice) : disque plein, chemins non normalisés du tar, flux coupé sans fin d'archive, tar existant illisible ou vide, interruptions, seconde lecture",_s114_flux)
         # 1.0.173 (story 36, A64) : une seule règle de message d'échec (_rb_errmsg)
         def _errmsg_rule():
             """_boex_last_modified (3, entière) et _boex_check_stdout (2, 100) : HORS plantage, MÊME texte que la règle de 1.0.173
@@ -31008,6 +33002,135 @@ sys.exit(0)
             for x in fails: print(f"  externe : {x}")
             return not fails
         _rbc("dépôt externe réel : Index + lecture + Restore ; Bkp/Prune/DelBkp refusés (code 4, aucun borg) ; -n ALL ; EXTERNAL_OPS élargie ; Mount/Prune sans clés",_ex_real)
+        def _s114_real():
+            """1.0.214 (story 114) : Restore sur vrai borg (dépôt neuf, archives par borg create) — mode sûr (défaut) = --fidele sur
+            contenu, droits, setuid, dates (s) des fichiers, dossiers et liens, liens symboliques, liens physiques, fifo, nom non
+            UTF-8, fichier de plusieurs Mo ; avis du mode sûr (commande --fidele complète) et du mode fidèle ; mode sûr : seul
+            `borg export-tar` lancé (aucun list, aucun extract) ; --fidele [--creux] : `borg extract` [--sparse] ; zones (bases, rc,
+            dépôt) sautées, code 1 ; racines imbriquées : lien créé, éléments sautés, --liens-en-dossiers ; flux coupé (borg
+            interrompu) : fichiers finis gardés et complets, aucun temporaire, code 2 ; tar/tgz et stdout : mêmes entrées que --fidele."""
+            import tarfile as tfm,hashlib
+            d=os.path.join(tmp,'s114real'); src=os.path.join(d,'src'); R=os.path.join(src,'root'); bb=os.path.join(d,'bb')
+            repo=os.path.join(d,'repo'); log=os.path.join(d,'borg.log'); w=os.path.join(d,'borgw'); wcut=os.path.join(d,'borgw-cut')
+            for x in ('d/sub','perm','liens','hard','spec','vide'): os.makedirs(os.path.join(R,x))
+            def put(p,data,mode=None,mt=None):
+                with open(os.path.join(R,p),'wb') as f: f.write(data)
+                if mode is not None: os.chmod(os.path.join(R,p),mode)
+                if mt is not None: os.utime(os.path.join(R,p),(mt,mt))
+            put('d/a',b'contenu a\n'); put('d/sub/b',b'b\n'); put('perm/f751',b'x',0o751,1500000000); put('perm/f4755',b'x',0o4755,1600000000)
+            put('perm/f600',b'x',0o600); put('hard/h1',b'lien physique\n'); os.link(os.path.join(R,'hard/h1'),os.path.join(R,'hard/h2'))
+            put('gros',os.urandom(5<<20))
+            with open(os.path.join(os.fsencode(R),b'd',b'nom-\xe9t\xe9'),'wb') as f: f.write(b'latin1\n')
+            os.symlink('/etc/hostname',os.path.join(R,'liens/abs')); os.symlink('../perm/f751',os.path.join(R,'liens/rel'))
+            os.utime(os.path.join(R,'liens/rel'),(1400000000,1400000000),follow_symlinks=False); os.mkfifo(os.path.join(R,'spec/fifo'))
+            os.chmod(os.path.join(R,'d/sub'),0o750); os.utime(os.path.join(R,'d/sub'),(1300000000,1300000000))
+            os.chmod(os.path.join(R,'vide'),0o700); os.utime(os.path.join(R,'vide'),(1200000000,1200000000))
+            Z=os.path.join(d,'zsrc'); os.makedirs(os.path.join(Z,'cache')); os.makedirs(os.path.join(Z,'repo')); os.makedirs(os.path.join(Z,'ok'))
+            for p,v in (('cache/x.db',b'pas une base'),('rc',b'[pirate]'),('repo/config',b'faux'),('ok/f',b'ok')):
+                with open(os.path.join(Z,p),'wb') as f: f.write(v)
+            H=os.path.join(d,'hsrc'); os.makedirs(os.path.join(H,'cache')); os.makedirs(os.path.join(H,'ok2'))   # revue 1 (M17) : décision 14
+            with open(os.path.join(H,'cache','h1'),'w') as f: f.write('contenu partagé\n')
+            os.link(os.path.join(H,'cache','h1'),os.path.join(H,'ok2','h2'))
+            N=os.path.join(d,'nsrc'); os.makedirs(os.path.join(N,'real','sub'))
+            with open(os.path.join(N,'real','sub','f'),'w') as f: f.write('sous le lien')
+            os.symlink('real',os.path.join(N,'lnk'))
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-s114'); borg=shutil.which('borg'); fails=[]
+            for cmd,cwd in ((['init','-e','repokey',repo],d),(['create',repo+'::fid','root'],src),(['create',repo+'::zones','cache','rc','repo','ok'],Z),
+                            (['create',repo+'::nested','lnk','lnk/sub'],N),(['create',repo+'::hardz','cache','ok2'],H)):
+                r=subprocess.run([borg]+cmd,env=env,cwd=cwd,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+                if r.returncode!=0: print(f"  borg {cmd[0]} : {r.stderr[-200:]}"); return False
+            _rb_wrapper(w,bb,f"echo \"$*\" >> {shlex.quote(log)}\n")
+            _rb_wrapper(wcut,bb,f"if [ \"$1\" = export-tar ]; then set -o pipefail; {shlex.quote(w)} \"$@\" | head -c 2500000; exit 2; fi\n")
+            rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                base=f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-s114\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n"
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nDB_ENCRYPT=false\nSTORAGE_ALERT=off\n\n[s]\n{base}BORG_EXE={w}\n\n[cut]\n{base}BORG_EXE={wcut}\n")
+            os.chmod(rc,0o600)
+            me=os.path.realpath(__file__); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                try: os.unlink(log)
+                except OSError: pass
+                p=_rb_run([me,'-C',rc,'-c','Restore',*a],300,env=cenv)
+                try: lg=[l for l in open(log).read().splitlines() if l]
+                except OSError: lg=[]
+                return p.returncode,p.stdout,p.stderr,lg
+            def tree(top):
+                out={}; ino={}
+                for root,ds,fs in os.walk(top):
+                    for n in ds+fs:
+                        p=os.path.join(root,n); st=os.lstat(p); k=os.path.relpath(p,top)
+                        e=(stat.S_IFMT(st.st_mode),stat.S_IMODE(st.st_mode) if not stat.S_ISLNK(st.st_mode) else None,int(st.st_mtime))
+                        if stat.S_ISREG(st.st_mode):
+                            e+=(hashlib.sha1(open(p,'rb').read()).hexdigest(),); ino.setdefault(st.st_ino,[]).append(k)
+                        if stat.S_ISLNK(st.st_mode): e+=(os.readlink(p),)
+                        out[k]=e
+                return out,sorted(sorted(v) for v in ino.values() if len(v)>1)
+            o=os.path.join(d,'out'); os.makedirs(o)
+            c1,s1,e1,l1=cli('-n','s','-b','fid','-f','root','-w',os.path.join(o,'sur'))
+            c2,s2,e2,l2=cli('-n','s','-b','fid','-f','root','-w',os.path.join(o,'fid'),'--fidele')
+            ts,tf_=tree(os.path.join(o,'sur')),tree(os.path.join(o,'fid')); tsrc=tree(src)
+            if not (c1==0 and c2==0 and ts==tf_ and ts==tsrc and len(ts[0])==20 and ts[1]==[['root/hard/h1','root/hard/h2']]):
+                diff=sorted(k for k in set(ts[0])|set(tf_[0]) if ts[0].get(k)!=tf_[0].get(k))
+                fails.append(f"fidélité : codes {c1}/{c2}, {len(ts[0])} éléments, écarts {diff[:5]} liens physiques {ts[1]} {tf_[1]} {e1[-200:]!r}")
+            # revue 1 (M21) : textes de la spec en dur (décision 4, AC4), commande --fidele attendue construite ici
+            SAFE="mode sûr : attributs étendus et ACL non restaurés (--fidele pour les restaurer)"
+            note="  mode fidèle (aucune protection des bases, du dépôt et du rc) : "+' '.join(shlex.quote(x) for x in
+                 [me,'-C',rc,'-c','Restore','-n','s','-b','fid','-f','root','-w',os.path.join(o,'sur'),'--fidele'])
+            if (SAFE not in e1.splitlines() or note not in e1.splitlines() or "mode fidèle : aucune protection des bases, du dépôt et du rc" not in e2.splitlines()
+                    or SAFE in e2):
+                fails.append(f"avis : {e1[-300:]!r} / {e2[-200:]!r}")
+            if [l.split()[0] for l in l1]!=['export-tar'] or [l.split()[0] for l in l2]!=['extract'] or '--sparse' in l2[0]:
+                fails.append(f"appels de borg : sûr {l1} ; fidèle {l2}")
+            c,_,e,lg=cli('-n','s','-b','fid','-f','root/d','-w',os.path.join(o,'creux'),'--fidele','--creux')
+            if c!=0 or len(lg)!=1 or not lg[0].startswith('extract --numeric-ids --sparse '): fails.append(f"--creux : {c} {lg} {e[-200:]!r}")
+            # zones : restauration -w <dossier du rc> d'une archive qui contient rc, cache/, repo/
+            h=lambda p: hashlib.sha1(open(p,'rb').read()).hexdigest()
+            before=(h(rc),h(os.path.join(repo,'config')))
+            c,_,e,lg=cli('-n','s','-b','zones','-f','**','-w',d)
+            if not (c==1 and (h(rc),h(os.path.join(repo,'config')))==before and not os.path.exists(os.path.join(d,'cache','x.db'))
+                    and open(os.path.join(d,'ok','f')).read()=='ok' and [l.split()[0] for l in lg]==['export-tar']
+                    and '[WARN] 2 éléments sautés : bases de borgHelper' in e and '[WARN] 1 élément sauté : fichier rc' in e
+                    and '[WARN] 2 éléments sautés : dépôt borg local' in e and '  repo/… (2 éléments)' in e):
+                fails.append(f"zones : code {c} {lg} {e[-500:]!r}")
+            # revue 1 (M17) : lien physique dont le premier nom (cache/h1) est dans une zone -> second nom écrit comme fichier
+            # indépendant par une seconde lecture export-tar de ce seul chemin, [WARN] dit après l'écriture, code 1
+            c,_,e,lg=cli('-n','s','-b','hardz','-f','**','-w',d)
+            h2=os.path.join(d,'ok2','h2')
+            if not (c==1 and os.path.isfile(h2) and open(h2).read()=='contenu partagé\n' and os.stat(h2).st_nlink==1
+                    and not os.path.exists(os.path.join(d,'cache','h1')) and [l.split()[0] for l in lg]==['export-tar','export-tar']
+                    and lg[1].endswith(' pp:ok2/h2')
+                    and '[WARN] lien physique rompu : ok2/h2 écrit comme fichier indépendant (premier nom cache/h1 non restauré)' in e):
+                fails.append(f"lien physique rompu : code {c} {lg} {e[-400:]!r}")
+            c,_,e,_=cli('-n','s','-b','nested','-f','lnk','-w',os.path.join(o,'n1'))
+            if not (c==1 and os.readlink(os.path.join(o,'n1','lnk'))=='real' and os.listdir(os.path.join(o,'n1'))==['lnk']
+                    and "[WARN] 2 éléments sautés : sous un lien de l'archive (--liens-en-dossiers : vrai dossier à la place du lien)" in e
+                    and '  lnk/… (2 éléments)' in e):
+                fails.append(f"racines imbriquées : {c} {e[-300:]!r}")
+            c,_,e,_=cli('-n','s','-b','nested','-f','lnk','-w',os.path.join(o,'n2'),'--liens-en-dossiers')
+            if not (c==0 and not os.path.islink(os.path.join(o,'n2','lnk')) and open(os.path.join(o,'n2','lnk','sub','f')).read()=='sous le lien'):
+                fails.append(f"--liens-en-dossiers : {c} {e[-300:]!r}")
+            c,_,e,_=cli('-n','cut','-b','fid','-f','root','-w',os.path.join(o,'cut'))
+            kept=tree(os.path.join(o,'cut'))[0]; tmpf=[k for k in kept if '.bhr' in k]
+            partial=[k for k,v in kept.items() if v[0]==stat.S_IFREG and v!=tsrc[0].get(k)]
+            if not (c==2 and '[ERREUR] flux interrompu après « ' in e and 'fichiers finis gardés' in e and not tmpf and not partial and kept):
+                fails.append(f"flux coupé : code {c}, temporaires {tmpf}, incomplets {partial}, gardés {len(kept)} {e[-300:]!r}")
+            def mlist(x):   # revue 1 (F15) : contenu compris (sha1 des fichiers)
+                return sorted((m.name,m.type,m.mode,m.size,m.linkname,int(m.mtime),hashlib.sha1(x.extractfile(m).read()).hexdigest() if m.isreg() else '')
+                              for m in x.getmembers())
+            def members(t):
+                with tfm.open(t) as x: return mlist(x)
+            ca,_,ea,_=cli('-n','s','-b','fid','-f','root','-w',os.path.join(o,'s.tgz'))
+            cb,_,eb,_=cli('-n','s','-b','fid','-f','root','-w',os.path.join(o,'f.tgz'),'--fidele')
+            r=subprocess.run([sys.executable,me,'-C',rc,'-c','Restore','-n','s','-b','fid','-f','root','-w','-'],env=cenv,capture_output=True,timeout=300,stdin=subprocess.DEVNULL)
+            try:
+                with tfm.open(fileobj=io.BytesIO(r.stdout)) as x: so=mlist(x)
+            except tfm.TarError as x_: so=repr(x_)
+            ms,mf=members(os.path.join(o,'s.tgz')),members(os.path.join(o,'f.tgz'))
+            if not (ca==0 and cb==0 and r.returncode==0 and ms==mf and so==ms and len(ms)==20 and SAFE.encode() in r.stderr):
+                fails.append(f"tar : codes {ca}/{cb}/{r.returncode} ; écarts {sorted(set(ms)^set(mf))[:4]} ; stdout {so if isinstance(so,str) else len(so)}")
+            for x in fails: print(f"  {x}")
+            return not fails
+        _rbc("Restore mode sûr sur vrai borg : = --fidele (sauf xattr/ACL), seul export-tar lancé, zones, racines imbriquées, flux coupé, tar",_s114_real)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE
@@ -32706,7 +34829,11 @@ def _cli_main():
         else:
             if '-W' in options: where=options['-W']; flat=True
             else: where=options['-w']; flat=False
-            bh.restore(nick,bid,options['-f'],where,flat=flat,debug=debug)
+            # 1.0.214 (story 114, revue 3 row 49) : SIGTERM -> nettoyage, posé ICI (point d'entrée de la commande, mode sûr), jamais
+            # par BorgHelper.restore() (bibliothèque)
+            with (contextlib.nullcontext() if '--fidele' in options else _restore_sigterm()):
+                bh.restore(nick,bid,options['-f'],where,flat=flat,debug=debug,fidele='--fidele' in options,sparse='--creux' in options,
+                           links_as_dirs='--liens-en-dossiers' in options,by_name='--par-nom' in options)
     elif cmd=='delbkp':
         bh.delbkp(nick,options['-b'],debug=debug)
     elif cmd=='bkp':

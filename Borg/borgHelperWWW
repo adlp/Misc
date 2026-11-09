@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress,threading
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress,threading,unicodedata
 from pathlib import Path
 from typing import Optional, Dict
 from collections import defaultdict, deque
@@ -66,6 +66,7 @@ def _push_deps_hint(err):
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args, _pid_stat,
+                         _restore_cli_line,_RESTORE_FIDELE_CMD,   # 1.34.2 (story 114) : commandes CLI équivalentes de POST /restore
                          _close_quiet,   # 1.31.17 (story 81) : fermeture garantie des ensure_*
                          _db_busy,   # 1.31.19 (story 84) : verrou passager du contrôle de schéma
                          DbKeyError, DbTamperError, DbCodecError, _duidx_group_spec,
@@ -84,7 +85,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.34.1"
+WWW_VERSION="1.34.2"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -4780,11 +4781,46 @@ def restore(nick: str, ftor: str, where: str, request: Request, bid: Optional[st
             x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
     require_api_key(x_api_key)
     dest=_restore_where(where)   # 1.29.0 (A68) : sous RESTORE_ROOT seulement, avant tout le reste
+    # 1.34.2 (revue 1 de la story 114, row 18) : caractère de contrôle dans le chemin -> 400 (la ligne --fidele réécrite par
+    # _restore_with_cli n'en couvrirait qu'une ligne : réponse d'un chemin hors périmètre distinguable)
+    for _k,_v in (('ftor',ftor),('bid',bid or ''),('where',where or '')):   # revue 2 (row 30) : bid et where aussi
+        # revue 3/4 (rows 48, 52) : caractère qui coupe une ligne ou pilote le terminal (C0, C1 dont U+0085, U+2028/2029) — jamais
+        # les espaces Unicode (U+00A0, U+202F des noms de captures macOS), ZWJ ni les octets non UTF-8 d'un nom (surrogates)
+        if any(unicodedata.category(c) in ('Cc','Zl','Zp') for c in _v): raise HTTPException(400,detail=f"{_k} : caractère de contrôle refusé")
     decoy=None if require_path_in_scope(request,nick,ftor) else _oos_decoy(ftor)  # hors périmètre : leurre (1.27.5)
     extra=['-f',decoy or ftor,'-W' if flat else '-w',dest]
     if bid: extra+=['-b',bid]
     resp=run_borghelper('restore',nick=nick,extra_args=extra,passphrase=x_borg_passphrase)
-    return _oos_swap(resp,decoy,ftor) if decoy else resp
+    return _restore_with_cli(_oos_swap(resp,decoy,ftor) if decoy else resp,nick,bid,ftor,dest,flat)
+
+def _restore_cli_commands(nick,bid,ftor,dest,flat,out_text=''):
+    """1.34.2 (story 114, décisions 6, 13 et 16 ; borgHelper 1.0.214) : commandes CLI équivalentes d'un POST /restore (toujours en
+    mode sûr, seul mode de borgHelperWWW) — {'sur', 'fidele'} : borgHelper exécuté par ce serveur, `-C` du rc du nick (mode dossier :
+    rc du préfixe, nick nu), archive exacte (`bid`, sinon celle que Restore a choisie et dite dans `out_text`), chemin demandé (jamais
+    le leurre hors périmètre) et destination résolue, cités pour le shell ; jamais de passphrase. None si le rc est inconnu."""
+    if not DIR_MODE: rc,bn=CFGFILE,nick
+    else:
+        e,b=_rc_entry_of(nick)
+        if e is None: return None
+        rc,bn=e.path,b
+    if not bid or bid=='last':   # revue 1 (row 18) : « last » = l'archive que Restore a choisie et dite
+        m=re.search(r"^Archive sélectionnée (?:depuis l'index|\(dernière\)) : (.+)$",out_text or '',re.M)
+        bid=m.group(1) if m else bid   # revue 2 (row 31) : ligne absente -> `bid` gardé (« last » compris), jamais perdu
+    exe=[sys.executable,os.path.realpath(str(BORGHELPER_BIN))]   # revue 1 (row 18) : comme _build_borghelper_argv_env le lance
+    return {k:_restore_cli_line(rc,bn,bid,ftor,dest,flat,fidele=(k=='fidele'),exe=exe) for k in ('sur','fidele')}
+
+def _restore_with_cli(resp,nick,bid,ftor,dest,flat):
+    """Réponse de POST /restore + `cli` (_restore_cli_commands), statut et autres champs inchangés. La ligne de l'avis du mode sûr qui
+    porte la commande --fidele (stderr de Restore) est remplacée par celle de `cli` : chemin DEMANDÉ cité pour le shell — hors
+    périmètre, Restore a cité le leurre, pas le chemin (réponse identique à celle d'un chemin réellement absent, 1.27.5)."""
+    try: data=json.loads(resp.body)
+    except ValueError: return resp
+    if not isinstance(data,dict): return resp
+    cli=data['cli']=_restore_cli_commands(nick,bid,ftor,dest,flat,(data.get('stdout') or '')+'\n'+(data.get('stderr') or ''))
+    if cli and isinstance(data.get('stderr'),str):
+        data['stderr']='\n'.join(_RESTORE_FIDELE_CMD+cli['fidele'] if l.startswith(_RESTORE_FIDELE_CMD) else l for l in data['stderr'].split('\n'))
+    hd={k:v for k,v in resp.headers.items() if k.lower() not in ('content-length','content-type')}   # revue 1 (row 18) : en-têtes repris
+    return JSONResponse(status_code=resp.status_code,content=data,headers=hd)
 
 @router.delete("/delbkp",response_model=CommandResult,tags=["mutation"],summary="⚡ Supprime une archive sur le dépôt — irréversible")
 def delbkp(nick: str, bid: str, x_api_key: Optional[str]=Header(default=None),
@@ -8383,6 +8419,75 @@ def push_selftest():
                 if _internal is None: print("SKIP racine de restauration : aucun nick interne dans ce rc")
                 else: check("POST /restore sous la racine de restauration seulement : 403 sans racine/hors racine/lien, 409 si remplie, chemin résolu transmis, « / » refusé (A68)",
                             _restore_root)
+                def _restore_cli():
+                    """1.34.2 (story 114, décisions 6, 13, 16) : POST /restore lance Restore en mode sûr (ni --fidele, ni --creux, ni
+                    --liens-en-dossiers dans l'argv) et répond `cli` = commandes équivalentes sûr et --fidele : relues par shlex = argv
+                    attendu (borgHelper de ce serveur, -C du rc, nick, archive exacte : -b donné ou celle dite par Restore, chemin
+                    demandé et destination résolue), --fidele seulement dans la seconde, jamais de passphrase (X-Borg-Passphrase ni
+                    rc) ; hors périmètre : chemin demandé, jamais le leurre ; statut et stdout/stderr inchangés."""
+                    import shlex
+                    root=os.path.realpath(os.path.join(tmpdir,'restore-cli')); os.makedirs(root,exist_ok=True)
+                    def post(params,out,code=0,decoy=False):
+                        res=CommandResult(exitcode=code,stdout=out,stderr='mode sûr : x')
+                        with mock.patch(f"{__name__}.RESTORE_ROOT",root), \
+                             mock.patch(f"{__name__}._exec_borghelper",return_value=res) as ex, \
+                             mock.patch(f"{__name__}.require_path_in_scope",lambda *a,**k: not decoy):
+                            r=client.post(f"{P}/restore",headers={**H,'X-Borg-Passphrase':'secret-s114'},
+                                          params={'nick':_internal,'ftor':"etc/a b'c",'where':'d e',**params})
+                        return r,(ex.call_args[0][2] if ex.called else None)
+                    exe=os.path.realpath(str(BORGHELPER_BIN))
+                    rc=os.path.abspath(_rc_entry_of(_internal)[0].path if DIR_MODE else CFGFILE)
+                    nk=_rc_entry_of(_internal)[1] if DIR_MODE else _internal
+                    def want(b,flag,fid):   # revue 1 (row 18) : interpréteur du serveur puis borgHelper, comme il le lance
+                        return [sys.executable,exe,'-C',rc,'-c','Restore','-n',nk]+(['-b',b] if b else [])+['-f',"etc/a b'c",flag,os.path.join(root,'d e')]+(['--fidele'] if fid else [])
+                    res={}
+                    r,a=post({'bid':'arch 1'},'Restauré')
+                    j=r.json(); cli=j.get('cli') or {}
+                    res['-b']=(r.status_code==200 and j.get('stdout')=='Restauré' and shlex.split(cli.get('sur',''))==want('arch 1','-w',False)
+                               and shlex.split(cli.get('fidele',''))==want('arch 1','-w',True)
+                               and not any(x in a for x in ('--fidele','--creux','--liens-en-dossiers','--par-nom')),j,a)
+                    r,a=post({'flat':'true'},"Archive sélectionnée depuis l'index : srv-2026-10-01\nRestauré",code=1)
+                    j=r.json(); cli=j.get('cli') or {}
+                    res['archive choisie, -W, code 1']=(r.status_code==400 and shlex.split(cli.get('sur',''))==want('srv-2026-10-01','-W',False)
+                                                      and shlex.split(cli.get('fidele',''))==want('srv-2026-10-01','-W',True),j)
+                    r,a=post({'bid':'last'},"Archive sélectionnée (dernière) : srv-2026-10-02\nRestauré")   # revue 1 (row 18) : « last » relu
+                    cli=r.json().get('cli') or {}
+                    res['-b last -> archive choisie']=(shlex.split(cli.get('sur',''))==want('srv-2026-10-02','-w',False),cli)
+                    for k_,v_ in (('ftor','a\nb'),('bid','x\ny'),('where','d\re'),('ftor','a\u2028b'),('bid','x\x85y'),('where','d\u2029e')):   # revue 2/3 (rows 30, 48)
+                        r,a=post({k_:v_},'')
+                        res[f'caractère de contrôle ({k_}={v_!r}) -> 400']=(r.status_code==400 and a is None,r.status_code)
+                    # revue 4 (row 52) : noms courants acceptés — U+202F (captures macOS), U+00A0, ZWJ (un surrogate n'arrive pas par HTTP)
+                    for k_,v_ in (('ftor',"Capture d'écran 2023-01-01 à 10.00.00\u202fAM.png"),('ftor','a\u00a0: b'),('ftor','\U0001f468\u200d\U0001f469')):
+                        r,a=post({k_:v_},'Restauré')
+                        res[f'nom accepté ({k_}={v_!r})']=(r.status_code==200 and a is not None and v_ in a,r.status_code,a)
+                    r,a=post({'bid':'last'},'Restauré')   # revue 2 (row 31) : ligne « Archive sélectionnée » absente -> -b last gardé
+                    res['-b last gardé sans ligne']=(shlex.split((r.json().get('cli') or {}).get('sur',''))==want('last','-w',False),r.json())
+                    hres=JSONResponse(status_code=200,content={'exitcode':0,'stdout':'','stderr':''},headers={'X-S114':'garde'})
+                    with mock.patch(f"{__name__}.RESTORE_ROOT",root),mock.patch(f"{__name__}.run_borghelper",return_value=hres):
+                        r=client.post(f"{P}/restore",headers=H,params={'nick':_internal,'ftor':'x','where':'d e','bid':'a'})
+                    res['en-têtes repris']=(r.headers.get('X-S114')=='garde' and r.json().get('cli') is not None,dict(r.headers))
+                    r,a=post({},'',decoy=True)
+                    j=r.json(); cli=j.get('cli') or {}
+                    res['hors périmètre']=('.bh-absent-' in ' '.join(a) and "etc/a b'c" in shlex.split(cli.get('sur','')) and '.bh-absent-' not in json.dumps(cli),j,a)
+                    dec={'pw':[]}
+                    def fake(cmd,nick,args,pw):   # Restore cite le chemin qu'il reçoit (leurre hors périmètre) dans sa ligne --fidele
+                        f=args[args.index('-f')+1]; dec['f']=f; dec['pw'].append(pw)
+                        # revue 1 (F15) : ligne de Restore qui porterait la passphrase -> remplacée, jamais relayée
+                        return CommandResult(exitcode=0,stdout='',stderr=f"mode sûr : x\n{_RESTORE_FIDELE_CMD}borgHelper -P {pw} -f {shlex.quote(f)} --fidele\nfin")
+                    outs={}
+                    for oos in (False,True):
+                        with mock.patch(f"{__name__}.RESTORE_ROOT",root),mock.patch(f"{__name__}._exec_borghelper",fake), \
+                             mock.patch(f"{__name__}.require_path_in_scope",lambda *a,o=oos,**k: not o):
+                            outs[oos]=client.post(f"{P}/restore",headers={**H,'X-Borg-Passphrase':'secret-s114'},params={'nick':_internal,'ftor':'x y','where':'d e','bid':'a'}).json()
+                    res['ligne --fidele du stderr']=(outs[False]==outs[True] and outs[True]['stderr'].split('\n')[1]==_RESTORE_FIDELE_CMD+outs[True]['cli']['fidele']
+                                                    and outs[True]['stderr'].endswith('\nfin') and '.bh-absent-' in dec['f'],outs)
+                    res['sans passphrase']=(dec['pw']==['secret-s114','secret-s114'] and 'secret-s114' not in json.dumps(outs)
+                                            and 'secret-s114' not in json.dumps(j),dec['pw'])   # revue 2 (row 37) : passphrase bien reçue par Restore
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                if _internal is not None:
+                    check("POST /restore : mode sûr seul, réponse `cli` = commandes équivalentes sûr et --fidele (shlex, archive exacte, sans passphrase) (story 114)",_restore_cli)
                 def _access_state():
                     """/access : external, ops (allowed_ops de borgHelper), build, rebuild, bkp_running, index_last, bkp_last par nick lisible ; nick
                     sans droit : rien de plus."""
@@ -9332,10 +9437,12 @@ def push_selftest():
                                'ensure_push_db','_borg_cleanup_summary','<module>',
                                '_storage_state_mtimes'},   # 1.34.0 (story 87b) : mode -C seulement, comme _bkp_markers_state
                   'CFGFILE':{'_default_section_groups','_capture_fingerprints','_build_borghelper_argv_env','_borg_cfg','_stats_sections','<module>',
-                             '_storage_nicks'}}   # revue 87a (row 55) : ouvert en mode -C seulement (`if not DIR_MODE`), jamais le maître
+                             '_storage_nicks',   # revue 87a (row 55) : ouvert en mode -C seulement (`if not DIR_MODE`), jamais le maître
+                             '_restore_cli_commands'}}   # 1.34.2 (story 114) : rc de la commande CLI équivalente, mode -C seulement (`if not DIR_MODE`)
             wit=uses("def ailleurs(n):\n    return _bh_paths.db.get_diff_db(n)\n")['_bh_paths']=={'ailleurs'}
             def unguarded(text):
-                """Revue 87a (row 65) : lignes des lectures de CFGFILE dans _storage_nicks hors d'un `if not DIR_MODE:` (corps)."""
+                """Revue 87a (row 65) : lignes des lectures de CFGFILE dans _storage_nicks (et _restore_cli_commands, 1.34.2) hors d'un
+                `if not DIR_MODE:` (corps)."""
                 out=[]
                 def walk(nd,ok):
                     if isinstance(nd,_ast.Name) and nd.id=='CFGFILE' and isinstance(nd.ctx,_ast.Load) and not ok: out.append(nd.lineno)
@@ -9347,7 +9454,7 @@ def push_selftest():
                         return
                     for c_ in _ast.iter_child_nodes(nd): walk(c_,ok)
                 for top in _ast.parse(text).body:
-                    if isinstance(top,_ast.FunctionDef) and top.name=='_storage_nicks': walk(top,False)
+                    if isinstance(top,_ast.FunctionDef) and top.name in ('_storage_nicks','_restore_cli_commands'): walk(top,False)
                 return out
             ung=unguarded(src)
             wit_ok=unguarded("def _storage_nicks(r):\n    if not DIR_MODE:\n        open(CFGFILE)\n    else: x=CFGFILE\n    return CFGFILE\n")==[4,5]

@@ -2387,6 +2387,14 @@ code 1 depuis 1.0.178).
 sous-processus) — `RESTORE_ROOT` (realpath au démarrage) absent ou pas un dossier -> 403 ; `realpath(join(racine, where))`
 hors racine (`commonpath`) -> 403 ; vide/NUL -> 400 ; dossier existant non vide -> 409 (aucun lien préexistant sous la
 destination) ; rend le chemin résolu passé à `-w`/`-W`. `RESTORE_ROOT == '/'` -> `sys.exit` au chargement du module.
+1.34.2 (story 114) : argv inchangé — Restore en mode sûr (défaut de borgHelper 1.0.214), jamais d'option longue de Restore.
+`_restore_with_cli(resp, …)` relit le JSON de la réponse (après `_oos_swap`) et ajoute `cli` = `_restore_cli_commands(nick, bid,
+ftor, dest, flat, stdout+stderr)` : `_restore_cli_line` de borgHelper (exécutable `realpath(BORGHELPER_BIN)`, rc : `CFGFILE` sous
+`if not DIR_MODE`, sinon `_rc_entry_of(nick)` — rc du préfixe, nick nu ; garde AST `_dm_source_guard` : liste blanche et
+lecture sous `if not DIR_MODE` vérifiées), archive : `bid`, sinon relue de « Archive sélectionnée (depuis l'index|(dernière)) :
+X » ; `ftor` = chemin DEMANDÉ (jamais le leurre). La ligne de stderr qui commence par `_RESTORE_FIDELE_CMD` (commande `--fidele`
+de l'avis, citée par Restore avec le leurre hors périmètre) est remplacée par `cli['fidele']` : réponse identique à celle d'un
+chemin réellement absent (contrôle 1.27.5), même pour un chemin que shlex cite. Statut HTTP inchangé (`_http_status`).
 
 La clé de `_RESPONSE_CACHE` inclut désormais un condensé de la passphrase de la requête quand `cacheable=True` et
 qu'une passphrase est fournie (`x_borg_passphrase`, ex. route `report -o`) : `_passphrase_digest(passphrase)` =
@@ -2736,7 +2744,7 @@ DbRekey sans -y × 11 états -> empreintes de CACHE_DIR inchangées. BorgCleanup
 `-`) : vide, pas un dossier (lien cassé, « fichier/ », parent fichier), non traversable, création impossible (premier
 parent existant sans écriture) -> code 3. `-w` : `_makedirs_tracked` juste avant `borg extract`, dossiers créés retirés
 s'ils restent vides après un extract en échec (`_rmdirs_if_empty`) ; `-W` : création après un extract réussi (inchangé),
-dans un `try` (code 3). **Message d'échec
+dans un `try` (code 3) — depuis 1.0.214, ce chemin est celui du mode FIDÈLE (`_restore_fidele`), voir « Restore, mode sûr ». **Message d'échec
 (A64)** : `_rb_errmsg(rb, cmd, n=2, cut=100)` seule règle (tous ses appelants : `_boex_check_stdout`, Mount, Key, DelBkp,
 Prune…) (lignes ERROR JSON, texte hors bandeau `Platform`/`Borg:`) ; 1.0.174 (story 37, A69) : `_borg_err_lines(lines, st)` —
 machine à états par bloc (`tb` cadres, `exc` ligne d'exception + suite indentée, `chain` « During handling… »/« The above
@@ -2745,6 +2753,123 @@ le message précédent (erreur borg `traceback=True`) ; bandeau `_BORG_SYSINFO` 
 (`st['crash']`, partagé entre texte et JSON par `_rb_errmsg`), `_BORG_ALWAYS` (`Platform`, `Borg:`) partout comme avant ;
 message `--log-json` multi-lignes : même traitement, 1er message gardé, jamais coupé (Bkp seul passe `--log-json`) ;
 `_boex_last_modified` : `n=3, cut=None` (texte inchangé).
+**Restore, mode sûr (1.0.214, story 114, décision 16 de l'utilisateur ; story 99 abandonnée)** — défaut de `restore()` ;
+`fidele=True` (`--fidele`) : `_restore_fidele` = code de 1.0.212 (`_borg_extract_args(bid, ftor, sparse, numeric)` : `--sparse`
+pour `--creux`, `--numeric-ids` retiré par `--par-nom`), sans aucune protection. Refus avant tout (CLI `_cli_required`, et
+`restore()` pour la bibliothèque) : `--creux` sans `--fidele`, `--liens-en-dossiers` avec `--fidele`, option longue avec `-L`
+(code 2). Options longues réservées à Restore (`_CLI_LONG_OWNER`, `_RESTORE_LONG`).
+- **Flux** : `BorgRunner.boex(…, stream=consume)` -> `_boex_stream` : `borg export-tar --exclude */log/* ::<archive> - <sélection>`
+  (`_export_tar_args` ; joker : motifs de `_borg_glob_args`), stdout binaire lu par `consume(fh)` (tarfile `r|`, `tf.members=[]`
+  après chaque entrée : tarfile garde sinon chaque membre lu — mémoire bornée, mesuré : fichier de 600 Mo, RSS de borgHelper
+  inchangée), stderr lu par un fil ; `consume` rend None (reste du flux vidé, borg sort seul) ou l'exception d'arrêt (borg arrêté :
+  `_kill_tree` SIGTERM, 5 s, SIGKILL, comme boex) dans `rb['stream_exc']` ; Ctrl-C : arbre arrêté, code 130. Aucun `borg list`.
+- **Zones** : `BorgHelper._restore_zones(nick)` -> `[(étiquette, formes, _ZoneIds)]` — CACHE_DIR (et clés `CACHE_DIR` de section),
+  rc, et pour CHAQUE nick du rc : dépôt LOCAL (`_restore_local_repo` : distant -> None ; relatif ou `BORG_KEY_FILE` relatif : sous
+  le dossier courant, celui de borg export-tar ; marqueurs stables de borg 1.2 par `_BorgMarks`, `{borgversion}` par un
+  `BORG_EXE --version` seulement s'il est présent), `BORG_KEY_FILE`, `BORG_BASE_DIR`/`…_DIR` du rc ; `.cache/borg` et
+  `.config/borg` du home pwd et de `HOME`. Formes : `realpath` et chemin absolu non résolu ; « / » jamais une zone. Relu juste
+  avant l'écriture (après `wait_index_idle`). `_restore_zone_of(p, zones)` : chemin sous une forme, puis identité de `p` ou d'un
+  parent (`_restore_ids_of`) — destination (`root_label` : rien créé, tout sauté) et fichier tar (`_restore_tar_zone`, code 3,
+  avant la sélection d'archive et juste avant l'écriture).
+- **Écrivain** `_SafeWriter(root, zones, flat, by_name, links_as_dirs, root_label)` : racine = `realpath(dest)` ouverte en
+  `O_PATH|O_DIRECTORY|O_NOFOLLOW` ; par entrée : `_restore_norm` (absolu, `..`, composant vide -> `_RZ_ODD` ; `.` retirés ;
+  racine `.` ignorée) ; zone par CHEMIN (`root/parts`, chemin réel puisqu'aucun lien n'est traversé dessous ; élément groupé sous
+  la racine de la zone) ; `_parent(dparts)` : chaîne de descripteurs gardée d'une entrée à la suivante, chaque composant ouvert
+  `O_NOFOLLOW` depuis le précédent (`mkdir 0o777` s'il manque), `ELOOP`/`ENOTDIR` -> lien créé par CETTE restauration
+  (`made_links`) : `_RZ_UNDER` ou, avec `links_as_dirs`, `unlink` + `mkdir` (`converted`) ; autre lien : `_RZ_LINK` ; fichier :
+  `_RZ_NOTDIR` ; `fstat` de chaque dossier contre les identités des zones (`zid`) ; cible existante (`lstat`) : identité d'une zone
+  -> sautée. Écriture : `.<nom>.bhr<hex>` dans le parent (`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`, 0600), contenu par `os.write`,
+  `fchown` (root : uid/gid numériques, ou `pwd`/`grp` par nom avec `by_name`), `fchmod` (après chown : setuid gardé), `utime`, puis
+  `os.replace(tmp, nom, src_dir_fd, dst_dir_fd)` ; lien symbolique/fifo/périphérique (root, `mknod`)/lien physique (`os.link` du
+  premier nom restauré, `inos` ; à plat : `occupant`) : créés sous le temporaire puis renommés, métadonnées `dir_fd` +
+  `follow_symlinks=False` ; erreur : temporaire retiré (`_drop_tmp`) ; `ENOSPC`/`EDQUOT`/`EROFS`/`EIO` -> `_RestoreStop` (flux
+  interrompu, code 2) ; autre `OSError` -> élément sauté « erreur d'écriture (…) ». Dossier de l'archive : créé 0700 (ou existant),
+  remplace un fichier ; métadonnées en fin de flux (`finish`, du plus profond au moins profond, `O_NOFOLLOW`). Cible : dossier
+  vide existant -> `rmdir` puis écriture (comme borg), non vide -> `_RZ_FULLDIR`. Lien physique dont le premier nom n'est pas
+  restauré -> `broken` ; après un flux réussi : `[WARN] lien physique rompu`, seconde lecture `export-tar … pp:<chemin>` de ces
+  seuls chemins (borg 1.2 rend un esclave dont le maître n'est pas sélectionné en fichier complet), `only` = ces chemins.
+  Rapport : `_SkipLog` (`{étiquette: {(chemin, groupé): n}}` — mémoire bornée par les racines de zones et de liens).
+- **Tar/stdout** (`_restore_safe_tar`) : `_restore_tar_entry` (chemin normalisé ; à plat : nom seul, dossiers omis, lien physique
+  vers le nom seul de son premier nom) puis `addfile` dans `tarfile.open(fileobj, 'w|'/'w'/'w:gz'/'a')` ; fichier neuf : temporaire
+  voisin `O_EXCL|O_NOFOLLOW` (0666 & umask) renommé à la fin ; `.tar` existant : copie (droits gardés) complétée puis renommée ;
+  stdout : `BrokenPipeError` -> code 0 (comme 1.0.212) ; écriture impossible -> code 3 ; borg en échec -> code 2, temporaire retiré.
+- **Avis** : `_RESTORE_SAFE_NOTE` + `_RESTORE_FIDELE_CMD` + `_restore_cli_line(…, fidele=True)` (mode sûr), `_RESTORE_FIDELE_NOTE`
+  (mode fidèle), sur stderr, après la sélection d'archive (archive exacte dans la commande).
+- **Revue 1** : destination dans une zone (`_restore_zone_of` : chemin, puis identité de la destination et de chaque dossier
+  existant au-dessus) -> aucun borg, `[WARN] rien restauré`, code 1 ; `_export_tar_args`/`_borg_extract_args` : `::<_borg_literal(bid)>`,
+  `-b` vide refusé (CLI `_cli_required` et `restore()`) ; `--liens-en-dossiers` vers un tar/stdout, `--par-nom` vers un tar/stdout
+  sans `--fidele` : code 2 ; `_restore_nick_zones` par nick sous `try` (`[WARN] zones du nick X inconnues`), `BORG_*_DIR` joints au
+  dossier courant sans `expanduser` (borg 1.2 lit l'environnement tel quel) ; `_SafeWriter` : `inos` = entiers `st_ino` + ensemble
+  `devs`, `dirs` = (chemin joint, mode, uid, gid, mtime), `made_links`/`occupant` en chemins joints (mémoire : un élément par
+  dossier, lien ou fichier écrit — limite), `made_dirs` (parents créés, retirés par `rm_made_dirs` si rien n'est restauré),
+  `_tmpname` coupé en octets (100), EDQUOT du `fchown` -> `_SkipErr` (élément sauté), lien physique : fifo/périphérique acceptés,
+  nom déjà lié au même inode -> rien à faire (aucun temporaire), `finish` : ENOTDIR/ELOOP/ENOENT d'un dossier remplacé plus loin dans
+  le flux ignorés, racine illisible -> saut dit ; `_SkipLog` : `_SKIP_SHOWN`=50 chemins par raison, le reste compté (`more`),
+  chemins affichés par `_shown_path` (contrôles en `\xNN`) ; seconde lecture par lots `_argv_batches` (64 Kio d'argv), échec traité
+  comme le flux (code 2), `[WARN] lien physique rompu` après, pour les noms écrits ; cause d'un échec : la lecture si borg a été
+  arrêté par nous, sinon le message de borg. `_restore_safe_tar` : tar de sortie ouvert AVANT borg (`.tar` illisible : code 3),
+  `dst.close()` (fin d'archive) seulement si flux et borg réussis, `try/except BaseException: drop()` (temporaire retiré sur Ctrl-C,
+  SIGTERM). `_boex_stream` : SIGTERM -> KeyboardInterrupt pendant le flux (fil principal ; gestionnaire d'avant remis).
+  borgHelperWWW 1.34.2 : `ftor` à caractère de contrôle -> 400 ; `cli` : `exe=[sys.executable, realpath(BORGHELPER_BIN)]`
+  (`_restore_cli_line` accepte une liste), `bid` vide ou `last` -> archive relue ; en-têtes de la réponse repris.
+- **Revue 2** : identité d'un premier nom = un entier `(st_dev<<64)|st_ino` (jamais deux ensembles : leur produit acceptait un
+  fichier d'un autre système de fichiers) ; `_tar_stdout_cut(dst)` : tampon du `_Stream` vidé puis en-tête tronqué (un en-tête
+  invalide est lu comme la fin par tarfile, mesuré `work/s114/mesure-fin-tar.txt`) ; `_restore_sigterm()` autour de tout `restore()`
+  en mode sûr (fil principal, SIG_DFL seulement, `_term` -> SIG_IGN puis `_SigTerm`, remis à SIG_DFL en sortie, code 143) ;
+  `_boex_stream` ne pose plus de gestionnaire (seul appelant : `_restore_stream` du mode sûr), `on_abort` (le `drop()` du tar)
+  appelé avant l'arrêt de borg ; `_SafeWriter._mk` : temporaire noté avant sa création, oublié sur FileExistsError ;
+  `_restore_nick_zones` : `g()` par clé (configparser, NUL -> `[WARN]`, clé ignorée), `BORG_*_DIR` sous les deux formes ;
+  `_restore_run` : zones calculées une fois, destination dans une zone avant la sélection d'archive et le verrou, passées à
+  `_restore_safe_dir`/`_restore_safe_tar`/`_restore_tar_zone` ; `seen_only` (seconde lecture : un saut compté une fois) ;
+  `rm_made_dirs` aussi sans échec quand rien n'est restauré ; `.tar` vide tenu pour absent ; `_shown_path` : tout
+  `not isprintable()` ; `listperms` : `_borg_literal`. WWW : `bid`/`where` à caractère de contrôle -> 400, `bid` gardé sans ligne
+  « Archive sélectionnée ».
+- **Revue 3** : `_tar_stdout_cut(dst, in_progress)` : tampon du `_Stream` vidé ; entre deux membres seulement, en-tête
+  `TarInfo('././@LongLink')` de type GNUTYPE_LONGNAME, taille 2**33-1 (`_create_header`, GNU_FORMAT) — GNU tar « Unexpected EOF »
+  (code 2) et tarfile « empty header » sans rien créer ; membre en cours (`st['inprog']`, posé avant `addfile`) : rien ajouté (un
+  en-tête serait lu comme contenu d'un membre ≤ 512 o ; mesures `work/s114/mesure_fin_tar2.py`, `mesure-fin-tar2.txt`, 3.10 et
+  3.14) ; `drop()` du tar : `_sigterm_disarm()` puis, sur stdout, la coupe (une fois, `st['cut']`) — Ctrl-C/SIGTERM compris ;
+  fichier : temporaire retiré seulement si son identité est celle notée après `os.open` (`st['made']` posé avant la création,
+  `st['ident']` par `fstat`) ; `.tar`/`.tgz` existant : `os.stat`, non régulier -> code 3 « pas un fichier ordinaire », taille 0 ->
+  absent, droits repris par `fchmod` ; zones RECALCULÉES (`_restore_zones(nick, quiet=True)`, aucun `[WARN]` répété) juste avant
+  l'écrivain (`_restore_safe_dir`) et avant l'ouverture du tar (`_restore_tar_zone`) ; `_restore_nick_zones` : une lecture par clé,
+  `ver()` (BORG_EXE illisible) par clé. `_restore_sigterm()` posé par la CLI seulement (dispatch, hors `--fidele`) ; `restore()`
+  ne touche à aucun signal ; `_term._bh_restore` marque le gestionnaire ; `_sigterm_disarm()` (SIG_IGN si ce gestionnaire est posé,
+  sinon rien) à l'entrée de tout nettoyage : `drop()` du tar, `_SafeWriter.entry` sur KeyboardInterrupt, `_boex_stream` et `boex`
+  (non-flux) sur KeyboardInterrupt ; `boex` non-flux : `_SigTerm` -> `[INTERRUPTED] Restore arrêté (SIGTERM).`, 143 (sélection
+  d'archive) ; `_boex_stream` : `Popen` dans le `try`. `_SafeWriter._mk` : `tmp=(pfd, nom, identité)`, identité `None` tant que
+  la création n'est pas prouvée -> `_drop_tmp` ne retire rien. `_restore_run` : `wait_index_idle` dans le `try` du verrou de
+  priorité. Seconde lecture : LNKTYPE réémis vers un premier nom sauté -> `_RZ_HARD`. Sélection vide : « Rien restauré ».
+  borgHelperWWW : `ftor`/`bid`/`where` refusés (400) dès qu'un caractère n'est pas `isprintable()` [revue 4 : remplacé, voir dessous].
+- **Revue 4** : WWW : refus si `unicodedata.category(c) in ('Cc','Zl','Zp')` (`_shown_path` garde `isprintable()`, affichage
+  seulement). `_restore_safe_tar` : `st['span']=(pos, pos+len(tobuf)+contenu en blocs)` noté avant `addfile` (stdout seulement),
+  remis à None après ; `_tar_stdout_cut(dst, span)` : membre en cours ssi `span[0] < _Stream.pos < span[1]` ; pas d'`on_abort` sur
+  stdout (coupe dans le `drop()` du `except BaseException`, après `stop()` de `_boex_stream`) ; stdout en non bloquant pendant la
+  coupe, échec (EAGAIN, EPIPE) -> `_stdout_discard()` (/dev/null `dup2` sur le fd de stdout : vidange finale et `_Stream.__del__`
+  sans blocage ni code 120 ; aussi sur les chemins « lecteur parti » ; `_FOG_WL` : `_stdout_discard|os.open`) ; `_create_header`
+  en TypeError/AttributeError -> aucun marqueur. `_restore_run` marque la sortie de fin (`except SystemExit as x:
+  x._bh_restore_end=True`) : `_restore_sigterm` ne garde que ce code (un SystemExit rattrapé dans un `except SystemExit:` interne
+  est aussi `__context__` d'un `_SigTerm` reçu dans ce bloc — indiscernable par `__context__` ou `sys.exc_info()`, mesuré 3.10 et
+  3.14). `.tar` dont `os.stat` échoue (lien cassé) : absent, remplacé. `_restore_safe_tar` : `quiet=zones is not None`.
+  `_restore_nick_zones` : `CACHE_DIR` et `cache_dir` lus (`cfgread` : `optionxform=str`) ; `ver(cfg, n)` : `[WARN]` BORG_EXE
+  illisible, une fois par nick. `boex` : `Popen` dans le `try` (`_NoBorg` si interrompu avant). `_boex_stream` : `killed` rendu
+  seulement si borg est mort du signal (code < 0 ou ≥ 128) — borg sorti seul pendant l'arrêt garde sa cause (les `_MEI` sont
+  purgés dans les deux cas : un délai de grâce avant l'arrêt laissait un `_MEI` orphelin par run vrai borg, retiré).
+- Limites (revue 1, rows 19-21 ; revue 3, row 50 ; revue 4, row 56, documentées) : avis `--fidele` dit avant le `[WARN]` d'une
+  zone apparue tard ; stdout abandonné : un tube resté plein peut finir sur un membre complet sans marqueur ; tar/stdout reproduit les liens de l'archive et les éléments
+  dessous ; pas de `fsync` avant `os.replace` ; `chmod` du temporaire fifo/périphérique avec `dir_fd` suit un lien (course d'un tiers
+  qui écrit dans la destination) ; SIGHUP non converti ; signal reçu entre la création d'un temporaire et le relevé de son identité
+  (temporaire laissé, jamais celui d'un autre) ; signal reçu pendant le `finally` de `_restore_sigterm` ou après lui (SIG_DFL
+  remis) : fin par le signal (-15) au lieu de `sys.exit(143)`.
+- Garde AST des ouvertures (`_FOG_WL`) : `_SafeWriter.*|os.open`, `_restore_safe_*` (flux et tar), `_restore_fidele|shutil.copy2`.
+- Contrôles : écrivain sur flux tar fabriqué (zones par chemin et par identité, liens, écriture atomique avec ENOSPC simulé,
+  chemins non normalisés, liens physiques, à plat), options, de bout en bout par borg factice (chaque sous-contrôle dans sa section
+  `sec` : une exception le met en échec sans perdre les suivants ; `term_run` : vrais SIGTERM — fichier, stdout, rafale, SIG_IGN
+  hérité, pendant la sélection —, borg factice toujours tué en fin par son PID vérifié ; SIGTERM désarmé à la réception et SIG_DFL
+  rendu, Ctrl-C puis SIGTERM pendant le nettoyage ; marqueur de coupe rejeté par GNU tar ; refus d'un tar dans une zone par chacun
+  des deux contrôles ; noms piégés échappés dans `[ERREUR] … (nom)` et `[WARN] lien physique rompu`), et vrai borg (`_rbc` : fidélité = `--fidele` sur 20 éléments, seul
+  `export-tar` lancé, zones, racines imbriquées, flux coupé par un BORG_EXE qui tronque, tar/tgz/stdout = `--fidele`).
+
 **Sorties de borg à chaque site (1.0.175, story 38, A70)** : `_print_borg_stderr(entries, debug)` (et `_print_boex_stderr(rb)`)
 — texte réduit par `_borg_err_lines(…, raw=True)` (indentation gardée), enregistrement JSON réduit seulement s'il porte une
 trace, un bloc « Exception ignored » ou commence par le bandeau ; DEBUG masqué sans `debug` ; utilisé par Bkp, Restore, ListPerms,

@@ -1,5 +1,87 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.214, borgHelperWWW 1.34.2, UI 1.27.1 — Restore : mode sûr par défaut — 2026-10-23
+
+Chantier « reconstruction progressive », story 114 (décisions de l'utilisateur du 2026-10-22 et 2026-10-23, dont la 16 : « on arrête
+les tentatives de protection » de `borg extract`, story 99 abandonnée ; mesures au bac, compte ordinaire, borg 1.2.6 par un BORG_EXE
+de bac, HOME de bac — `work/s114/` : `mk_bac.sh`, `mk_zones.sh`, `compare.py`, `mem.py` ; dossiers de borg de l'utilisateur
+inchangés, 36 et 37 entrées).
+
+- **borgHelper — Restore, mode SÛR par défaut** : `borg export-tar` lu en flux (jamais de tar intermédiaire, mémoire bornée —
+  mesuré : fichier de 600 Mo, RSS de borgHelper inchangée), chaque entrée écrite par borgHelper : parents ouverts un par un sans
+  suivre de lien, **jamais d'écriture à travers un lien** ; élément sous un lien de l'archive (racines imbriquées d'un Bkp
+  ordinaire) : le lien est créé, les éléments dessous sautés et listés, code 1, le `[WARN]` propose **`--liens-en-dossiers`**
+  (nouveau : vrai dossier à la place du lien) ; élément sous un lien déjà présent dans la destination : sauté ; **zones protégées**
+  (définition de la story 99) contrôlées au moment d'écrire, par chemin et par identité : bases (CACHE_DIR), dépôt local et clé de
+  borg de chaque nick du rc, dossiers de borg, rc — sautés et listés (`[WARN] N éléments sautés : <zone>`, groupés sous la racine
+  de la zone), code 1, aucun `borg list` de plus ; destination dans une zone : rien créé ; fichier `.tar`/`.tgz` dans une zone :
+  refus, code 3 (avant : mesuré en 1.0.209, `-W <CACHE_DIR>` écrasait une base, code 0) ; fichier écrit sous un nom temporaire
+  voisin puis renommé — jamais un fichier à moitié écrit ; **flux interrompu** (borg en échec ou tué, disque plein) : fichiers finis
+  gardés, aucun temporaire, `[ERREUR] flux interrompu après « … » : N éléments restaurés …`, **code 2** ; chemins absolus, à
+  « .. » ou composant vide : sautés ; lien physique dont le premier nom est sauté : second nom écrit comme fichier indépendant
+  (`[WARN] lien physique rompu`) ; périphériques : recréés en root, sautés en compte ordinaire. `-W`, `.tar`/`.tgz` et stdout :
+  écrits directement depuis le flux (plus de dossier temporaire ; à plat, un lien de l'archive est recréé comme lien — avant, `-W`
+  copiait le fichier visé). Avis **toujours** affiché : `mode sûr : attributs étendus et ACL non restaurés (--fidele pour les
+  restaurer)` + la commande `--fidele` complète. Mesuré identique à `--fidele` : contenu, droits, setuid, dates (s) des fichiers,
+  dossiers et liens, liens symboliques et physiques, fifo, noms non UTF-8 ; perdus : attributs étendus, ACL, creux. Propriétaires
+  étrangers, capacités, périphériques et `--par-nom` : décidés sur le code, **non mesurés (pas de root)**. Fin : `Restauré dans
+  <dest> : N éléments` (`-w` compris).
+- **borgHelper — mode FIDÈLE `--fidele`** (CLI seulement) : `borg extract` brut, comme 1.0.212, **sans aucune protection** — avis
+  `mode fidèle : aucune protection des bases, du dépôt et du rc` ; **`--creux`** (seulement avec `--fidele`, sinon code 2) :
+  `--sparse` ; **`--par-nom`** (deux modes) : propriétaires par nom de l'archive (numériques si inconnus ; fidèle : `--numeric-ids`
+  retiré). `--liens-en-dossiers` avec `--fidele`, option longue avec `-L` : code 2. Bibliothèque : `restore(…, fidele, sparse,
+  links_as_dirs, by_name)`, mêmes refus.
+- **borgHelperWWW** : `POST /restore` reste en mode sûr (seul mode du serveur) ; la réponse ajoute `cli` (`sur`, `fidele`) :
+  commandes CLI équivalentes complètes et copiables (`-C` du rc, archive exacte, chemins cités, jamais de passphrase) ; la ligne
+  `--fidele` de l'avis porte le chemin demandé (hors périmètre : jamais le leurre, réponse toujours identique à un chemin absent).
+- **UI** : sous le résultat de « Restaurer », les deux commandes (mode sûr ; mode fidèle, « AUCUNE protection ») avec un bouton
+  « 📋 Copier » chacune.
+- CodecSelfTest : 6 contrôles (écrivain sur flux tar fabriqué : zones par chemin et identité, liens, écriture atomique avec disque
+  plein simulé, chemins et types ; options et commande CLI ; vrai borg : fidélité, appels de borg, zones, racines imbriquées, flux
+  coupé, tar) ; contrôles existants adaptés (`borg export-tar` en mode sûr, nick `zw` du borg factice : dépôt dans un sous-dossier).
+  Push selftest : `POST /restore` mode sûr seul et `cli`. Test UI : `restoreCliHtml`.
+- Revue 1 : destination dans une zone par son chemin OU par identité (montage bind de CACHE_DIR…) -> aucun borg lancé, rien créé,
+  `[WARN] rien restauré : destination dans une zone protégée`, code 1 ; nom d'archive littéral pour borg (accolades doublées), `-b`
+  vide refusé ; tar/stdout : fin d'archive écrite seulement si le flux et borg ont réussi (flux coupé : stdout tronqué sans fin,
+  `[ERREUR] flux interrompu : tar de stdout tronqué`, code 2 ; fichier jamais créé), `.tar` existant illisible : code 3 avant borg,
+  temporaire retiré aussi sur Ctrl-C et SIGTERM ; seconde lecture des liens physiques : par lots, échec -> code 2 et cause dite,
+  `[WARN] lien physique rompu` seulement pour les noms écrits ; fifo et périphériques liés acceptés ; liste des sautés : 50 chemins
+  par raison puis « … et N autres », caractères de contrôle écrits `\xNN` ; parents créés retirés si rien n'est restauré ; jamais
+  « après « None » » ; EDQUOT du changement de propriétaire (root) : élément sauté ; nom temporaire coupé en octets ; nick du rc
+  illisible : `[WARN] zones du nick X inconnues`, Restore continue ; `BORG_*_DIR` relatifs comme borg (dossier courant, sans `~`) ;
+  `--liens-en-dossiers` vers un tar/stdout, `--par-nom` vers un tar/stdout en mode sûr : code 2. borgHelperWWW : `ftor` à caractère
+  de contrôle -> 400 ; commandes `cli` préfixées par l'interpréteur du serveur, `bid=last` -> archive choisie ; en-têtes gardés.
+  Limites documentées : mémoire proportionnelle au nombre d'éléments écrits, liens de l'archive reproduits dans un tar, pas de
+  `fsync`, course sur les droits d'un fifo temporaire.
+- Revue 2 : lien physique vers un premier nom accepté seulement pour la paire (système de fichiers, inode) écrite par Restore ;
+  destination dans une zone dite en tête (aucun `borg list`, aucun verrou, pas de commande `--fidele`) ; stdout en échec : membres
+  complets livrés puis un en-tête tronqué (tout lecteur échoue) ; SIGTERM autour de tout le mode sûr (temporaires retirés, code 143,
+  SIG_IGN d'un parent respecté) ; clé du rc illisible ou à octet NUL : cette clé seule ignorée et dite ; `BORG_*_DIR` protégés sous
+  leurs deux lectures ; `.tar` existant vide tenu pour absent ; nom d'archive littéral aussi pour `-L` ; noms non imprimables
+  échappés (C1, U+2028…) ; parents retirés aussi quand tout est sauté ; WWW : `bid`/`where` à caractère de contrôle -> 400,
+  `-b last` gardé si l'archive choisie n'est pas dite.
+- Revue 3 : stdout coupé **entre deux membres** -> en-tête `././@LongLink` (nom long GNU, 8 Gio annoncés) que GNU tar et tarfile
+  rejettent sans rien créer ; coupé **dans un membre** -> rien ajouté (mesuré : un en-tête y serait lu comme contenu) ; Ctrl-C et
+  SIGTERM coupent aussi stdout ; SIGTERM pendant la sélection d'archive : 143 et message SIGTERM ; verrou de priorité rendu même
+  interrompu pendant l'attente de l'Index ; `.tar`/`.tgz` vide = fichier ordinaire de 0 o (droits gardés), tout autre objet à ce nom
+  (fifo…) : code 3 « pas un fichier ordinaire » ; zones relues juste avant d'écrire (sans `[WARN]` répété) ; lien physique réémis
+  par la seconde lecture : listé sauté ; sélection vide : « Rien restauré : aucun élément de la sélection » ; `BORG_EXE` illisible :
+  dit par clé, une fois ; gestionnaire SIGTERM posé par la CLI seulement (`restore()` en bibliothèque ne touche à aucun signal) ;
+  nettoyage jamais interrompu par un SIGTERM (ignoré dès l'entrée, Ctrl-C compris), temporaire retiré seulement si son identité est
+  celle créée ; borgHelperWWW : `ftor`/`bid`/`where` à caractère non imprimable (C1, U+0085, U+2028…) -> 400. Limites documentées :
+  SIGHUP non converti, signal entre création d'un temporaire et relevé de son identité, SIGTERM pendant la sortie (fin par le
+  signal). CodecSelfTest : sous-contrôles du bout-en-bout isolés (une exception n'emporte plus les suivants), borg factice des
+  SIGTERM réels toujours tué par son PID, SIGTERM répétés, SIG_IGN hérité, désarmement et SIG_DFL rendu, refus du tar dans une zone
+  par chacun des deux contrôles, `-L` à nom `{…}` littéral, noms piégés affichés échappés, marqueur rejeté par GNU tar.
+- Revue 4 : borgHelperWWW refuse seulement les caractères de contrôle (catégories Cc, Zl, Zp) — U+202F, U+00A0, ZWJ de nouveau
+  acceptés (régression de la revue 3) ; coupe de stdout décidée par la position du flux (début et fin attendue du membre en cours),
+  plus par un drapeau — un signal juste avant l'en-tête ou juste après un membre donne bien le marqueur ; coupe faite APRÈS l'arrêt
+  de borg, sans jamais attendre (lecteur figé ou parti : reste de stdout jeté vers /dev/null, SIGTERM -> 143 en quelques secondes,
+  borg arrêté ; avant : blocage, verrou gardé) ; `.tar` lien cassé remplacé comme avant ; `cache_dir` en minuscules protégé (clés du
+  rc sensibles à la casse) ; `BORG_EXE` illisible dit ; SIGTERM dans une sortie interne rattrapée -> 143 (seule la sortie d'un Restore
+  fini garde son code) ; API privée du marqueur en échec -> sans marqueur, code 2 ; `boex` : Popen dans le `try` ; borg sorti seul
+  pendant l'arrêt : sa cause gardée. Limites : avis `--fidele` dit avant le `[WARN]` d'une zone apparue tard ; tube resté plein.
+
 ## borgHelper 1.0.213 — Variables BORG_* dans la commande ssh d'un Bkp tiré (SSH_ENV) — 2026-11-09
 
 Story 115 (demande et décisions de l'utilisateur du 2026-11-09 : « tous les serveurs ssh n'acceptent pas les variables

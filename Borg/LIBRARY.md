@@ -257,7 +257,24 @@ bh.restore('mon-serveur', bid=None, ftor='etc/nginx/*.conf', where='/tmp/nginx.t
 # Glob → tgz plat
 bh.restore('mon-serveur', bid=None, ftor='home/user/*.log',
            where='/tmp/logs.tgz', flat=True)
+
+# 1.0.214 : mode sûr par défaut (borg export-tar écrit par borgHelper, zones protégées sautées) ;
+# mode fidèle (borg extract brut, AUCUNE protection) : fidele=True, sparse=True pour --sparse
+bh.restore('mon-serveur', bid=None, ftor='home/user', where='/tmp/r', fidele=True, sparse=True)
+# lien de l'archive avec des éléments dessous -> vrai dossier (mode sûr) ; propriétaires par nom (root)
+bh.restore('mon-serveur', bid=None, ftor='home', where='/tmp/r', links_as_dirs=True, by_name=True)
 ```
+
+`restore()` termine toujours par `sys.exit` (codes de la CLI : 0, 1 éléments sautés ou destination dans une zone — aucun borg —,
+2 options refusées — `sparse` sans `fidele`, `links_as_dirs` avec `fidele` ou vers un tar/stdout, `by_name` vers un tar/stdout sans
+`fidele`, `bid` vide ou blanc — 1.0.212 le passait à borg (`::`, échec de borg), jamais une sélection automatique : `bid=None` la
+demande — ou flux interrompu, 3 destination inutilisable, tar dans une zone, `.tar`/`.tgz` existant illisible ou qui n'est pas un
+fichier ordinaire). Destination dans une zone : `SystemExit(1)` avant toute sélection d'archive. `restore()` ne pose **aucun
+gestionnaire de signal** (1.0.214, revue 3) : SIGTERM garde l'effet choisi par l'application ; la conversion de SIGTERM en arrêt
+propre (temporaires retirés, borg arrêté, code 143) est faite par la CLI seulement. Les avis (`mode sûr : …` et la commande `--fidele`, ou `mode fidèle : …`) et
+les `[WARN]` vont sur stderr. Constantes : `_RESTORE_SAFE_NOTE`, `_RESTORE_FIDELE_NOTE`, `_RESTORE_FIDELE_CMD` ;
+`_restore_cli_line(cfgfile, nick, bid, ftor, where, flat=False, fidele=False, extra=(), exe=None)` rend la commande CLI
+équivalente citée pour le shell (borgHelperWWW : réponse `cli` de `POST /restore`).
 
 ### Gestion des archives
 
@@ -860,7 +877,7 @@ sys.exit(0)
 | `filehist(nick, path, archive_from, archive_to, debug, as_json)` | Historique d'un chemin — `as_json` : `{nick:[{date,archive_before,archive_after,type,size_before,size_after},...]}` |
 | `duidx(nick, pattern, sort_by, reverse, as_json, archive_from, archive_to, debug, raw)` | Résumé taille/type ; `raw=True` (Story 1.4, distinct de `as_json` qui reste le mode groupé historique) : mode brut, une ligne par chemin (`{'pattern','rows':[{'chemin','type','taille'}]}`) |
 | `diffbkp(nick, bidun, bideux, debug, db_path, as_json)` | Différences entre deux archives — `+`/`-`/`=` par ligne, résumé compteurs ; `as_json` : `{archive_old,archive_new,entries:[...],n_add,n_rem,n_mod}` |
-| `restore(nick, bid, ftor, where, flat, debug)` | Restauration |
+| `restore(nick, bid, ftor, where, flat, debug, fidele=False, sparse=False, links_as_dirs=False, by_name=False)` | Restauration — 1.0.214 (story 114) : mode sûr par défaut (`borg export-tar` lu en flux, écrit par borgHelper : jamais à travers un lien, zones protégées sautées, écriture atomique) ; `fidele` : `borg extract` brut de 1.0.212, sans protection ; `sparse` (seulement avec `fidele`, sinon `SystemExit(2)`) : `--sparse` ; `links_as_dirs` (mode sûr seulement, sinon `SystemExit(2)`) : lien de l'archive avec des éléments dessous -> vrai dossier ; `by_name` : propriétaires par nom (deux modes) |
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |
 | `list_backups(nick, debug)` | Liste les archives |
 | `list_files(nick, bid, debug, as_json)` | Liste fichiers d'une archive — `as_json` : `{nick,archive,files:[chemin,...]}` |

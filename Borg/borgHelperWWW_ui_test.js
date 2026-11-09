@@ -1288,6 +1288,17 @@ async ${grab('loadStorage')}
     const c87=await runList(src,cFix);
     eq('loadMachines lance loadStorage une fois par chargement de la liste',c87.h.storage,1);
   }catch(e){ eq('Stockages (story 87a) : rendu sans exception',String(e&&e.stack||e),''); }
+  // UI 1.27.1 (story 114) : POST /restore -> commandes CLI équivalentes (sûr, --fidele), texte échappé, bouton copier par commande
+  try{
+    const rc=new Function(`${grab('escapeHtml')}; ${grab('escapeAttr')}; ${grab('restoreCliHtml')}; return restoreCliHtml;`)();
+    const h=rc({sur:"/opt/borgHelper -C /etc/rc -c Restore -n s -f 'a b<x>' -w /r",fidele:"/opt/borgHelper -C /etc/rc -c Restore -n s -f 'a\"b' -w /r --fidele"});
+    eq('restoreCliHtml : deux commandes échappées, deux boutons copier (data-cmd = commande), mode fidèle sans protection dit',
+       [h.includes("-f &#39;a b&lt;x&gt;&#39; -w /r</pre>"),(h.match(/class="secondary copy-cli-btn"/g)||[]).length,h.includes('data-cmd="/opt/borgHelper -C /etc/rc -c Restore -n s -f &#39;a&quot;b&#39; -w /r --fidele"'),
+        h.includes('AUCUNE protection'),h.includes('<x>')],[true,2,true,true,false]);
+    const ra=src.slice(src.indexOf('async function runAction('),src.indexOf('// UI 1.27.1 (story 114, décisions 6'));
+    eq('runAction : bloc resultCli rempli par restoreCliHtml(r.cli), masqué sans r.cli',
+       [ra.includes("cliBox.hidden=!r.cli"),ra.includes("r.cli?restoreCliHtml(r.cli):''"),src.includes('<div id="resultCli" hidden></div>')],[true,true,true]);
+  }catch(e){ eq('restoreCliHtml : rendu sans exception',String(e&&e.stack||e),''); }
   console.log(fail?fail+' FAIL':'TOUT OK');
   process.exit(fail?1:0);
 })();
