@@ -2814,7 +2814,8 @@ si absent ou vide, jamais le dossier courant), LC_ALL et `_BORG_EXIT_CODES_ENV` 
 `boex` avec `preBorg` (Bkp `SSH_REMFO`, borg distant) : commande `list(preBorg) + [BORG_EXE] + arg` (copie : la liste de
 l'appelant n'est plus modifiée), sans préfixe (décision de l'utilisateur : une clé à commande forcée « borg … » la refuserait,
 `sudo` env_reset la retirerait) — le borg distant ne reçoit la variable que par `SendEnv BORG_*`, si son sshd l'accepte
-(`AcceptEnv`) ; un environnement distant qui force `modern` reste hors couverture. Sonde de version en ssh direct : la
+(`AcceptEnv`) ; un environnement distant qui force `modern` reste hors couverture. 1.0.213 : ce mode est le défaut de `SSH_ENV`
+(voir « SSH_ENV » ci-dessous). Sonde de version en ssh direct : la
 variable atteint le client ssh local, jamais le `borg --version` distant (code 0 dans les deux modes). borgHelperWWW `_borg_env`
 (copie de `os.environ` + clés borg du rc, utilisé par `_latest_archive` et les deux routes `/download/*`) la force aussi. Les
 lectures (`_borg_ok`, `_borg_warn`, `create_mute_fail`, `_borg_stream`, `_latest_archive`) restent en convention 1.2 : borg 1.4
@@ -2826,6 +2827,49 @@ wrapper `BORG_EXE` qui force `modern` après coup. Harnais : le borg factice de 
 son fichier `b14` est une SENTINELLE de « legacy reçu » (codes modernes seulement si la variable vaut `modern` ou est
 absente ; toute autre valeur — `legacy`, `Legacy`, vide — : hérités), pas un modèle de borg 1.4 ; le borg factice du push selftest suit le vrai (absente = legacy) ; `_rb_env` pose
 `legacy` (borg réel des contrôles).
+**SSH_ENV — variables BORG_* d'un Bkp tiré (1.0.213, story 115, décisions de l'utilisateur du 2026-11-09 ; revue 1 rows 1-7)** :
+clé du rc `SSH_ENV` (nom sensible à la casse : `optionxform=str`, comme toute clé), lue par `_ssh_env_mode(cfg)` (absente ou vide :
+`sendenv` ; `sendenv`/`commande`, casse et espaces de la VALEUR ignorés ; autre : `ValueError`, texte sans secret ; « % » mal formé :
+`_RcValueError`). Seuls lanceurs de borg distant : `backup()` -> `boex(…, preBorg=…)` (inventaire : aucun autre appelant de `boex`
+avec `preBorg`, borgHelperWWW n'en a pas ; `_bkp_server_version` avec preBorg lance `BORG_REMOTE_PATH --version` LOCALEMENT, cible du
+tunnel = cette machine, jamais par ssh : non concernée ; le df par ssh de `_storage_measure` ne lance pas borg). `backup()` lit
+`SSH_ENV` UNE fois, seulement si `SSH_REMFO` est non vide (même prédicat que `preBorg`) : `sendenv` -> `preBorg =
+['ssh','-o','SendEnv BORG_*', …]` (octet pour octet comme 1.0.212) ; `commande` -> `['ssh','-T', …]` (`-T` : jamais de pty, même
+avec `RequestTTY force` dans ssh_config — un pty renverrait la passphrase en écho sur stdout). Il transmet sa décision à `boex`
+(`sshEnv=ssh_env`) : `boex` ne relit `SSH_ENV` dans le rc que si `sshEnv` est `None` (appelant direct) — avant la revue, un rc
+modifié pendant `wait_index_idle`/le rapprochement donnait un ssh sans SendEnv ni préfixe, ou une `ValueError` hors refus propre ;
+`sshEnv` hors de `_SSH_ENV_MODES` : `ValueError`. Refus, dans le `try` après `store_bkp_status_start` (comme `BORG_ROOTBKP`
+illisible : après l'attente d'un Index et `_reconcile_killed_bkp`, qui peut lancer un `borg list` local — « rien lancé » = ni ssh
+ni `borg create`, limite acceptée, revue 1 row 7), AVANT tout ssh : `SSH_ENV` inconnue, ou `commande` avec une passphrase refusée
+par `_ssh_env_pw_err` (saut de ligne : `_SSH_ENV_PW_NL` ; non encodable en UTF-8, surrogates de `-P`/`BORGHELPERC_RUNTIME_PASSPHRASE` :
+`_SSH_ENV_PW_ENC` — sinon `UnicodeEncodeError` dans `communicate` APRÈS le `Popen`, ssh orphelin) -> `[ERREUR] <nick>: <texte> — rien
+lancé`, `bkp_status` « error », `sentry_alert('bkp_error', …)` (texte sans la passphrase), `sys.exit(2)`. `boex` : `by_cmd = preBorg
+is not None and (sshEnv or _ssh_env_mode(cfg))=='commande'` (borg LOCAL d'un nick en `commande` : inchangé, passphrase par
+l'environnement) ; alors `_ssh_env_prefix(varfut)` -> (préfixe, entrée) : mêmes refus (`_ssh_env_pw_err` -> `ValueError`) ; préfixe
+`[IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; ]exec env BORG_X=<shlex.quote(valeur)> …` (`|| exit 2` : entrée à
+EOF — `StdinNull`, interruption — jamais une passphrase vide exportée, borg non lancé ; chaque `BORG_*` de l'environnement construit
+par `_borg_child_env` — exactement ce qu'enverrait `SendEnv BORG_*` —, noms triés, nom conforme à `BORG_[A-Za-z0-9_]*`, sauf
+`BORG_PASSPHRASE`), entrée = passphrase + `\n` si `BORG_PASSPHRASE` est présente (même vide), sinon `None` (pas de `read`).
+Commande : `preBorg + [préfixe, BORG_EXE] + arg` — préfixe en UN élément, `BORG_EXE` et les arguments en éléments séparés comme
+en `sendenv` (écart à la spec accepté en revue 1) : ssh joint ses arguments par une espace, le shell du compte distant reçoit la
+même chaîne qu'en un seul élément, et `create` reste un élément de l'argv du ssh local (`_proc_create_run`/`run_create_alive`
+reconnaissent toujours un Bkp tiré vivant par l'argv et `BORGHELPER_BKP_RUN` de l'environ, comme en `sendenv`). Conséquence : les
+valeurs `BORG_*` autres que la passphrase (`BORG_REPO`, `BORG_RSH`, `BORG_KEY_FILE`…) sont dans l'argv, lisible par tous
+(`/proc/*/cmdline`, ici et sur le serveur sauvegardé) — dit dans README. Environnement du ssh local : `varfut` sans les `BORG_*`
+(`BORGHELPER_BKP_RUN`/`_PID`, PATH, LC_ALL gardés). Entrée : `communicate(input=inp)` ; la passphrase est écrite et l'entrée
+fermée dès ce premier appel. La boucle d'arrêt prioritaire (`self._stop` posé) repasse `inp=None` après un délai
+(`communicate` refuse une entrée après le premier appel, ValueError) : branche INATTEIGNABLE aujourd'hui — `_stop` n'est posé que
+par l'Index et le rapprochement, jamais pendant le `borg create` d'un Bkp, seul lanceur en `commande` — gardée pour un futur
+appelant arrêtable, sans contrôle qui la couvre. Trace `-d` en `commande` : `BORG_PASSPHRASE` affichée `***` (en `sendenv`, trace
+inchangée : en clair, comme avant). Arguments de borg inchangés (déjà écrits pour le shell distant : `--comment` cité,
+`BORG_ROOTBKP` tel quel). Limites (README) : shell distant POSIX et non restreint (`rbash` interdit `exec`) ; clé à commande forcée
+(préfixe jamais exécuté) ; `sudo` dans `BORG_EXE` (env_reset retire les `BORG_*`, comme en `sendenv`) ; `BORG_EXE` dont le premier
+mot contient `=` (pris par `env` pour une affectation). Contrôle « SSH_ENV : Bkp tiré… » (relais `ssh` par PATH qui exécute la
+commande distante par `sh -c` sans `BORG_*`, entrée à EOF sur demande ; borg factice ; décision transmise à `boex` relevée ; gardes
+de `boex` appelées directement ; borg local d'un nick en `commande` ; `SSH_ENV` dans `[DEFAULT]` ; `autre` sans `SSH_REMFO`) ;
+mesure vrai borg (dépôt repokey, passphrase à caractères spéciaux, relais) : `work/s115/mesure_reel.out`, `mesure_reel2.out`
+(après la revue 1).
+
 **Téléchargements, index_last, sondes lecteur (1.0.177 / WWW 1.30.2 / UI 1.22.1, story 40)** : borgHelperWWW `_borg_stream(request,
 cmd, env, what, decoy, path, missing)` remplace `_stream_proc` — stderr de borg lu dans un thread, premier bloc lu AVANT la
 réponse : rien et code 1 + `missing` -> 404, rien et code ≥ 2/signal -> 502 (`_rb_errmsg`, leurre remplacé par le chemin

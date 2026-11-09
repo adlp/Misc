@@ -1,5 +1,31 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.213 — Variables BORG_* dans la commande ssh d'un Bkp tiré (SSH_ENV) — 2026-11-09
+
+Story 115 (demande et décisions de l'utilisateur du 2026-11-09 : « tous les serveurs ssh n'acceptent pas les variables
+d'environnement » ; mesures : contrôle « SSH_ENV : Bkp tiré… », vrai borg 1.2.6 par un BORG_EXE qui exporte un BORG_BASE_DIR de
+bac, HOME de bac — `work/s115/mesure_reel.out`, `mesure_reel2.out` après la revue 1, `~/.config/borg/security` 36 et `~/.cache/borg`
+37 avant comme après ; témoin des contrôles de la revue sur le code d'avant : `work/s115/temoin/`).
+
+- **borgHelper** : nouvelle clé du rc `SSH_ENV` (section du nick ou `[DEFAULT]`), lue pour un Bkp tiré (`SSH_REMFO`) seulement :
+  - `sendenv` (défaut, clé absente ou vide) : inchangé, octet pour octet — `ssh -o SendEnv BORG_* …`, variables reçues par le
+    borg distant seulement si le sshd du serveur sauvegardé les accepte (`AcceptEnv BORG_*`) ;
+  - `commande` : les variables `BORG_*` (celles qu'enverrait `SendEnv` : clés borg du rc, `BORG_REPO` de `SSH_REPO`,
+    `BORG_EXIT_CODES=legacy`) passent DANS la commande distante (`exec env BORG_X=<valeur citée> … <borg> …`), `ssh -T`, plus de
+    `-o SendEnv`, plus de `BORG_*` dans l'environnement du ssh local ; `BORG_PASSPHRASE` n'est jamais dans une ligne de
+    commande (ni locale ni distante) : écrite sur l'entrée de ssh, lue par le shell distant (`IFS= read -r BORG_PASSPHRASE ||
+    exit 2; export BORG_PASSPHRASE; …` : entrée vide -> code 2, borg non lancé) ; sans passphrase : aucune lecture. Les autres
+    valeurs `BORG_*` (`BORG_REPO`, `BORG_RSH`…) deviennent visibles dans `ps` (argv) : aucun secret dedans (README). Mesuré (vrai borg, dépôt repokey, passphrase avec espaces
+    en tête et en fin, `\`, `$`, `%`, guillemets ; relais `ssh` qui refuse l'environnement comme un sshd sans `AcceptEnv`) :
+    `sendenv` -> `borg create` sans dépôt, code 2 ; `commande` -> archive créée, code 0, passphrase dans aucun argv ;
+  - autre valeur : `[ERREUR] <nick>: SSH_ENV inconnu (« … » ; attendu : sendenv ou commande) — rien lancé`, code 2, Bkp « error » ;
+    `commande` avec une passphrase contenant un saut de ligne ou non encodable en UTF-8 : `[ERREUR]` (sans la valeur), code 2,
+    Bkp « error », ssh jamais lancé. Décision de `backup()` transmise à `boex` (`sshEnv`), jamais relue entre-temps.
+  - Limites (README) : shell du compte distant POSIX non restreint (pas `rbash`) ; incompatible avec une clé à commande forcée (le
+    préfixe n'est pas exécuté) ; `sudo` dans `BORG_EXE` retire les `BORG_*` comme en `sendenv` ; nom de clé en majuscules.
+  - Trace `-d` en `commande` : passphrase masquée (`***`). Report/BkpReconcile reconnaissent toujours un borg create tiré
+    vivant (`create` reste un élément de l'argv du ssh local, `BORGHELPER_BKP_RUN` dans son environnement).
+
 ## borgHelper 1.0.212, borgHelperWWW 1.34.1 — Fichier de conf illisible sans secret — 2026-10-22
 
 Chantier « reconstruction progressive », story 96 (reports 87a et 84 ; décisions de l'utilisateur du 2026-10-22 : Q96-1, Q96-2,

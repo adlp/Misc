@@ -180,7 +180,8 @@ bh.backup('mon-serveur')
 # Backup sans indexation
 bh.backup('mon-serveur', no_index=True)
 # backup() se termine par sys.exit(code) — SystemExit à attraper. 1.0.163 : SystemExit(2) avant tout borg si
-# BORG_ROOTBKP est illisible ou si aucun de ses chemins n'existe (bkp_status 'error', alerte bkp_error)
+# BORG_ROOTBKP est illisible ou si aucun de ses chemins n'existe (bkp_status 'error', alerte bkp_error) ; 1.0.213 : de même,
+# Bkp tiré (SSH_REMFO), si SSH_ENV n'est ni sendenv ni commande, ou en commande avec une passphrase à saut de ligne
 # backup() ne prend qu'UN nick : la boucle multi-nicks (`-n ALL`, 1.0.167 : un nick après l'autre, pire code, Ctrl-C
 # = sys.exit(130) relancé) est dans la CLI — un appelant Python boucle lui-même en attrapant SystemExit par nick.
 
@@ -347,7 +348,9 @@ for nick in nicks.split(','):
 ```python
 # Appel borg brut (retourne dict {stdout, stderr, exitcode})
 # 1.0.195 : borg lancé avec BORG_EXIT_CODES=legacy (posé après forceEnv ; preBorg : borg distant,
-# variable reçue seulement par SendEnv BORG_* si le sshd distant l'accepte)
+# variable reçue seulement par SendEnv BORG_* si le sshd distant l'accepte ; 1.0.213 : avec SSH_ENV = commande dans le rc,
+# BORG_* dans la commande distante et passphrase sur l'entrée de ssh — SSH_ENV inconnue avec preBorg : ValueError ;
+# paramètre sshEnv='sendenv'|'commande' : décision imposée, SSH_ENV du rc non lue ; sans preBorg : sans effet)
 # — exitcode en codes hérités (0, 1, 2…) même avec borg 1.4 ; un wrapper BORG_EXE qui force `modern` n'est pas couvert
 rb = bh.borg.boex('mon-serveur', ['list', '--json'])
 archives = rb['stdout'][0]['archives']

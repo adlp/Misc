@@ -81,6 +81,11 @@ BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue
 ;SSH_KEY = /home/backupuser/.ssh/id_ed25519
 ; Port distant à forwarder (-R), rare — laisser absent sinon :
 ;SSH_REMFO = 2222
+; Variables BORG_* du borg distant d'un Bkp tiré (SSH_REMFO, borgHelper >= 1.0.213) : sendenv (défaut, ssh -o SendEnv BORG_*,
+; il faut AcceptEnv BORG_* côté sshd) ou commande (dans la commande distante, passphrase sur l'entrée de ssh ; shell distant
+; POSIX, incompatible avec une clé à commande forcée ; les autres valeurs BORG_* deviennent visibles dans ps :
+; aucun secret dans BORG_RSH & co) :
+;SSH_ENV = commande
 
 ; ── Identification et sélection des archives ───────────────────────────────
 ; Nom court affiché/utilisé (sert aussi à dériver GLOB_ARCH si absent) :

@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.212"
+Version="1.0.213"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2347,6 +2347,51 @@ def _borg_child_env(cfg,force=None):
     if force is not None: env.update(force)
     env['PATH']=os.environ.get('PATH') or os.defpath; env['LC_ALL']='fr_FR.UTF-8'; env.update(_BORG_EXIT_CODES_ENV)
     return env
+
+# 1.0.213 (story 115, décisions de l'utilisateur du 2026-11-09) : variables BORG_* du borg DISTANT d'un Bkp tiré (SSH_REMFO, preBorg)
+# — clé du rc SSH_ENV : `sendenv` (défaut, inchangé : `ssh -o SendEnv BORG_*`, reçues seulement si le sshd du client les accepte,
+# AcceptEnv) ou `commande` (dans la commande distante : `exec env BORG_X=<valeur citée> … <borg> …`, plus de SendEnv ; tous les sshd).
+# BORG_PASSPHRASE n'est JAMAIS dans une ligne de commande : écrite sur l'entrée de ssh, lue par le shell distant (`read -r`, une ligne).
+_SSH_ENV_MODES=('sendenv','commande')
+_SSH_ENV_NAME_RE=re.compile(r'BORG_[A-Za-z0-9_]*\Z')
+_SSH_ENV_PW_NL=("BORG_PASSPHRASE contient un saut de ligne — SSH_ENV = commande la transmet sur l'entrée de ssh, en une seule ligne : "
+                "SSH_ENV = sendenv, ou une passphrase sans saut de ligne")
+_SSH_ENV_PW_ENC=("BORG_PASSPHRASE non encodable en UTF-8 (octets invalides) — SSH_ENV = commande l'écrit en UTF-8 sur l'entrée de ssh : "
+                 "SSH_ENV = sendenv, ou une passphrase en UTF-8 valide")
+
+def _ssh_env_pw_err(pw):
+    """1.0.213 (story 115, revue 1 row 2) : passphrase que SSH_ENV = commande ne peut pas écrire sur l'entrée de ssh -> texte du refus
+    (sans la valeur) : saut de ligne (`read -r` n'en lit qu'une ligne), non encodable en UTF-8 (surrogates d'octets invalides : -P,
+    BORGHELPERC_RUNTIME_PASSPHRASE) ; None : utilisable (absente comprise)."""
+    if pw is None: return None
+    if '\n' in pw: return _SSH_ENV_PW_NL
+    try: pw.encode('utf-8')
+    except UnicodeEncodeError: return _SSH_ENV_PW_ENC
+    return None
+
+def _ssh_env_mode(cfg):
+    """1.0.213 (story 115) : SSH_ENV du nick -> 'sendenv' (absente ou vide : défaut) ou 'commande' (casse et espaces ignorés) ;
+    autre valeur : ValueError (texte sans secret : la valeur de SSH_ENV seule). Valeur à « % » mal formée : _RcValueError (rc illisible)."""
+    try: v=(cfg.get('SSH_ENV') or '').strip()
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None
+    if not v: return 'sendenv'
+    if v.lower() in _SSH_ENV_MODES: return v.lower()
+    raise ValueError(f"SSH_ENV inconnu (« {v[:40]} » ; attendu : sendenv ou commande)")
+
+def _ssh_env_prefix(env):
+    """1.0.213 (story 115) : SSH_ENV = commande — (préfixe de la commande distante, entrée de ssh ou None). Préfixe :
+    `[IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; ]exec env BORG_X=<shlex.quote(valeur)> …` — chaque BORG_* de `env`
+    (environnement de boex : celles qu'enverrait SendEnv BORG_*), noms triés, sauf BORG_PASSPHRASE ; ssh le joint par une espace à
+    `<borg> <arguments>` (inchangés : déjà écrits pour le shell distant) et le shell du compte distant (POSIX supposé) l'exécute.
+    BORG_PASSPHRASE présente (même vide) : entrée = passphrase + saut de ligne ; absente : None, pas de lecture. Entrée à EOF
+    (StdinNull, interruption) : `exit 2` (revue 1 row 4 : jamais une passphrase vide exportée). Saut de ligne ou passphrase non
+    encodable en UTF-8 : ValueError (_ssh_env_pw_err, jamais la valeur)."""
+    pw=env.get('BORG_PASSPHRASE')
+    err=_ssh_env_pw_err(pw)
+    if err: raise ValueError(err)
+    pre='IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; ' if pw is not None else ''
+    sets=[f"{k}={shlex.quote(env[k])}" for k in sorted(env) if k!='BORG_PASSPHRASE' and _SSH_ENV_NAME_RE.match(k)]
+    return pre+' '.join(['exec','env']+sets),(pw+'\n' if pw is not None else None)
 
 def _borg_ok(rb):
     """1.0.176 (story 39, A77, décision de l'utilisateur) : résultat boex utilisable — code 0, ou 1 (avertissement de borg, sortie
@@ -7421,16 +7466,30 @@ class BorgRunner:
         except OSError: return False   # présent mais inaccessible (droits) : jamais « absent »
         return False
 
-    def boex(self,nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True):
+    def boex(self,nick,arg,rep=None,debug=0,preBorg=None,forceEnv=None,retjson=True,sshEnv=None):
         cfg=self.cfgreaded(nick,debug=debug)
         if debug!=0: printer('Boex the first')
         varfut=_borg_child_env(cfg,forceEnv)   # 1.0.195 (story 72, D134) : codes hérités, même avec borg 1.4 (après forceEnv)
-        if debug!=0: printer(varfut)
+        # 1.0.213 (story 115) : SSH_ENV = commande (borg distant seulement) — lue AVANT la trace -d, qui ne montre alors jamais la passphrase.
+        # Revue 1 row 1 : sshEnv ('sendenv'|'commande') = décision de l'appelant (backup() : celle de ses refus et de son preBorg) ;
+        # None : SSH_ENV lue dans le rc
+        if sshEnv is not None and sshEnv not in _SSH_ENV_MODES: raise ValueError(f"sshEnv inconnu ({sshEnv!r})")
+        by_cmd=preBorg is not None and (sshEnv or _ssh_env_mode(cfg))=='commande'
+        if debug!=0: printer({k:('***' if k=='BORG_PASSPHRASE' else v) for k,v in varfut.items()} if by_cmd else varfut)
         borg_exe=cfg.get('BORG_EXE','borg')
-        if preBorg is not None:
+        inp=None
+        if by_cmd:
+            # 1.0.213 (story 115, décisions de l'utilisateur) : BORG_* dans la commande distante (_ssh_env_prefix), un élément de l'argv
+            # de ssh, puis `<borg> <arguments>` en éléments séparés comme en sendenv (ssh les joint : même commande distante qu'en une
+            # chaîne) — run_create_alive reconnaît toujours ce `create` dans l'argv du ssh local ; passphrase par l'entrée de ssh ;
+            # BORG_* retirées de l'environnement du ssh local (BORGHELPER_BKP_RUN/PID gardées : run_create_alive, environ)
+            pre,inp=_ssh_env_prefix(varfut)
+            commande=list(preBorg)+[pre,borg_exe]
+            varfut={k:v for k,v in varfut.items() if not k.startswith('BORG_')}
+        elif preBorg is not None:
             # 1.0.195 (revue story 72) : copie — la liste de l'appelant n'est plus modifiée. Borg DISTANT : BORG_EXIT_CODES=legacy
             # ne lui parvient que par `SendEnv BORG_*`, si le sshd distant l'accepte (AcceptEnv) — jamais de préfixe sur la commande
-            # distante (décision de l'utilisateur : clé à commande forcée « borg … », sudo env_reset)
+            # distante (décision de l'utilisateur : clé à commande forcée « borg … », sudo env_reset) ; 1.0.213 : défaut SSH_ENV = sendenv
             commande=list(preBorg); commande.append(borg_exe)
         else:
             commande=[borg_exe]
@@ -7447,11 +7506,15 @@ class BorgRunner:
         killed=False; tree=None; meis=set()   # 1.0.179 (A91) : arbre relevé et _MEI* mappés de ce borg (s'il est tué)
         try:
             stop=self._stop
-            if stop is None: inf,errs=ps.communicate()
+            # 1.0.213 (story 115) : inp = passphrase de SSH_ENV = commande (sinon None : entrée fermée aussitôt, comme avant) ; donnée
+            # au PREMIER appel seulement (communicate refuse une entrée ensuite : ValueError) ; une ligne courte : écrite dans le tube et entrée
+            # fermée dès ce premier appel
+            if stop is None: inf,errs=ps.communicate(input=inp)
             else:
                 while True:
-                    try: inf,errs=ps.communicate(timeout=0.5); break
+                    try: inf,errs=ps.communicate(input=inp,timeout=0.5); break
                     except subprocess.TimeoutExpired:
+                        inp=None
                         if stop():
                             # SIGTERM d'abord : borg relâche son verrou de dépôt (et ferme proprement un borg serve
                             # distant) ; SIGKILL seulement s'il ne s'arrête pas en 5 s.
@@ -8990,7 +9053,13 @@ class BorgHelper:
             forceEnv={'BORG_REPO':cfg['SSH_REPO']}
         else:
             forceEnv=None
-        preBorg=['ssh','-o','SendEnv BORG_*']
+        # 1.0.213 (story 115) : SSH_ENV lue pour un Bkp tiré seulement (SSH_REMFO non vide : preBorg) ; `commande` -> ni `-o SendEnv`
+        # ni BORG_* dans l'environnement de ssh (boex) ; valeur inconnue, passphrase à saut de ligne : refus plus bas, rien lancé
+        ssh_env,ssh_env_err='sendenv',None
+        if 'SSH_REMFO' in cfg.keys() and len(cfg['SSH_REMFO'])>0:
+            try: ssh_env=_ssh_env_mode(cfg)
+            except ValueError as e: ssh_env_err=str(e)
+        preBorg=['ssh','-T'] if ssh_env=='commande' else ['ssh','-o','SendEnv BORG_*']   # revue 1 row 3 : -T, jamais d'écho par un pty
         if 'SSH_REMFO' in cfg.keys():
             preBorg.append('-R'); preBorg.append(cfg['SSH_REMFO'])
         preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_LOGIN"]}@{cfg["SER_NAME"]}'.split(' '))
@@ -9055,6 +9124,17 @@ class BorgHelper:
             # 1.0.163 (story 26, choix de l'utilisateur) : borg local seulement (avec SSH_REMFO, borg tourne sur la machine
             # distante, ses chemins ne se vérifient pas ici). Chemin absent : [WARN], les autres sont sauvegardés (borg
             # ferait de même, code 1) ; tous absents : aucune archive vide, Bkp en échec (code 2, Status, notifications).
+            # 1.0.213 (story 115) : SSH_ENV inconnue, ou passphrase à saut de ligne avec SSH_ENV = commande (`read -r` n'en lit qu'une
+            # ligne) -> [ERREUR], code 2, bkp_status « error », AVANT ssh ; message sans la passphrase
+            if ssh_env_err is None and ssh_env=='commande':
+                try: pw=cfg.get('BORG_PASSPHRASE')
+                except configparser.InterpolationError: pw=None   # rc illisible : dit par boex, comme avant
+                ssh_env_err=_ssh_env_pw_err(pw)   # revue 1 row 2 : aussi non encodable en UTF-8
+            if ssh_env_err:
+                printer(f"[ERREUR] {nick}: {ssh_env_err} — rien lancé")
+                self.db.store_bkp_status_finish(nick,run_id,'error',bkp_status_db)
+                sentry_alert('bkp_error',nick,f"Sauvegarde en échec — {nick} ({ssh_env_err})",cfg,extra={'exitcode':2})
+                sys.exit(2)
             missing=[]
             if preBorg is None:
                 missing=[r for r in (roots or []) if _local_state(r)=='absent']   # accès refusé, délai : présent (borg tranche)
@@ -9066,7 +9146,7 @@ class BorgHelper:
                     sentry_alert('bkp_error',nick,f"Sauvegarde en échec — {nick} ({msg})",cfg,extra={'exitcode':2})
                     sys.exit(2)
             # 1.0.184 (story 52) : le run_id dans l'environnement de borg create — Report reconnaît ce borg s'il survit à borgHelper
-            anaRet=self.borg.boex(nick,create,preBorg=preBorg,debug=debug,
+            anaRet=self.borg.boex(nick,create,preBorg=preBorg,debug=debug,sshEnv=ssh_env,   # revue 1 row 1 : sa décision, jamais relue
                                   forceEnv=dict(forceEnv or {},BORGHELPER_BKP_RUN=run_id,BORGHELPER_BKP_PID=f"{os.getpid()}:{_proc_start(os.getpid())}"))
             newretC=0
             if anaRet['exitcode']:
@@ -24134,6 +24214,172 @@ fail()
             if bad: print(f"  {bad}")
             return not bad
         check("codes de sortie hérités demandés à borg (BORG_EXIT_CODES=legacy) : borg 1.4 « moderne » = borg 1.2 — avertissement gardé, erreur en échec, sondes de version (D134)",_bf_codes14)
+        def _ssh_env_cmd():
+            """1.0.213 (story 115, décisions de l'utilisateur du 2026-11-09 ; revue 1 rows 1-6) : Bkp tiré (SSH_REMFO) par le vrai backup()
+            et le vrai boex ; `ssh` = relais (PATH) qui note son argv, son entrée et les BORG_* de son environnement, puis exécute la
+            commande distante (arguments après la destination, joints par une espace comme ssh) par `sh -c` dans un environnement SANS
+            BORG_* (sshd sans AcceptEnv ; fichier `nostdin` : entrée remplacée par une entrée vide, EOF) ; borg factice (BORG_EXE) qui
+            note son argv et les BORG_* reçus. sendenv (clé absente ; `sendenv`) : argv de ssh de 1.0.212 (en dur), BORG_* dans
+            l'environnement de ssh, entrée vide, borg distant sans aucune BORG_*, boex reçoit sshEnv='sendenv'. commande : `-T`, sans
+            `-o SendEnv`, préfixe exact (valeurs citées, `read -r … || exit 2`), boex reçoit sshEnv='commande', borg reçoit
+            BORG_EXIT_CODES=legacy, BORG_REMOTE_PATH, BORG_REPO = SSH_REPO (espace, apostrophe), BORG_PASSPHRASE exacte (espaces en tête
+            et en fin, \\, $, %, guillemets, ;), arguments de borg identiques à sendenv (commentaire du run intact) ; passphrase (fragment
+            `x%y`, présent sous toutes ses formes : brute, repr, citée) dans aucun argv (ssh, borg), ni dans l'environnement de ssh
+            (BORGHELPER_BKP_RUN y reste), ni dans la sortie de -d, où la ligne masquée `'BORG_PASSPHRASE': '***'` est imprimée ; sans
+            passphrase (`Commande`) : pas de lecture, entrée vide, borg sans BORG_PASSPHRASE ; `SSH_ENV` dans [DEFAULT] : suivie.
+            `create` reste un élément de l'argv du ssh local (run_create_alive). SSH_ENV inconnue, passphrase à saut de ligne ou non
+            encodable en UTF-8 : [ERREUR] code 2, ssh jamais lancé, bkp_status « error ». SSH_ENV=autre sur un nick sans SSH_REMFO : Bkp
+            local, aucun refus. boex direct : borg local d'un nick en commande (argv [borg,'list','--json'], passphrase par
+            l'environnement, aucun relais) ; gardes propres à boex (valeur inconnue, saut de ligne, non UTF-8 : ValueError, rien lancé) ;
+            sshEnv l'emporte sur le rc (commande sur un rc `autre`, sendenv sur un rc `commande`) ; entrée à EOF -> `exit 2`, borg jamais
+            lancé. Attentes en dur."""
+            d=os.path.join(tmp,'sshenv115'); shutil.rmtree(d,ignore_errors=True); os.makedirs(os.path.join(d,'bin')); rc=os.path.join(d,'rc')
+            rc2=os.path.join(d,'rc2'); rlog=os.path.join(d,'relais.jsonl'); blog=os.path.join(d,'borg.jsonl')
+            relay=os.path.join(d,'bin','ssh'); fb=os.path.join(d,'borgfx'); srv=os.path.join(d,'borgsrv'); repo=os.path.join(d,'repo')
+            with open(relay+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json,subprocess
+a=sys.argv[1:]; i=0; dest=None
+while i<len(a):
+    x=a[i]
+    if x in ('-o','-R','-i','-p','-L','-l','-F','-J','-E','-S','-W','-b','-c','-m','-D','-e','-w','-B','-Q','-O','-I'): i+=2; continue
+    if x.startswith('-'): i+=1; continue
+    if dest is None: dest=x; i+=1; continue
+    break
+cmd=' '.join(a[i:]); data=sys.stdin.buffer.read()
+if os.path.exists({os.path.join(d,'nostdin')!r}): data=b''
+open({rlog!r},'a').write(json.dumps(dict(argv=a,cmd=cmd,stdin=data.decode('utf-8','replace'),env={{k:v for k,v in os.environ.items() if k.startswith('BORG')}}))+chr(10))
+env={{k:v for k,v in os.environ.items() if not k.startswith('BORG_')}}
+sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
+''')
+            os.chmod(relay+'.tmp',0o700); os.replace(relay+'.tmp',relay)
+            with open(fb+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json
+a=sys.argv[1:]
+open({blog!r},'a').write(json.dumps(dict(argv=a,env={{k:v for k,v in os.environ.items() if k.startswith('BORG_')}}))+chr(10))
+if a[:1]==['create']:
+    sys.stderr.write(json.dumps(dict(type='log_message',levelname='INFO',name='borg.output.show-version',message='borgbackup version 1.2.6'))+chr(10))
+    print(json.dumps(dict(archive=dict(name='a1',start='2026-11-09T10:00:00.000000',duration=1,stats=dict(original_size=1,compressed_size=1,
+          deduplicated_size=1,nfiles=1)),cache=dict(stats=dict()))))
+sys.exit(0)
+''')
+            os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+            with open(srv,'w') as f: f.write('#!/bin/sh\necho "borg 1.2.6"\n')
+            os.chmod(srv,0o700)
+            base=(f"SER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nBORG_ARCHNAME=t\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nNOIDX=1\n"
+                  f"BORG_EXE={fb}\nBORG_REMOTE_PATH={srv}\nBORG_REPO={repo}\n")
+            common=base+"SSH_REMFO=2222:localhost:22\n"
+            head=f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\n"
+            with open(rc,'w') as f:
+                f.write(f"{head}\n[se0]\n{common}BORG_PASSPHRASE=pw\n\n[se1]\n{common}BORG_PASSPHRASE=pw\nSSH_ENV=sendenv\n\n"
+                        f"[sc]\n{common}SSH_REPO=u@h:/r 'x\nSSH_ENV=commande\n\n"
+                        f"[sn]\n{common}SSH_ENV= Commande \n\n[sx]\n{common}BORG_PASSPHRASE=pw\nSSH_ENV=autre\n\n"
+                        f"[sl]\n{common}SSH_ENV=commande\n\n[su]\n{common}SSH_ENV=commande\n\n"
+                        f"[lx]\n{base}BORG_PASSPHRASE=pw\nBORG_ROOTBKP={d}\nSSH_ENV=autre\n")
+            with open(rc2,'w') as f: f.write(f"{head}SSH_ENV=commande\n\n[sd]\n{common}BORG_PASSPHRASE=pw\n")
+            for p in (rc,rc2): os.chmod(p,0o600)
+            PW='  p\\a\'ss" $HOME;x%y  '
+            PATHENV={'PATH':os.path.join(d,'bin')+os.pathsep+os.environ.get('PATH',os.defpath)}
+            def logs(n0):
+                rl=[json.loads(x) for x in (open(rlog).read().splitlines()[n0[0]:] if os.path.exists(rlog) else [])]
+                bl=[json.loads(x) for x in (open(blog).read().splitlines()[n0[1]:] if os.path.exists(blog) else [])]
+                return rl,bl
+            def mark(): return [len(open(p).read().splitlines()) if os.path.exists(p) else 0 for p in (rlog,blog)]
+            def run(nick,pw=None,debug=0,rcf=rc):
+                b=BorgHelper(cfgfile=rcf,cache_dir=os.path.join(d,'cache'),passphrase=pw)
+                n0=mark(); o=io.StringIO(); code=0; seen=[]; real=b.borg.boex
+                def spy(*a_,**k_):
+                    if a_[1][:1]==['create']: seen.append(k_.get('sshEnv','absent'))
+                    return real(*a_,**k_)
+                with mock.patch.dict(os.environ,PATHENV),mock.patch.object(b.borg,'boex',spy), \
+                     contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup(nick,no_index=True,debug=debug)
+                    except SystemExit as e: code=e.code or 0
+                    except Exception as e: code=f"{type(e).__name__}: {e}"   # sous-contrôle en échec, jamais tout le contrôle
+                rl,bl=logs(n0)
+                rows=_q(b.db.get_history_db(nick),f"SELECT result FROM bkp_status WHERE nick='{nick}'") if os.path.exists(b.db.get_history_db(nick)) else []
+                return code,o.getvalue(),[r for r in rl if fb in r['argv']],[x for x in bl if x['argv'][:1]==['create']],[r[0] for r in rows],seen,rl
+            def bx(nick,args,pw=None,**kw):
+                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'),passphrase=pw)
+                n0=mark()
+                with mock.patch.dict(os.environ,PATHENV),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    try: r=b.borg.boex(nick,args,**kw)
+                    except Exception as e: r=f"{type(e).__name__}: {e}"
+                return (r,)+logs(n0)
+            res={}
+            SSHOPT=['-R','2222:localhost:22','-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','x@h']
+            norm=lambda a: [re.sub(r'borgHelper run [0-9a-f]{32}','borgHelper run R',x) for x in a]
+            BORGENV={'BORG_REPO':repo,'BORG_PASSPHRASE':'pw','BORG_REMOTE_PATH':srv,'BORG_EXIT_CODES':'legacy'}
+            READ="IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; "
+            tails={}
+            for nk in ('se0','se1'):
+                code,out,cr,bc,rows,seen,_=run(nk)
+                a=cr[0]['argv'] if len(cr)==1 else []
+                tails[nk]=norm(a[a.index(fb):]) if fb in a else None
+                res[nk]=(code==0 and len(cr)==1 and a[:len(SSHOPT)+4]==['-o','SendEnv BORG_*']+SSHOPT+[fb,'create'] and cr[0]['stdin']==''
+                         and cr[0]['env'].get('BORGHELPER_BKP_RUN') and {k:v for k,v in cr[0]['env'].items() if k.startswith('BORG_')}==BORGENV
+                         and len(bc)==1 and bc[0]['env']=={} and rows==['success'] and seen==['sendenv'],code,a[:14],cr[0]['env'] if cr else None,bc,rows,seen,out[-300:])
+            code,out,cr,bc,rows,seen,_=run('sc',pw=PW,debug=1)
+            a=cr[0]['argv'] if len(cr)==1 else []
+            pre=READ+f"exec env BORG_EXIT_CODES=legacy BORG_REMOTE_PATH={srv} BORG_REPO='u@h:/r '\"'\"'x'"
+            argv_all=a+(bc[0]['argv'] if bc else [])
+            res['commande']=(code==0 and len(cr)==1 and a[:len(SSHOPT)+4]==['-T']+SSHOPT+[pre,fb,'create'] and 'SendEnv BORG_*' not in a
+                             and next((x for x in a if x in _BORG_SUBCMDS),None)=='create'   # run_create_alive : create vu dans l'argv du ssh
+                             and cr[0]['stdin']==PW+'\n' and not any(k.startswith('BORG_') for k in cr[0]['env']) and cr[0]['env'].get('BORGHELPER_BKP_RUN')
+                             and len(bc)==1 and bc[0]['env']=={'BORG_EXIT_CODES':'legacy','BORG_REMOTE_PATH':srv,'BORG_REPO':"u@h:/r 'x",'BORG_PASSPHRASE':PW}
+                             and norm(a[a.index(fb):] if fb in a else [])==tails['se0'] and rows==['success'] and seen==['commande'],
+                             code,a[:12],cr[0]['stdin'] if cr else None,cr[0]['env'] if cr else None,bc,rows,seen,out[-400:])
+            res['passphrase : aucun argv, ni la sortie de -d (ligne masquée imprimée)']=(bool(argv_all) and bool(cr)
+                and not any('x%y' in x for x in argv_all+[cr[0]['cmd']]) and 'x%y' not in out and "'BORG_PASSPHRASE': '***'" in out,len(argv_all))
+            res['comment intact']=(bool(bc) and bc[0]['argv'][1]=='--comment' and re.fullmatch(r'borgHelper run [0-9a-f]{32}',bc[0]['argv'][2]) is not None,bc[0]['argv'][:3] if bc else None)
+            code,out,cr,bc,rows,seen,_=run('sn')
+            a=cr[0]['argv'] if len(cr)==1 else []
+            res['commande sans passphrase']=(code==0 and len(cr)==1 and a[0]=='-T' and a[len(SSHOPT)+1]==f"exec env BORG_EXIT_CODES=legacy BORG_REMOTE_PATH={srv} BORG_REPO={repo}"
+                                             and cr[0]['stdin']=='' and len(bc)==1 and 'BORG_PASSPHRASE' not in bc[0]['env'] and rows==['success'],code,a[:10],bc,rows,out[-300:])
+            code,out,cr,bc,rows,seen,_=run('sd',rcf=rc2)
+            a=cr[0]['argv'] if len(cr)==1 else []
+            res['SSH_ENV dans [DEFAULT]']=(code==0 and len(cr)==1 and a[:len(SSHOPT)+2]==['-T']+SSHOPT+[READ+f"exec env BORG_EXIT_CODES=legacy BORG_REMOTE_PATH={srv} BORG_REPO={repo}"]
+                                           and cr[0]['stdin']=='pw\n' and len(bc)==1 and bc[0]['env'].get('BORG_PASSPHRASE')=='pw' and rows==['success'],code,a[:11],bc,rows,out[-300:])
+            code,out,cr,bc,rows,seen,_=run('sx')
+            res['SSH_ENV inconnue']=(code==2 and '[ERREUR] sx: SSH_ENV inconnu (« autre » ; attendu : sendenv ou commande) — rien lancé' in out
+                                      and not cr and not bc and rows==['error'],code,out[-300:],rows)
+            code,out,cr,bc,rows,seen,_=run('sl',pw='a\nb')
+            res['passphrase à saut de ligne']=(code==2 and "[ERREUR] sl: BORG_PASSPHRASE contient un saut de ligne — SSH_ENV = commande la transmet sur l'entrée de ssh, en une seule ligne : SSH_ENV = sendenv, ou une passphrase sans saut de ligne — rien lancé" in out
+                                                and not cr and not bc and rows==['error'] and 'a\nb' not in out,code,out[-300:],rows)
+            code,out,cr,bc,rows,seen,_=run('su',pw='a\udcffb')
+            res['passphrase non UTF-8']=(code==2 and "[ERREUR] su: BORG_PASSPHRASE non encodable en UTF-8 (octets invalides) — SSH_ENV = commande l'écrit en UTF-8 sur l'entrée de ssh : SSH_ENV = sendenv, ou une passphrase en UTF-8 valide — rien lancé" in out
+                                         and not cr and not bc and rows==['error'],code,out[-300:],rows)
+            code,out,cr,bc,rows,seen,rl=run('lx')
+            res['SSH_ENV=autre sans SSH_REMFO : Bkp local, aucun refus']=(code==0 and not rl and len(bc)==1 and bc[0]['argv'][:2]==['create','--comment']
+                and bc[0]['env']==BORGENV and rows==['success'] and '[ERREUR]' not in out,code,rl,bc,rows,out[-300:])
+            r,rl,bl=bx('sc',['list','--json'],pw=PW)
+            res['boex local d\'un nick en commande']=(isinstance(r,dict) and r.get('exitcode')==0 and not rl
+                and bl==[{'argv':['list','--json'],'env':{'BORG_EXIT_CODES':'legacy','BORG_REMOTE_PATH':srv,'BORG_REPO':repo,'BORG_PASSPHRASE':PW}}],r,rl,bl)
+            r,rl,bl=bx('sx',['list'],preBorg=['ssh','x@h'])
+            res['boex : SSH_ENV inconnue']=(r=="ValueError: SSH_ENV inconnu (« autre » ; attendu : sendenv ou commande)" and not rl and not bl,r,rl,bl)
+            r,rl,bl=bx('sl',['list'],pw='a\nb',preBorg=['ssh','x@h'])
+            res['boex : saut de ligne']=(r=="ValueError: BORG_PASSPHRASE contient un saut de ligne — SSH_ENV = commande la transmet sur l'entrée de ssh, en une seule ligne : SSH_ENV = sendenv, ou une passphrase sans saut de ligne"
+                                         and not rl and not bl,r,rl,bl)
+            r,rl,bl=bx('sl',['list'],pw='a\udcffb',preBorg=['ssh','x@h'])
+            res['boex : non UTF-8']=(r=="ValueError: BORG_PASSPHRASE non encodable en UTF-8 (octets invalides) — SSH_ENV = commande l'écrit en UTF-8 sur l'entrée de ssh : SSH_ENV = sendenv, ou une passphrase en UTF-8 valide"
+                                     and not rl and not bl,r,rl,bl)
+            r,rl,bl=bx('sx',['list','--json'],preBorg=['ssh','-T','x@h'],sshEnv='commande')
+            res['boex : sshEnv commande l\'emporte sur le rc']=(isinstance(r,dict) and r.get('exitcode')==0 and len(rl)==1
+                and rl[0]['argv']==['-T','x@h',READ+f"exec env BORG_EXIT_CODES=legacy BORG_REMOTE_PATH={srv} BORG_REPO={repo}",fb,'list','--json']
+                and rl[0]['stdin']=='pw\n' and len(bl)==1 and bl[0]['env'].get('BORG_PASSPHRASE')=='pw',r,rl,bl)
+            r,rl,bl=bx('sc',['list','--json'],pw=PW,preBorg=['ssh','x@h'],sshEnv='sendenv')
+            res['boex : sshEnv sendenv l\'emporte sur le rc']=(isinstance(r,dict) and r.get('exitcode')==0 and len(rl)==1
+                and rl[0]['argv']==['x@h',fb,'list','--json'] and rl[0]['stdin']=='' and rl[0]['env'].get('BORG_PASSPHRASE')==PW
+                and bl==[{'argv':['list','--json'],'env':{}}],r,rl,bl)
+            open(os.path.join(d,'nostdin'),'w').close()
+            try: r,rl,bl=bx('sc',['list','--json'],pw=PW,preBorg=['ssh','-T','x@h'])
+            finally: os.remove(os.path.join(d,'nostdin'))
+            res['entrée à EOF : exit 2, borg jamais lancé']=(isinstance(r,dict) and r.get('exitcode')==2 and len(rl)==1 and rl[0]['stdin']=='' and not bl,r,rl,bl)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("SSH_ENV : Bkp tiré, BORG_* par SendEnv (défaut, argv de 1.0.212) ou dans la commande ssh, passphrase par l'entrée de ssh, refus (story 115)",_ssh_env_cmd)
         def _borg_env_path():
             """1.0.195 (story 72, revue 2 ; mutation E2 survivante) : PATH absent ou vide dans l'environnement de borgHelper -> borg
             reçoit os.defpath, jamais une chaîne vide (Popen chercherait borg/ssh dans le dossier courant) ; PATH présent : gardé ;
