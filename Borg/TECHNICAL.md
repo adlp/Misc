@@ -2995,6 +2995,76 @@ de `boex` appelées directement ; borg local d'un nick en `commande` ; `SSH_ENV`
 mesure vrai borg (dépôt repokey, passphrase à caractères spéciaux, relais) : `work/s115/mesure_reel.out`, `mesure_reel2.out`
 (après la revue 1).
 
+**Bkp tiré : BORG_REPO et BORG_RSH du client construits (1.0.216, story 117, décisions de l'utilisateur des 2026-11-09 et
+2026-11-11)** : `_bkp_pull_env(cfg,nick)` — `None` (inactive : `SSH_REPO_USER` ou `SSH_REMFO` absente du rc, ou `SSH_REPO` /
+`BORG_RSH` présente — décidé sur `cfg.keys()` AVANT toute lecture de valeur, un `%` mal formé d'un nick inactif ne lève rien ;
+puis `SSH_REMFO` ou `SSH_REPO_USER` vide), sinon `({'BORG_REPO','BORG_RSH'}, None)` ou `(None, texte du refus)`. `backup()` l'appelle
+seulement si `preBorg` n'est pas `None` (Bkp tiré) ; construite : fusionnée dans `forceEnv` (même chemin que `SSH_REPO` :
+`_borg_child_env` -> `SendEnv BORG_*`, ou préfixe `exec env` de `SSH_ENV = commande`) ET, en `sendenv`, passée à `boex(cmdEnv=…)`,
+qui insère `exec env BORG_REPO=<shlex.quote> BORG_RSH=<shlex.quote>` (noms triés) comme élément de l'argv du ssh local juste avant
+`<BORG_EXE>` (décision de l'utilisateur, revue 1 row 1 : un `AcceptEnv` sans `BORG_RSH` ou un `export` du shell du client ne
+peuvent plus les perdre ; `create` reste un élément de l'argv pour `run_create_alive` ; `cmdEnv=None` -> argv de 1.0.215) ; en
+`commande`, déjà dans le préfixe. Revue 2 row 20 : de plus `create[3:3]=['--rsh',shlex.quote(BORG_RSH)]` (après `--comment <run>`,
+que `_proc_create_run` exige juste après `create` ; cité : le shell distant redécoupe) — un argument survit à `BORG_EXE = sudo
+borg` (env_reset ; mesuré : `work/s117/mesure3.out`, borg 1.2.6) et à une commande forcée qui ne relance que `borg …` (déduit, non
+mesuré). Refus : rejoint `ssh_env_err` (même bloc que `SSH_ENV` : `[ERREUR] <nick>: <texte> — rien lancé`,
+`bkp_status` « error », Sentry `bkp_error`, code 2, avant tout ssh) ; refus connu AVANT `getlastbkp` (`pull_err` ou `ssh_env_err` de
+la lecture de `SSH_ENV`) : `archive_old` n'est pas cherché, aucun `borg list` (revue 1 row 4 ; `_reconcile_killed_bkp` reste avant le
+refus : bkp_status inchangé). Valeur à `%` mal formée : `_RcValueError` (comme `_ssh_env_mode`). Construction :
+- `BORG_REPO = ssh://<user>@<hôte>:<int(port écouté)><chemin>` ; port de `_remfo_target` revérifié `[0-9]+` ASCII et 1..65535
+  (revue 1 row 3 : `isdigit` accepte `²` et la pleine chasse -> `ValueError` hors du `try`), port de la cible aussi (revue 2 row 28) ; hôte par le même découpage (`:` hors
+  crochets) : 4 champs -> adresse d'écoute ; `_PULL_BIND_ANY` (vide, `*`, `localhost`, casse ignorée) ou `ipaddress` non spécifiée
+  (`0.0.0.0`, `::`, `0:…:0`) -> `127.0.0.1` ; autre IP gardée (IPv6 entre crochets) ; IPv6 à zone (`scope_id`) ou texte non IP :
+  refus (revue 1 row 11) ; chemin = `BORG_REPO` du serveur (préfixe `file://` retiré) commençant par `/`, ou groupe chemin de
+  `_PULL_REPO_SSH_RE` (même forme que `_storage_repo_path`, `/~/…` et `/./…` gardés) ; `{`, `\n` ou `\r` n'importe où dans
+  `BORG_REPO` : refus.
+  Forme à une barre mesurée (`ssh://u@127.0.0.1:p/abs`, borg 1.2.6) ; la forme `//abs` marche aussi (borg la voit comme un autre
+  emplacement : « previously located at »), non retenue.
+- `BORG_RSH = shlex.join([...])` (découpé par `shlex.split` dans borg) : `BatchMode=yes`, `StrictHostKeyChecking=yes`,
+  `UserKnownHostsFile=/dev/null`, `GlobalKnownHostsFile=/dev/null` (aucun known_hosts lu ni écrit — mesuré ; `UpdateHostKeys`
+  inactif quand UserKnownHostsFile est changé, d'après ssh_config(5)), `HostKeyAlias=borghelper-<nick>` (minuscules, hors `[a-z0-9._-]` -> `_` : un
+  nom de known_hosts est un motif), `KnownHostsCommand=<texte>` avec `%` doublé (jetons d'OpenSSH, `percent_dollar_expand` des
+  arguments 1..n), `[IdentitiesOnly=yes, -i <SSH_REPO_KEY>]`. Le texte est découpé par `argv_split` d'OpenSSH : mots de
+  `_ssh_cfg_word` (nus si `[A-Za-z0-9@%+=:,./_-]+`, sinon entre apostrophes ; `\` et `'` échappés, jamais présents en pratique) ;
+  commande `/bin/sh -c 'for l do echo "$l"; done' sh '<alias> <type> <base64>' …` — chemin absolu (exigé par ssh), aucune
+  barre oblique inverse ni `%` dans le programme, `"$l"` hors de la forme `${…}` développée par ssh ; une ligne par clé.
+- Clés (`_pull_hostkeys(cfg,remfo)`) : `SSH_REPO_HOSTKEY` si non vide (découpée à CHAQUE saut de ligne, puis par
+  `_PULL_HOSTKEY_SEP` : `,` SUIVIE de `<type> AAAA…` — une `,` de commentaire ne coupe pas ; `AAAA` : longueur du type < 2^8 ;
+  mot de commentaire qui commence par `_PULL_KEYWORD_RE` (vrais types OpenSSH : `ssh-(rsa|dss|ed25519|ed448|xmss)`, `ecdsa-sha2-`,
+  `sk-(ssh|ecdsa)`, casse ignorée) : refus — revues 2 row 21 et 3 row 34 ; vides ignorés ; chacun par `_pull_hostkey` : `<type>
+  <base64>[ commentaire]`, `_pull_key_blob` = type `[a-z0-9][a-z0-9@._-]*` sans `-cert-`, base64 strict ET aller-retour exact,
+  blob = au moins 2 chaînes SSH couvrant exactement sa longueur, la première = le type ; un commentaire contenant une autre paire
+  `<type> <base64>` cohérente = deux clés sur une ligne : refus ; commentaire retiré — revue 1 row 2) ; sinon cible locale
+  (`_remfo_target_local(remfo)`, évaluée seulement dans cette branche — revue 1 row 6 : pas de `getfqdn` non borné quand
+  `SSH_REPO_HOSTKEY` est posée ; il reste pour une cible non locale sans clé, différé) : `glob(_PULL_HOSTKEY_GLOB)` trié
+  (`/etc/ssh/ssh_host_*_key.pub`, remplacé par un bac dans les contrôles), première ligne (64 Kio au plus) de chaque fichier ;
+  un fichier illisible ou mal formé : refus qui nomme ce fichier (revue 3 row 34 ; `_pull_hostkeys` rend alors le texte) ; aucune
+  clé : refus `_PULL_HOSTKEY_ERR`. Pourquoi tout ou rien : mesuré (OpenSSH 8.9,
+  `work/s117/mesure2.out`), une clé d'hôte d'un type présenté par le sshd mais absente de la liste fait échouer ssh dès qu'une
+  autre clé y est (« has changed »), une clé en trop d'un type non présenté est sans effet (`work/s117/mesure.out`, cas 3).
+- `SSH_REPO_KEY` avec `%` ou `${` : refus (`${` : même développement d'OpenSSH, déduit ; `%` mesuré : `ssh -i` fait `stat` du chemin littéral à la lecture de l'option puis développe les
+  jetons au chargement — `%x` -> « unknown key », `%%x` -> fichier introuvable puis identités par défaut). `-o IdentityFile=` le
+  permettrait (découpage `argv_split` à gérer) : non retenu, la story fixe `-i`.
+- `SSH_REPO_USER` : `[A-Za-z0-9_][A-Za-z0-9_.-]*` (jamais un argument d'option pour ssh : borg passe `user@hôte` en un mot).
+- Aide OpenSSH < 8.5 : `_pull_openssh_old(stderr)` (message d'un enregistrement `--log-json`, ou ligne de texte, contenant
+  `bad configuration option: knownhostscommand` sans casse — revue 1 row 10 : pas un « KnownHostsCommand … exited » d'un ≥ 8.5) après un `borg create` en échec (`newretC`) d'un Bkp construit -> `[ERREUR] <nick>:
+  _PULL_OPENSSH_HELP`. Forme DÉDUITE : borg relaie le stderr du ssh du client en `WARNING` « Remote: <ligne> » (mesuré avec une
+  option inconnue sur 8.9 : « Remote: command-line: line 0: Bad configuration option: knownhostscommandx »,
+  `work/s117/old-openssh-sim.txt`) ; aucun OpenSSH < 8.5 disponible pour mesurer `KnownHostsCommand` lui-même.
+- Status : `status()` ajoute `bkp_pull` par `_bkp_pull_view(nick)` (rc relu, rien lu sans `SSH_REPO_USER` ; `{'error'}` pour un refus
+  ou un `%` mal formé — jamais l'exception, code de sortie inchangé). Pas dans `_status_one` : `/access` (borgHelperWWW) ne lit
+  jamais les clés publiques. Ouverture de fichier ajoutée à la liste blanche `_FOG_WL` (`_pull_hostkeys|open`, jamais une base).
+- Contrôles : « Bkp tiré : BORG_REPO et BORG_RSH du client construits… » (fonction, attentes en dur ; `_PULL_HOSTKEY_GLOB` affirmé
+  en dur et `/etc/ssh` lu sans remplacement comparé à une lecture indépendante), « Bkp tiré construit par le vrai backup()… »
+  (relais ssh + borg factice : argv ENTIER et environnement en sendenv (préfixe) / commande, nicks inactifs = 1.0.215 dont
+  `SSH_REPO`/`BORG_RSH` dans `[DEFAULT]` seulement, refus dont un sans NOIDX ni `-I` sans aucun borg lancé, aide, Status, trace
+  `-d` dans les deux modes), « Bkp tiré construit sur vrai sshd de bac et vrai borg… » (sshd non root, port libre, `PermitUserRC
+  no`, ssh du client par relais `-F /dev/null -o UserKnownHostsFile=<bac>/kh_guard` avant les options de BORG_RSH, kh_guard
+  affirmé absent ou vide ; relais du pull qui retire BORG_RSH de l'environnement (AcceptEnv restreint) ; `borg serve` à commande
+  forcée, BORG_BASE_DIR de bac, sans BORG_RELOCATED_REPO_ACCESS_IS_OK ; dépôt joint par l'URL construite vérifié par
+  l'emplacement de la sécurité du borg client et les connexions acceptées du sshd ; clé étrangère et alias sans clé : 255 ; Bkp
+  à clé étrangère : échec, aucune archive). Témoin : les trois échouent sur le code 1.0.215 (`work/s117/temoin-run2.log`).
+
 **Trace -d sans secret (1.0.215, story 116, décision de l'utilisateur du 2026-11-09)** : seul masquage de la trace, `_dbg_mask(obj)`
 (copie : `dict`, `list`, `tuple` récursifs, texte ; autre type tel quel). Clés `_DBG_SECRET_KEYS` (`BORG_PASSPHRASE`,
 `BORG_NEW_PASSPHRASE`, `BORG_PASSCOMMAND`, `BORGHELPERC_RUNTIME_PASSPHRASE`) -> `'***'` dans un dict ; dans un texte, chaque forme

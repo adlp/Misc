@@ -1,5 +1,46 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.216 — Bkp tiré : BORG_REPO et BORG_RSH du client construits depuis le rc — 2026-11-11
+
+Story 117 (chantier « Bkp tiré / client à IP flottante, ProxyJump », étude `work/proxyjump/etude.md` ; décisions de l'utilisateur
+des 2026-11-09 et 2026-11-11 : configuration ssh du client dérivée du rc, clé d'hôte épinglée par le serveur).
+
+- **borgHelper — Bkp tiré sans `Host` dans le `~/.ssh/config` du client** : nouvelles clés du rc `SSH_REPO_USER` (compte du dépôt
+  sur la cible du tunnel), `SSH_REPO_KEY` (clé privée SUR le client, facultative) et `SSH_REPO_HOSTKEY` (clé(s) publique(s)
+  d'hôte d'une cible du tunnel autre que cette machine). Avec `SSH_REMFO` non vide, `SSH_REPO_USER` non vide, et ni `SSH_REPO` ni
+  `BORG_RSH` dans le rc, borgHelper construit pour le borg du client `BORG_REPO=ssh://<SSH_REPO_USER>@127.0.0.1:<port de
+  SSH_REMFO><chemin de BORG_REPO>` (adresse d'écoute explicite de `SSH_REMFO` gardée) et un `BORG_RSH` qui épingle la clé d'hôte
+  (`KnownHostsCommand`, `StrictHostKeyChecking=yes`, aucun known_hosts lu ni écrit sur le client, jamais de TOFU), placés
+  TOUJOURS dans la commande distante (`exec env BORG_REPO=… BORG_RSH=… <borg> create …`), en `SSH_ENV = sendenv` aussi (décision
+  de l'utilisateur : ni `AcceptEnv` ni le shell du client ne peuvent les perdre), et `--rsh <BORG_RSH>` dans les arguments de
+  `borg create` (survit à `BORG_EXE = sudo borg` — `env_keep` de `BORG_REPO` requis — et à une commande forcée qui ne garde que
+  `borg …`) ; passphrase et autres `BORG_*` inchangées. Clés
+  d'hôte : tunnel vers cette machine -> `/etc/ssh/ssh_host_*_key.pub` ; sinon `SSH_REPO_HOSTKEY` (prioritaire si posée ; `,` ou
+  saut de ligne entre clés). Client : OpenSSH ≥ 8.5. Migration depuis `SSH_REPO` : emplacement du dépôt changé pour le borg du
+  client, premier Bkp « Aborting » sans `BORG_RELOCATED_REPO_ACCESS_IS_OK = yes` (README).
+- Refus avant tout lancement (`[ERREUR] <nick>: … — rien lancé`, code 2, Bkp « error » ; ni ssh vers le client ni `borg create`,
+  ni le `borg list` de la dernière archive — le rapprochement d'un Bkp tué précédent peut encore lancer un `borg list` local) :
+  `SSH_REMFO` illisible (port écouté ou de la cible à 0, hors plage, non ASCII) ou adresse d'écoute ni IP ni `localhost`, `BORG_REPO` relatif /
+  `hôte:chemin` / `{…}` / multi-ligne (`file:///x` accepté : `/x`), `SSH_REPO_USER` invalide, `%` ou `${` dans `SSH_REPO_KEY`,
+  clé d'hôte inconnue, illisible ou mal formée (`clé d'hôte de la cible du tunnel inconnue (SSH_REPO_HOSTKEY)`).
+- Échec d'un `borg create` dont la sortie contient `Bad configuration option: knownhostscommand` : ligne d'aide `[ERREUR] <nick>: OpenSSH ≥ 8.5 requis sur le
+  client (KnownHostsCommand)` (forme du message d'un OpenSSH < 8.5 déduite, non mesurée).
+- **Status** : ligne `Bkp tiré, borg du client : BORG_REPO=…` / `BORG_RSH=…` (JSON `bkp_pull`), ou le refus ; nicks sans
+  construction : sortie inchangée. Trace `-d` du Bkp : les deux valeurs dans l'environnement imprimé, le préfixe `exec env` et
+  `--rsh` de la commande (aucun secret).
+- **Refus `SSH_ENV`** (`SSH_ENV` inconnue ; 1.0.213) : plus de `borg list` de la dernière archive avant le
+  refus (comme pour les refus de la construction ; « rien lancé » plus exact).
+- Inchangé (vérifié par contrôle, argv et environnement en dur) : nick sans `SSH_REPO_USER`, avec `SSH_REPO` ou `BORG_RSH`, Bkp
+  local. `WWW_VERSION` et UI inchangés.
+- Mesures (sshd de bac non root, vrai ssh 8.9, borg 1.2.6 ; `~/.ssh` jamais écrit ; une mesure, `-i id%%x` (mesure2), a fait
+  tenter à ssh les identités par défaut sous le vrai `~/.ssh` — 28 chemins, tous absents : rien lu ni écrit ; les autres cas,
+  strace, n'y touchent pas) : clés justes -> 0 ; clé étrangère
+  -> « Host key verification failed. », 255 ; une clé d'un type présenté par le sshd mais absente de la liste -> échec (d'où
+  « toutes les clés ou rien ») ; `borg create` par l'URL construite à travers `borg serve` à commande forcée.
+- Contrôles (3) : fonction de construction, vrai `backup()` avec relais ssh et borg factice, vrai sshd de bac + vrai borg (Bkp
+  sendenv — BORG_RSH retiré de l'environnement transmis — et commande, archives créées par ssh, clé étrangère refusée). Témoin :
+  les trois échouent sur 1.0.215.
+
 ## borgHelper 1.0.215 — Trace -d sans passphrase, tous modes — 2026-11-11
 
 Story 116 (constat de la story 115, deferred-work « Constaté pendant la story 115 » ; décision de l'utilisateur du 2026-11-09 :

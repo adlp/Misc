@@ -108,6 +108,13 @@ SSH_KEY          = /root/.ssh/id_borg
 #            les AUTRES valeurs BORG_* (BORG_REPO, BORG_RSH…) deviennent visibles dans `ps` : aucun secret dedans
 # autre valeur : [ERREUR], code 2, rien lancé. Voir « Variables BORG_* d'un Bkp tiré » ci-dessous
 # SSH_ENV        = commande
+# Bkp tiré sans `Host` dans le ~/.ssh/config du client (borgHelper >= 1.0.216, SSH_REMFO requis, sans SSH_REPO ni BORG_RSH) :
+# BORG_REPO et BORG_RSH du borg du client construits ici, toujours dans la commande distante (clé d'hôte épinglée,
+# OpenSSH >= 8.5 sur le client).
+# Voir « Bkp tiré : BORG_REPO et BORG_RSH du client construits » ci-dessous
+# SSH_REPO_USER  = borg
+# SSH_REPO_KEY   = /root/.ssh/id_borg_repo
+# SSH_REPO_HOSTKEY = ssh-ed25519 AAAA…   (cible du tunnel autre que cette machine seulement)
 
 # Nom de l'hôte de stockage (borgHelper >= 1.0.208, commande Storage) : remplace celui tiré de BORG_REPO
 # (user@hôte[:port], cible du tunnel SSH_REMFO, point de montage d'un dépôt local)
@@ -309,6 +316,107 @@ Limites de `commande` :
 
 Avec `-d`, la passphrase est masquée (`***`) dans la trace, en `commande` comme en `sendenv` (1.0.215 ; avant, en clair en
 `sendenv` et pour tout borg local).
+
+### Bkp tiré : `BORG_REPO` et `BORG_RSH` du client construits (`SSH_REPO_USER`, 1.0.216)
+
+Dans un Bkp tiré, le borg du client rejoint le dépôt par le tunnel inverse `SSH_REMFO` (port du client -> sshd de la cible du
+tunnel). Avant 1.0.216, il fallait pour cela un `SSH_REPO = ssh://…@localhost:8022/…` et un `Host` dans le `~/.ssh/config` de
+CHAQUE client (port, clé, clé d'hôte). Avec `SSH_REPO_USER`, borgHelper construit lui-même, depuis le rc du serveur, le
+`BORG_REPO` et le `BORG_RSH` du borg du client, et les met TOUJOURS dans la commande distante, avant borg :
+`exec env BORG_REPO=<valeur citée> BORG_RSH=<valeur citée> <BORG_EXE> create --comment … --rsh <BORG_RSH cité> …` — en
+`SSH_ENV = sendenv` aussi (décision de l'utilisateur) : ni un `AcceptEnv` qui n'accepte pas `BORG_RSH`, ni un `export BORG_RSH=…`
+du shell du compte client ne peuvent les perdre ou les remplacer ; `--rsh` (argument de `borg create`, borg ≥ 1.1 ; mesuré avec
+borg 1.2.6, valeur citée telle que le shell distant la redécoupe) garde l'épinglage même quand l'environnement est vidé APRÈS le
+préfixe (`BORG_EXE = sudo borg`, voir plus bas). La passphrase et les autres `BORG_*` restent transmises comme avant (`SendEnv`
+en `sendenv`, entrée de ssh et préfixe en `commande`). Rien à configurer côté ssh du client.
+
+```ini
+[portable1]
+; dépôt vu par CE serveur (lectures, Index, Prune) — son chemin sert aussi au client
+BORG_REPO        = /srv/borg/portable1
+SSH_REMFO        = 8022:localhost:22
+SER_NAME         = portable1
+SER_LOGIN        = root
+; compte du dépôt (borg serve) sur la cible du tunnel
+SSH_REPO_USER    = borg
+; clé privée SUR LE CLIENT (facultative : sans elle, identités par défaut du compte du client)
+SSH_REPO_KEY     = /root/.ssh/id_borg_repo
+; cible du tunnel autre que cette machine (ex. 8022:nas:22) : sa ou ses clés publiques d'hôte, séparées par « , »
+; ou une par ligne (lignes de suite indentées)
+; SSH_REPO_HOSTKEY = ssh-ed25519 AAAA…, ecdsa-sha2-nistp256 AAAA…
+```
+
+- **Activation** : Bkp tiré (`SSH_REMFO` non vide) ET `SSH_REPO_USER` non vide ET ni `SSH_REPO` ni `BORG_RSH` dans le rc du nick
+  — section du nick OU `[DEFAULT]` : un `BORG_RSH` posé dans `[DEFAULT]` pour d'autres nicks (ssh direct) coupe la construction
+  pour TOUS les nicks tirés (rien construit, aucun message). Un rc qui a déjà `SSH_REPO` ou `BORG_RSH` est gardé tel quel ; sans
+  `SSH_REPO_USER`, comportement de 1.0.215 à l'identique (argv de ssh, environnement transmis). Bkp local : rien construit.
+- **`BORG_REPO` du client** : `ssh://<SSH_REPO_USER>@<hôte>:<port>/<chemin>` — port = port écouté de `SSH_REMFO` (`8022` ;
+  chiffres ASCII, 1 à 65535, sinon refus « illisible ») ; hôte = `127.0.0.1` pour `8022:…`, `*`, `localhost` ou une adresse non
+  spécifiée (`0.0.0.0`, `::`), sinon l'adresse d'écoute explicite si c'est une IP (`[::1]:8022:…` ; IPv6 avec zone `%…`, nom
+  d'hôte : refus) ; port de la cible (`…:22`) : même règle que le port écouté. Une adresse d'écoute explicite autre que
+  `127.0.0.1`/`::1` (ex. `127.0.0.2:8022:…`) n'est honorée par le sshd du client qu'avec `GatewayPorts clientspecified` ; sinon
+  il écoute sur le bouclage et la connexion à l'adresse construite échoue (déduit des sources d'OpenSSH, non mesuré). Chemin = `BORG_REPO` du serveur s'il est un chemin absolu (`file://` retiré : `file:///srv/x` -> `/srv/x` ;
+  `/srv/borg/portable1` -> `ssh://borg@127.0.0.1:8022/srv/borg/portable1`), ou la partie chemin de son URL `ssh://` telle quelle
+  (`ssh://u@nas/~/r` -> `…:8022/~/r` : `~` est alors le dossier personnel de `SSH_REPO_USER` sur la cible, pas celui de `u` —
+  déduit : borg serve tourne sous ce compte).
+  Mesuré (borg 1.2.6) : `borg create` du client par cette URL et ce `BORG_RSH`, à travers un vrai sshd en
+  `borg serve --restrict-to-path`.
+- **`BORG_RSH` du client** : `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null
+  -o GlobalKnownHostsFile=/dev/null -o HostKeyAlias=borghelper-<nick> -o KnownHostsCommand=… [-o IdentitiesOnly=yes -i
+  <SSH_REPO_KEY>]` (chaque élément cité pour le découpage de borg ; alias en minuscules, caractères hors `a-z 0-9 . _ -`
+  remplacés par `_`). `SSH_REPO_KEY` : `~` développé par ssh sur le client (déduit des sources d'OpenSSH, `tilde_expand_filename`,
+  non mesuré) ; chemin relatif : résolu depuis le dossier courant du borg du client, en pratique le dossier personnel de
+  `SER_LOGIN` (déduit, non mesuré) ; fichier absent sur le client : ssh l'ignore (« Identity file … not accessible ») et retombe sur les identités par
+  défaut du compte (`~/.ssh/id_*`), malgré `IdentitiesOnly=yes` (mesuré avec OpenSSH 8.9).
+- **Clé d'hôte épinglée par le serveur** (jamais de TOFU : ni `accept-new` ni `StrictHostKeyChecking=no`) : la
+  `KnownHostsCommand` (`/bin/sh -c 'for l do echo "$l"; done' sh '<alias> <type> <clé>' …`) donne à ssh la ou les clés
+  attendues, une ligne par clé ; aucun fichier `known_hosts` n'est lu ni écrit sur le client. Clés : `SSH_REPO_HOSTKEY` si
+  posée (`<type> <base64>[ commentaire]`, plusieurs séparées par `,` ou un saut de ligne — chaque ligne est une clé, jamais la
+  suite d'un commentaire ; une `,` dans un commentaire est gardée ; refusées : deux clés sur une ligne sans séparateur, mot de
+  commentaire qui commence comme un vrai type OpenSSH (`ssh-rsa`, `ssh-dss`, `ssh-ed25519`, `ssh-ed448`, `ssh-xmss`,
+  `ecdsa-sha2-`, `sk-ssh`, `sk-ecdsa`, casse ignorée — `rsa-key-…` de PuTTYgen ou `ssh-gw` restent des commentaires), base64 qui ne se réécrit pas à
+  l'identique, clé tronquée, certificat `*-cert-*`) ; sinon, tunnel vers CETTE machine (`localhost`, `127.0.0.1`, `::1`, son nom) : chaque
+  `/etc/ssh/ssh_host_*_key.pub` du serveur. Autre clé présentée : ssh refuse (« Host key verification failed. », code 255,
+  mesuré). **Épingler TOUTES les clés d'hôte du sshd cible** : mesuré (OpenSSH 8.9), une clé d'un type que le sshd présente mais
+  absente de la liste fait échouer ssh (« Host key … has changed ») dès qu'une autre clé est épinglée ; une clé en trop d'un
+  type qu'il ne présente pas est sans effet. Poser `SSH_REPO_HOSTKEY` (prioritaire) quand le sshd de cette machine qui reçoit le
+  tunnel n'est pas celui de `/etc/ssh` (autre port), ou qu'un de ses `HostKey` est hors du motif `/etc/ssh/ssh_host_*_key.pub`.
+  `SSH_REPO_HOSTKEY` dans `[DEFAULT]` s'applique à TOUS les nicks tirés, ceux dont le tunnel vise cette machine compris (ils
+  épinglent alors cette clé à la place de `/etc/ssh` : échec à l'exécution si ce n'est pas la leur).
+- **OpenSSH ≥ 8.5 sur le client** (`KnownHostsCommand`). Plus ancien : le Bkp échoue ; une sortie de borg contenant
+  `Bad configuration option: knownhostscommand` (casse ignorée ; forme DÉDUITE, non mesurée sur un OpenSSH < 8.5) ajoute la
+  ligne `[ERREUR] <nick>: OpenSSH ≥ 8.5 requis sur le client (KnownHostsCommand)`.
+- **Shell du compte client** : la commande distante commence par `exec env …` — shell POSIX non restreint, comme pour
+  `SSH_ENV = commande`. Valeurs visibles dans `ps` des deux machines : aucun secret dedans.
+- **`BORG_EXE = sudo borg`** sur le client : `env_reset` de sudo retire ce que le préfixe vient de poser ; `--rsh` garde
+  l'épinglage (mesuré au bac : environnement vidé sauf `PATH`, `LC_ALL`, `BORG_PASSPHRASE`, `BORG_REPO`, archive créée par ssh,
+  clé étrangère refusée), mais `env_keep` doit garder `BORG_REPO` (et `BORG_PASSPHRASE`), sinon borg échoue, fermé (« repository
+  not specified » — déduit) ; sans variable de langue UTF-8, borg 1.2.6 échoue sur une passphrase non ASCII (UnicodeEncodeError,
+  mesuré — le `env_keep` par défaut de sudo garde les variables de langue). **Commande forcée côté client** (`command="…"` dans `authorized_keys`) : une commande qui exécute
+  `SSH_ORIGINAL_COMMAND` par un shell garde tout ; (déduit, non mesuré :) un garde qui ne relance que la partie `borg …` perd le préfixe (`BORG_REPO`
+  et `BORG_RSH` ne viennent plus que de `SendEnv`) mais garde `--rsh` : l'épinglage tient, `BORG_REPO` doit alors arriver par
+  `AcceptEnv` ; un garde qui refuse `exec env`, les apostrophes ou `$` refuse la commande (Bkp en échec).
+- **Refus avant tout lancement** (`[ERREUR] <nick>: … — rien lancé`, code 2, Bkp « error ») : « rien lancé » = ni ssh vers le
+  client ni `borg create`, et pas non plus le `borg list` de la dernière archive ; seul le rapprochement d'un Bkp tué
+  précédent peut encore lancer un `borg list` local, comme pour les refus de `SSH_ENV`. Motifs : `SSH_REMFO` illisible (socket
+  unix, champs manquants, port écouté ou port de la cible à 0, hors plage ou non ASCII) ou adresse d'écoute ni IP ni `localhost` ; `BORG_REPO` relatif,
+  `hôte:chemin`, à marqueur `{…}` ou sur plusieurs lignes ; `SSH_REPO_USER` invalide (lettres, chiffres, `.`, `_`, `-`
+  seulement) ; `SSH_REPO_KEY` avec `%` ou `${` (mesuré pour `%` : `ssh -i` ne l'accepte ni seul, « unknown key », ni doublé ;
+  `${` : même développement, déduit) ; aucune clé d'hôte (cible distante sans `SSH_REPO_HOSTKEY`, `/etc/ssh` sans clé publique),
+  clé de `SSH_REPO_HOSTKEY` mal formée : `clé d'hôte de la cible du tunnel inconnue (SSH_REPO_HOSTKEY)` ; fichier de `/etc/ssh`
+  illisible ou mal formé : `clé d'hôte de la cible du tunnel illisible ou mal formée (/etc/ssh/…) — ou poser SSH_REPO_HOSTKEY`.
+- **Migration depuis `SSH_REPO`** : passer d'un `SSH_REPO = ssh://…@localhost:8022/…` (ou d'un alias `Host`) à
+  `SSH_REPO_USER` change l'emplacement du dépôt vu par le borg du client (`ssh://borg@127.0.0.1:8022/…`). borg 1.2 le remarque
+  (« … was previously located at … ») et demande confirmation ; sans terminal, le premier Bkp s'arrête (« Aborting »). Poser
+  `BORG_RELOCATED_REPO_ACCESS_IS_OK = yes` le temps du premier Bkp (transmise comme les autres `BORG_*` : `AcceptEnv` en
+  `sendenv`), puis la retirer. Mesuré (borg 1.2.6, emplacement changé, entrée fermée) : « Do you want to continue? [yN]
+  Aborting. », code 2.
+- **Visible** : `Status` montre les valeurs construites telles que borg les recevra (`Bkp tiré, borg du client : BORG_REPO=…`
+  puis `BORG_RSH=…` ; JSON `bkp_pull`), ou le refus ; la trace `-d` du Bkp les montre aussi (environnement, préfixe `exec env`
+  et `--rsh` de la commande). Aucun secret dedans (clés publiques, chemin de la clé privée du client).
+- Le `ssh` du client lit toujours son `ssh_config` (`/etc/ssh/ssh_config`, `~/.ssh/config`) : les options données ici
+  l'emportent ; un `ProxyJump` ou `ProxyCommand` d'un `Host *` s'appliquerait aussi (règle d'OpenSSH, non mesuré ici :
+  à éviter pour `127.0.0.1`).
 
 ### Dépôts borg externes (1.0.142)
 
@@ -1687,7 +1795,7 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 | Option | Description |
 |--------|-------------|
 | `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory`, qui rejettent le multi-nick avec `-j`) — c'est le cas d'usage principal de `Status` |
-| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction |
+| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction ; `bkp_pull` (1.0.216, nick à Bkp tiré construit seulement) : `{BORG_REPO,BORG_RSH}` construits pour le borg du client, ou `{error}` (refus du Bkp) |
 
 En texte, en ligne de commande, une ligne finale signale les restes à nettoyer sur la machine, comme `Report`
 (1.0.160 ; JSON inchangé ; jamais via borgHelperWWW) — voir [`BorgCleanup`](#borgcleanup).
@@ -1734,6 +1842,9 @@ Par nick :
   « Opération prioritaire en cours (Restore, Prune ou DelBkp) » (« Bkp peut-être toujours actif, … » si un Bkp sans fin au-delà du délai, ou interrompu sur un dépôt distant, est affiché) — **ambiguïté assumée**, `priority.lock` ne
   distingue pas laquelle le tient. Si un Bkp est aussi détecté, pas de message redondant (le
   Bkp lui-même tient ce lock).
+- **Bkp tiré construit** (1.0.216, `SSH_REPO_USER` — voir « Bkp tiré : `BORG_REPO` et `BORG_RSH` du client construits ») :
+  `Bkp tiré, borg du client : BORG_REPO=…` puis `BORG_RSH=…`, tels que borg les recevra ; refus du Bkp : `Bkp tiré : <motif> —
+  Bkp refusé` (code de sortie inchangé). Autres nicks : rien (JSON : pas de clé `bkp_pull`).
 
 En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at,en_attente,orphelin,sans_suivi}`
 (1.0.186 :
