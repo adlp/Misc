@@ -1,6 +1,6 @@
 [project]
 name = "sshvault"
-version = "0.16.0"
+version = "0.16.1"
 description = "Clés SSH dans Vaultwarden, utilisées de façon transparente par ssh"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,8 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not integration'"
+addopts = "-m 'not integration and not lab'"
 markers = [
     "integration: conteneur Vaultwarden + vrai bw (docker et bw requis ; lancer avec -m integration)",
+    "lab: maquette Docker Compose de conteneurs ssh + vrai bw + compte de test (docker requis ; lancer avec -m lab)",
 ]

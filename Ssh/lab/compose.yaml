@@ -1,0 +1,71 @@
+# Maquette ssh de sshvault (story 20). Lancée par lab.sh (ou à la main :
+# SSHVAULT_LAB_KEYS=<dossier des clés publiques> docker compose -p <projet> -f compose.yaml up -d --build --wait).
+#
+#   front : A (bastion), P (mot de passe), D (cible de deploy)
+#   back  : A et B (hôte interne, qui n'accepte que les connexions venant de A) ; réseau interne
+#
+# Ports publiés sur 127.0.0.1 seulement, choisis par docker (`docker compose port`). Aucun secret
+# ici : le mot de passe de P est posé après le démarrage par `chpasswd` sur stdin (lab.sh).
+# Versions d'OpenSSH serveur : A 9.2, B 9.3, P 10.0, D 10.0.
+name: sshvault-lab
+
+x-key-host: &key-host
+  environment:
+    LAB_USER: lab
+    LAB_AUTH: key
+  volumes:
+    - ${SSHVAULT_LAB_KEYS:?dossier des clés publiques}:/keys:ro
+  stop_grace_period: 2s
+
+services:
+  a:
+    <<: *key-host
+    image: sshvault-lab/a
+    build: {context: images, dockerfile: a/Dockerfile}
+    hostname: a
+    ports: ["127.0.0.1::22"]
+    networks: [front, back]
+    healthcheck: &hc
+      test: ["CMD", "test", "-s", "/run/sshd.pid"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  b:
+    <<: *key-host
+    image: sshvault-lab/b
+    build: {context: images, dockerfile: b/Dockerfile}
+    hostname: b
+    environment:
+      LAB_USER: lab
+      LAB_AUTH: key
+      LAB_ALLOW_FROM: a
+    networks: [back]
+    depends_on: [a]
+    healthcheck: *hc
+
+  p:
+    image: sshvault-lab/p
+    build: {context: images, dockerfile: p/Dockerfile}
+    hostname: p
+    environment:
+      LAB_USER: labpw
+      LAB_AUTH: password
+    ports: ["127.0.0.1::22"]
+    networks: [front]
+    stop_grace_period: 2s
+    healthcheck: *hc
+
+  d:
+    <<: *key-host
+    image: sshvault-lab/d
+    build: {context: images, dockerfile: d/Dockerfile}
+    hostname: d
+    ports: ["127.0.0.1::22"]
+    networks: [front]
+    healthcheck: *hc
+
+networks:
+  front: {}
+  back:
+    internal: true

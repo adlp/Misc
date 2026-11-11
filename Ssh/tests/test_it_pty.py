@@ -1,4 +1,4 @@
-"""`pty_login` du test d'intégration (`tests/integration/test_integration.py`), sans réseau ni
+"""`pty_login` du test d'intégration (`tests/integration/itbase.py`), sans réseau ni
 vrai sshvault : un faux paquet `sshvault` (PYTHONPATH) se termine aussitôt en laissant un
 petit-enfant qui écrit sans fin sur le terminal et garde la sortie standard ouverte. Lecture du
 reste du terminal et de la sortie : bornées (PTY_DRAIN_LIMIT, 5 s au plus)."""
@@ -10,7 +10,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "integration"))
-import test_integration as integ  # noqa: E402  (collecté aussi par pytest : même module)
+import itbase as integ  # noqa: E402
 
 #: petit-enfant : écrit sur le terminal (stderr) toutes les 10 ms, 30 s au plus, garde stdout
 CHILD = r'''

@@ -1,5 +1,38 @@
 # Changelog — sshvault
 
+## sshvault 0.16.1 — Maquette de test à conteneurs ssh — 2026-11-11
+
+Tests et maquette seulement : aucun changement du comportement de sshvault.
+
+- **Maquette Docker Compose** `lab/` (lançable à la main par `lab/lab.sh up|down|status|config|password`) :
+  A (bastion, OpenSSH 9.2, Debian 12), B (hôte interne, 9.3, Alpine 3.18, réseau `back` interne,
+  `AllowUsers` limité à l'adresse de A résolue au démarrage), P (mot de passe seul, 10.0, Alpine
+  3.22) et D (cible de `deploy`, 10.0, Debian 13). Ports de A, P et D publiés sur 127.0.0.1
+  seulement, ni `--privileged` ni capacité ajoutée, un seul montage en lecture seule (clés
+  publiques admises), clés d'hôte générées à chaque démarrage. Mot de passe de P aléatoire par
+  démarrage, posé par `chpasswd` sur stdin, écrit dans `$XDG_RUNTIME_DIR/sshvault-lab/password`
+  (0600, dossier 0700), relu par `lab.sh password`, supprimé par `down`. `lab.sh config` affiche
+  un extrait de `ssh_config` (Host, HostName, Port, User, ProxyJump, puis le bloc `Host svlab-*` des clés d'hôte) ; `lab.sh` n'écrit jamais
+  dans `~/.ssh`. Pour les hôtes `svlab-*`, `config` ajoute `UserKnownHostsFile <dossier d'état>/known_hosts` et
+  `StrictHostKeyChecking accept-new` (`down` supprime ce fichier ; le vrai `~/.ssh/known_hosts` n'est jamais touché) ;
+  `lab.sh` refuse un dossier d'état relatif ou contenant « : », « % » ou « " », `up` repart d'un known_hosts vide, `down` échoue si docker ne répond pas, le mot de
+  passe de P n'est publié qu'une fois posé, les lignes écartées du fichier de clés sont comptées. Les images
+  `sshvault-lab/*` sont gardées par `down`. Les clés d'hôte sont générées au premier démarrage de chaque
+  conteneur (jamais celles, cuites, des images Debian).
+- **Série pytest `lab`** (`-m lab`, exclue par défaut ; sautée sans docker ou sans OpenSSH du
+  poste ; sans le compte de test ou sans `bw`, seul le test du coffre est sauté) : `tests/integration/test_lab.py` et `labenv.py` (cycle de vie du projet
+  Compose, nom unique par run, `down -v` puis contrôle de ce qui reste, même en échec, SIGINT ou
+  SIGTERM). Scénarios sur le vrai `bw` : rebond réel par clé (`ssh svlab-b` par A, agent vide),
+  B en direct refusé, transfert restreint (`ssh -A svlab-a`), mot de passe d'hôte par
+  `sshvault-askpass` (dont le rebond A→P), `generate` puis `deploy` vers D puis connexion avec
+  la clé déployée ; sans coffre : versions serveur, ports, privilèges, montages, secrets dans
+  `docker inspect`, `sshvault.deploy` idempotent ; interruption pendant ou après le démarrage.
+- **Fixtures partagées** déplacées de `test_integration.py` dans `tests/integration/itbase.py`
+  (`vault`, `home`, `report`, `Bw`, `sv`, `sv_login`, `check`, `purge_marked`…), sans changement
+  de comportement ; `Report.flush(suffix)` (le rapport de la série `lab` va dans
+  `SSHVAULT_IT_REPORT.lab`) ; `tests/test_it_pty.py` importe `itbase`.
+- `pyproject.toml` : marqueur `lab`, `addopts = -m 'not integration and not lab'`.
+
 ## sshvault 0.16.0 — ssh-config install et uninstall à travers un lien symbolique — 2026-10-16
 
 - `ssh-config install` et `uninstall` suivent un `~/.ssh/config` **lien symbolique** (config

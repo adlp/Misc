@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.16.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.16.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -1393,6 +1393,7 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 cd Ssh
 uv run --python 3.10 pytest -q                    # faux bw, sans réseau
 uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou conteneur)
+uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh + vrai bw + compte de test
 ```
 
 - Les tests unitaires passent par `tests/fake_bw.py`, un faux `bw` qui reproduit
@@ -1494,7 +1495,82 @@ uv run --python 3.10 pytest -q -m integration     # vrai bw + compte de test (ou
   (avec ou sans `account.env`), `SSHVAULT_IT_ENV`, `SSHVAULT_IT_ACCOUNTS` (`~` développé) vers
   un chemin absent, un dossier, une FIFO, un lien cassé ou un chemin illisible, fichier par
   défaut présent mais inutilisable (échec, raison nommée) ; aucune valeur dans les messages.
-- `tests/test_it_pty.py` : `pty_login` de l'intégration, sans réseau ni vrai sshvault (faux
+- **Maquette de conteneurs ssh** (`lab/`, tests `tests/integration/test_lab.py`, série `lab`,
+  exclue par défaut comme `integration` ; sautée sans docker (avec compose) ou sans OpenSSH du poste ;
+  sans le compte de test ou sans `bw`, seul le test du coffre est sauté).
+  Les tests d'intégration n'ont que des `sshd` locaux sur 127.0.0.1 (même OpenSSH, même compte,
+  rebond vers soi-même) ; la maquette ajoute un rebond vers un hôte réellement injoignable en
+  direct, un vrai compte à mot de passe, un `deploy` sur un compte distant et d'autres versions
+  d'OpenSSH serveur. Docker Compose, images construites localement (`sshvault-lab/<rôle>`) ; les
+  versions d'OpenSSH ci-dessous sont celles des étiquettes d'image (`debian:bookworm-slim`,
+  `alpine:3.18`, `alpine:3.22`, `debian:trixie-slim`) : une étiquette qui avance change la version
+  (le test des versions serveur échoue alors, à mettre à jour) :
+
+  | Rôle | Image | OpenSSH | Réseau | Accès |
+  |---|---|---|---|---|
+  | A, bastion | Debian 12 | 9.2 | `front` + `back` | clé seule (compte `lab`), transfert d'agent et rebond permis |
+  | B, hôte interne | Alpine 3.18 | 9.3 | `back` (interne) | clé seule ; `AllowUsers lab@<adresse de A>`, résolue au démarrage : `ssh` direct vers B depuis le poste est refusé, par A il passe |
+  | P, hôte à mot de passe | Alpine 3.22 | 10.0 | `front` | mot de passe seul (compte `labpw`), clés refusées |
+  | D, cible de `deploy` | Debian 13 | 10.0 | `front` | clé seule (compte `lab`, `authorized_keys` écrit par le compte) |
+
+  Ports de A, P et D publiés sur 127.0.0.1 seulement, choisis par docker (`docker compose
+  port`) ; B n'est pas publié. Ni `--privileged` ni capacité ajoutée ; un seul montage, en
+  lecture seule : le dossier des clés publiques admises (jamais `~/.ssh`, `~/.config`,
+  `~/.local` ni le dossier de `bw`). Clés d'hôte générées au premier démarrage de chaque conteneur (jamais celles de l'image ; un
+  redémarrage du conteneur les garde). Mot de passe de P
+  aléatoire par démarrage, posé par `chpasswd` sur stdin (jamais en argument, ni dans
+  l'environnement du conteneur, ni dans `docker inspect`).
+
+  Usage manuel, `lab/lab.sh` (n'écrit jamais dans `~/.ssh`) :
+  ```
+  lab/lab.sh up [FICHIER_CLES_PUBLIQUES]  # construit, démarre A B P D ; clés admises sur A, B, D
+  lab/lab.sh config                       # extrait ssh_config : Host, HostName, Port, User, ProxyJump, puis known_hosts à part
+  lab/lab.sh password                     # mot de passe de P (compte labpw)
+  lab/lab.sh status                       # état et ports
+  lab/lab.sh down                         # détruit conteneurs, réseaux, volumes ; efface mot de passe et known_hosts
+  ```
+  `down` garde les images `sshvault-lab/a`, `b`, `p`, `d` (cache de construction) ; pour les retirer :
+  `docker image rm sshvault-lab/a sshvault-lab/b sshvault-lab/p sshvault-lab/d`.
+  `config` donne les hôtes `svlab-a`, `svlab-b` (`ProxyJump svlab-a`), `svlab-b-direct` (B sans
+  A : refusé), `svlab-p`, `svlab-pj` (P par A), `svlab-d` et `svlab-dg` (D, pour une seconde
+  clé), puis un bloc `Host svlab-*` (`UserKnownHostsFile <dossier d'état>/known_hosts`,
+  `StrictHostKeyChecking accept-new` : les clés d'hôte changent à chaque `up`, et `up` repart d'un
+  known_hosts vide). À inclure dans un `ssh_config` (`Include`, ou copie) **avant tout bloc
+  `Host *`** : pour chaque paramètre, la première valeur obtenue gagne. Le vrai
+  `~/.ssh/known_hosts` n'est jamais touché ; `down` supprime ce fichier.
+  Le mot de passe de P est écrit dans `$XDG_RUNTIME_DIR/sshvault-lab/password` (fichier 0600,
+  dossier 0700, hors dépôt), nouveau à chaque `up`, supprimé par `down`. Le client ssh est celui
+  du poste (sa version, `ssh -V`, est écrite dans le rapport `.lab`, si `SSHVAULT_IT_REPORT` est
+  défini) ; un client OpenSSH 10.0 en conteneur est une autre story.
+  Environnement : `SSHVAULT_LAB_PROJECT` (projet Compose, défaut `sshvault-lab`),
+  `SSHVAULT_LAB_DIR` (dossier d'état : chemin absolu, sans `:`, `%` ni `"`). La première construction des images télécharge les
+  paquets OpenSSH (apt, apk) : accès réseau nécessaire.
+
+  Série `lab` : un projet Compose au nom unique par run (`sshvault-lab-<hex>`), démarré et
+  détruit par `lab.sh` (`tests/integration/labenv.py`) ; fixtures de l'intégration partagées
+  (`tests/integration/itbase.py` : `vault`, `home`, `Bw`, `sv`, `report`, marquage et purge des
+  éléments, `account.scrub`) ; HOME temporaire dont le `~/.ssh/config` décrit la maquette
+  (`ProxyJump` pour B, `StrictHostKeyChecking accept-new` et `UserKnownHostsFile` temporaire
+  fournis par `lab.sh config`, `ssh -F` explicite, aucune identité par défaut ; la série du test
+  « à la main » tourne aussi avec un HOME et des `XDG_*` temporaires). `test_maquette_a_la_main` (ni coffre ni
+  sshvault) : `ssh svlab-a`, `svlab-b` par A, B refusé sans A (`AllowUsers` lu dans le journal
+  de B), versions serveur 9.2, 9.3, 10.0, mot de passe de P direct et par A, clés refusées par
+  P (seule méthode annoncée : `password`), mot de passe voisin refusé (askpass appelé), `sshvault.deploy` idempotent, ports sur 127.0.0.1, aucune
+  capacité ajoutée, montage unique en lecture seule, aucun secret dans `docker inspect`.
+  `test_sshvault_sur_la_maquette` (vrai `bw`) : `ssh svlab-b` agent vide par `ensure` (une seule
+  clé offerte à chaque saut, B admet la clé venue de A), `svlab-b-direct` refusé alors que la
+  clé est offerte, `forward add` puis `ssh -A svlab-a 'ssh-add -l'` (seule la clé transférée),
+  mot de passe d'hôte par `sshvault-askpass` (`ssh svlab-p`, puis `svlab-pj` par le rebond A→P :
+  une invite de mot de passe chacun, aucun mot de passe en argument ni sur disque), `generate`,
+  `deploy` vers D (relancé : « déjà présente ») puis connexion avec la clé déployée.
+  `test_interruption` : SIGINT pendant le démarrage (dès le premier conteneur, avant `PRET`) ou
+  après, puis SIGTERM, envoyé au groupe de processus d'une sonde (`labenv.py sonde`) :
+  conteneurs, réseaux et volumes du projet supprimés, dossier d'état de la sonde effacé (nettoyage
+  de secours si la sonde échoue). Les journaux de B sont lus à partir d'un décalage pris avant
+  chaque connexion. En fin de série, même en échec : `docker compose down -v`, puis contrôle que
+  `docker ps -a`, `docker network ls` et `docker volume ls` ne montrent plus rien du projet et
+  que le fichier du mot de passe a disparu, éléments marqués purgés, `bw logout`.
+- `tests/test_it_pty.py` : `pty_login` de l'intégration (`tests/integration/itbase.py`), sans réseau ni vrai sshvault (faux
   paquet `sshvault` par PYTHONPATH, qui laisse un petit-enfant écrire sans fin sur le terminal
   et garder la sortie standard ouverte) : reste du terminal et sortie standard lus 5 s au
   plus chacun.
