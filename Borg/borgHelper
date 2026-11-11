@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.214"
+Version="1.0.215"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2929,19 +2929,20 @@ def _print_borg_stderr(entries,debug=0):
     tel quel (lignes de texte avec leur indentation, enregistrements JSON « [NIVEAU] message », DEBUG seulement avec debug).
     Avant : tout imprimé brut (Restore, ListPerms, Mount, Key, Bkp)."""
     st={}; txt=[]
+    dm=_dbg_mask if debug else (lambda x: x)   # 1.0.215 (story 116) : avec debug (DEBUG de borg compris), lignes masquées
     def flush():
-        for l in _borg_err_lines(txt,st,raw=True): print(l,file=sys.stderr,flush=True)
+        for l in _borg_err_lines(txt,st,raw=True): print(dm(l),file=sys.stderr,flush=True)
         txt.clear()
     for i in entries:
         if isinstance(i,dict):
             flush()
-            lvl=i.get('levelname','INFO'); msg=i.get('message',str(i))
+            lvl=i.get('levelname','INFO'); msg=i.get('message',str(dm(i)))   # 1.0.215 (revue 116 row 1) : masqué avant le repr
             if lvl=='DEBUG' and not debug: continue
             if isinstance(msg,str) and ('Traceback (most recent call last):' in msg or msg.startswith('Exception ignored ')
                                        or (st.get('crash') and msg.startswith(_BORG_SYSINFO))):   # trace, bloc ignoré, bandeau : réduits
-                for l in _borg_err_lines(msg.split('\n'),st): print(f"[{lvl}] {l}",file=sys.stderr,flush=True)
-            else: print(f"[{lvl}] {msg}",file=sys.stderr,flush=True)
-            if debug: printer(i)
+                for l in _borg_err_lines(msg.split('\n'),st): print(dm(f"[{lvl}] {l}"),file=sys.stderr,flush=True)
+            else: print(dm(f"[{lvl}] {msg}"),file=sys.stderr,flush=True)
+            if debug: printer(_dbg_mask(i))   # 1.0.215 (story 116)
         elif isinstance(i,str): txt.append(i)
     flush()
 
@@ -2973,6 +2974,44 @@ def _borg_child_env(cfg,force=None):
     if force is not None: env.update(force)
     env['PATH']=os.environ.get('PATH') or os.defpath; env['LC_ALL']='fr_FR.UTF-8'; env.update(_BORG_EXIT_CODES_ENV)
     return env
+
+# 1.0.215 (story 116, décision de l'utilisateur du 2026-11-09) : trace -d sans aucun secret, dans tous les modes (avant : BORG_PASSPHRASE
+# en clair dans l'environnement imprimé par boex, sauf SSH_ENV = commande). Seul masquage de la trace : _dbg_mask, appliqué à tout ce
+# que boex, _boex_stream, _print_borg_stderr et prep_report impriment sous -d (environnement, lignes par clé, argv, sorties de borg) ; borg
+# reçoit les mêmes valeurs (copies). Clés masquées par leur nom (dict, `CLÉ=valeur` d'un texte, valeur citée par shlex comprise) ; valeurs
+# de ces clés vues par boex sous -d (_dbg_note, avant toute impression) et de l'environnement du processus : remplacées dans tout texte (brute, citée par shlex,
+# intérieur de repr et de json.dumps), quelle que soit leur longueur (une passphrase courte masque aussi d'autres mots de la trace).
+_DBG_SECRET_KEYS=('BORG_PASSPHRASE','BORG_NEW_PASSPHRASE','BORG_PASSCOMMAND','BORGHELPERC_RUNTIME_PASSPHRASE')
+_DBG_SECRETS=set(); _DBG_LOCK=threading.Lock()
+_DBG_KV_RE=re.compile(r"\b("+'|'.join(_DBG_SECRET_KEYS)+r")=((?:'[^']*'|\"'\"|[^\s'\"])*)")
+
+def _dbg_note(env):
+    """1.0.215 (story 116) : valeurs des clés secrètes de `env` (environnement d'un borg) retenues pour _dbg_mask."""
+    with _DBG_LOCK:
+        for k in _DBG_SECRET_KEYS:
+            v=env.get(k)
+            if isinstance(v,str) and v: _DBG_SECRETS.add(v)
+
+def _dbg_mask(obj):
+    """1.0.215 (story 116) : copie de `obj` (dict, liste, tuple, texte ; autre : tel quel) sans secret, pour la trace -d : valeur d'une
+    clé de _DBG_SECRET_KEYS -> '***' ; dans un texte, chaque forme d'une valeur secrète connue (_DBG_SECRETS, environnement du
+    processus) -> '***', les plus longues d'abord, puis `CLÉ=valeur` (valeur sans espace ou citée par shlex) -> `CLÉ=***`."""
+    with _DBG_LOCK: vals=set(_DBG_SECRETS)
+    for k in _DBG_SECRET_KEYS:
+        v=os.environ.get(k)
+        if v: vals.add(v)
+    forms=set()
+    for v in vals: forms.update((v,shlex.quote(v),repr(v)[1:-1],json.dumps(v)[1:-1],json.dumps(v,ensure_ascii=False)[1:-1]))
+    forms=sorted((f for f in forms if f),key=len,reverse=True)
+    def m(x):
+        if isinstance(x,dict): return {k:('***' if k in _DBG_SECRET_KEYS else m(v)) for k,v in x.items()}
+        if isinstance(x,list): return [m(i) for i in x]
+        if isinstance(x,tuple): return tuple(m(i) for i in x)
+        if isinstance(x,str):
+            for f in forms: x=x.replace(f,'***')
+            x=_DBG_KV_RE.sub(lambda r: r.group(1)+'=***',x)   # après les valeurs : une valeur à espace jamais coupée avant
+        return x
+    return m(obj)
 
 # 1.0.213 (story 115, décisions de l'utilisateur du 2026-11-09) : variables BORG_* du borg DISTANT d'un Bkp tiré (SSH_REMFO, preBorg)
 # — clé du rc SSH_ENV : `sendenv` (défaut, inchangé : `ssh -o SendEnv BORG_*`, reçues seulement si le sshd du client les accepte,
@@ -8121,7 +8160,8 @@ class BorgRunner:
         # None : SSH_ENV lue dans le rc
         if sshEnv is not None and sshEnv not in _SSH_ENV_MODES: raise ValueError(f"sshEnv inconnu ({sshEnv!r})")
         by_cmd=preBorg is not None and (sshEnv or _ssh_env_mode(cfg))=='commande'
-        if debug!=0: printer({k:('***' if k=='BORG_PASSPHRASE' else v) for k,v in varfut.items()} if by_cmd else varfut)
+        if debug!=0: _dbg_note(varfut)   # 1.0.215 (story 116 ; revue row 2 : retenus sous -d seulement) : masqués dans toute trace -d, tous modes
+        if debug!=0: printer(_dbg_mask(varfut))
         borg_exe=cfg.get('BORG_EXE','borg')
         inp=None
         if by_cmd:
@@ -8142,10 +8182,12 @@ class BorgRunner:
         if rep is None: rep=os.getcwd()
         commande.extend(arg)
         if debug:
-            for k in varfut: printer(f' {k}={varfut[k]}')
-            printer(f"+{rep}"); printer(commande)
-            printer(f"{' '.join(commande)}")
-            printer(f"+{rep} >{' '.join(commande)}")
+            # 1.0.215 (story 116) : toute impression de la trace par _dbg_mask (copies : borg reçoit varfut et commande tels quels)
+            mv=_dbg_mask(varfut)
+            for k in mv: printer(_dbg_mask(f' {k}={mv[k]}'))
+            printer(_dbg_mask(f"+{rep}")); printer(_dbg_mask(commande))
+            printer(_dbg_mask(' '.join(commande)))
+            printer(_dbg_mask(f"+{rep} >{' '.join(commande)}"))
             if arg[1] in "extract": sys.exit(4)
         if stream is not None: return self._boex_stream(commande,varfut,rep,stream,debug,on_abort)
         killed=False; tree=None; meis=set(); ps=None   # 1.0.179 (A91) : arbre relevé et _MEI* mappés de ce borg (s'il est tué)
@@ -8215,7 +8257,7 @@ class BorgRunner:
                 else: ret['stderr'].append(_line)
         ret['exitcode']=ps.returncode
         if killed: ret['killed']=True
-        if debug: printer(json.dumps(ret,indent=4))
+        if debug: printer(_dbg_mask(json.dumps(_dbg_mask(ret),indent=4)))
         return ret
 
     def _boex_stream(self,commande,env,rep,stream,debug=0,on_abort=None):
@@ -8280,7 +8322,7 @@ class BorgRunner:
         # revue 4 : « arrêté par nous » seulement si borg est mort du signal (code < 0, ou ≥ 128 : 143 de borg) — borg sorti seul
         # pendant l'arrêt (EOF puis code 2 et son message) garde sa cause (course mesurée en contrôle ciblé : « empty file »)
         if killed and (ps.returncode<0 or ps.returncode>=128): ret['killed']=True
-        if debug: printer(json.dumps({k:v for k,v in ret.items() if k!='stream_exc'},indent=4))
+        if debug: printer(_dbg_mask(json.dumps(_dbg_mask({k:v for k,v in ret.items() if k!='stream_exc'}),indent=4)))
         return ret
 
 # ── BorgHelper — high-level service layer (DB + Borg combined) ────────────────
@@ -13943,8 +13985,8 @@ class BorgHelper:
             resume['last']=r['repository']['last_modified']; resume['lastname']=""
         else:
             resume['last']=r['archives'][c-1]['start']; resume['lastname']=r['archives'][c-1]['name']
-        if debug>0:
-            print(json.dumps(r,indent=4)); print(json.dumps(resume,indent=4)); print(json.dumps(kept,indent=4))
+        if debug>0:   # 1.0.215 (story 116) : sortie de borg, masquée comme celle de boex
+            for _x in (r,resume,kept): print(_dbg_mask(json.dumps(_dbg_mask(_x),indent=4)))
         avail=self.borg.dfRepo(nick)
         dabesi=d2DateNSince(resume['last'])
         tcmpl={}
@@ -25508,6 +25550,106 @@ sys.exit(0)
             if bad: print(f"  {bad}")
             return not bad
         check("SSH_ENV : Bkp tiré, BORG_* par SendEnv (défaut, argv de 1.0.212) ou dans la commande ssh, passphrase par l'entrée de ssh, refus (story 115)",_ssh_env_cmd)
+        def _dbg_mask_116():
+            """1.0.215 (story 116, décision de l'utilisateur du 2026-11-09) : trace -d sans secret, tous modes. _dbg_mask : clés
+            BORG_PASSPHRASE, BORG_NEW_PASSPHRASE, BORG_PASSCOMMAND, BORGHELPERC_RUNTIME_PASSPHRASE -> '***' (dict) ; valeurs retenues
+            (_dbg_note) et de l'environnement du processus remplacées dans tout texte (brute, repr, shlex, json), les plus longues
+            d'abord, quelle que soit leur longueur ; `CLÉ=valeur` d'une valeur inconnue (citée par shlex) masqué ; liste, tuple,
+            imbrication ; objet d'origine inchangé ; non-texte tel quel. boex réel (borg factice BORG_EXE, passphrase injectée à
+            caractères spéciaux, debug=1), lecture ordinaire et en flux (_boex_stream), borg local et sendenv (preBorg `env`) : ligne
+            masquée imprimée, aucune forme de la passphrase dans stdout+stderr, borg reçoit la passphrase exacte, résultat rendu non
+            masqué (écho de borg intact) ; sans -d, aucun secret retenu (_DBG_SECRETS). _print_borg_stderr : avec debug (enregistrement
+            sans message compris), DEBUG de borg et lignes masqués ; sans debug, sortie
+            inchangée. Garde de source : sous `if debug…` de boex, _boex_stream, _print_borg_stderr et prep_report, chaque
+            printer/print imprime une constante ou un appel _dbg_mask. Attentes en dur."""
+            import ast,inspect,textwrap
+            res={}; saved=set(_DBG_SECRETS)
+            PW="Zq9s\\e'c\" $HOME;x%yé"
+            forms=(PW,repr(PW)[1:-1],shlex.quote(PW),json.dumps(PW)[1:-1],json.dumps(PW,ensure_ascii=False)[1:-1],'Zq9s')
+            leak=lambda t: [f for f in forms if f in t]
+            try:
+                env0={k:v for k,v in os.environ.items() if k not in _DBG_SECRET_KEYS}
+                with mock.patch.dict(os.environ,dict(env0,BORGHELPERC_RUNTIME_PASSPHRASE='Rt5-exec'),clear=True):
+                    _DBG_SECRETS.clear()
+                    env={'BORG_PASSPHRASE':PW,'BORG_NEW_PASSPHRASE':'Nw7 nouvelle','BORG_PASSCOMMAND':'Pc4 cmd --arg','BORG_REPO':'/r','PATH':'/bin'}
+                    orig=dict(env); _dbg_note(env); m=_dbg_mask(env)
+                    res['dict : clés secrètes -> ***, autres gardées, origine intacte']=(m=={'BORG_PASSPHRASE':'***','BORG_NEW_PASSPHRASE':'***',
+                        'BORG_PASSCOMMAND':'***','BORG_REPO':'/r','PATH':'/bin'} and env==orig,m)
+                    txt=[PW,repr(PW),shlex.quote(PW),json.dumps(PW),json.dumps(PW,ensure_ascii=False),f"a {PW} b",'x Nw7 nouvelle y',
+                         'Pc4 cmd --arg','Rt5-exec']
+                    mt=_dbg_mask(txt)
+                    res['formes (brute, repr, shlex, json), autres clés, environnement du processus']=(isinstance(mt,list)
+                        and mt==['***',"'***'",'***','"***"','"***"','a *** b','x *** y','***','***'],mt)
+                    mx=_dbg_mask(('k',[{'BORG_PASSCOMMAND':'z','n':(PW,)}],5,None))
+                    res['tuple, liste, imbrication, non-texte']=(mx==('k',[{'BORG_PASSCOMMAND':'***','n':('***',)}],5,None),mx)
+                    kv=_dbg_mask("exec env BORG_NEW_PASSPHRASE='U8 v'\"'\"'x' BORG_PASSCOMMAND=U9w BORG_REPO=/r")
+                    res['CLÉ=valeur inconnue (citée shlex)']=(kv=="exec env BORG_NEW_PASSPHRASE=*** BORG_PASSCOMMAND=*** BORG_REPO=/r",kv)
+                    _dbg_note({'BORG_PASSPHRASE':'k'}); _dbg_note({'BORG_PASSPHRASE':'abcd'}); _dbg_note({'BORG_PASSPHRASE':'ab'})
+                    sh=_dbg_mask('kayak xabcdx xabx')
+                    res['valeur courte masquée, plus longue d\'abord']=(sh=='***aya*** x***x x***x',sh)
+                    _DBG_SECRETS.clear()
+                    # boex réel : borg factice qui note la passphrase reçue et l'écrit en écho (stdout, stderr JSON et texte)
+                    d=os.path.join(tmp,'dbg116'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d)
+                    fb=os.path.join(d,'borgfx'); got=os.path.join(d,'got.jsonl'); rc=os.path.join(d,'rc')
+                    with open(fb+'.tmp','w') as f:
+                        f.write(f'''#!{sys.executable}
+import sys,os,json
+pw=os.environ.get('BORG_PASSPHRASE')
+open({got!r},'a').write(json.dumps(pw)+chr(10))
+sys.stderr.write(json.dumps(dict(type='log_message',levelname='DEBUG',name='borg',message='dbg '+str(pw)))+chr(10)+'texte '+str(pw)+chr(10))
+if sys.argv[1:2]==['export-tar']: sys.stdout.write('flux '+str(pw)); sys.exit(0)
+print(json.dumps(dict(pw=pw)))
+''')
+                    os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+                    with open(rc,'w') as f: f.write(f"[n]\nBORG_REPO=/r-116\nBORG_EXE={fb}\n")
+                    os.chmod(rc,0o600)
+                    def bx(dbg,**kw):
+                        br=BorgRunner(cfgfile=rc,passphrase=PW); o=io.StringIO()
+                        with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                            try: r=br.boex('n',kw.pop('args',['list','--json']),debug=dbg,**kw)
+                            except BaseException as e: r=f"{type(e).__name__}: {e}"
+                        try: g=[json.loads(x) for x in open(got).read().splitlines()]
+                        except OSError: g=[]
+                        with contextlib.suppress(OSError): os.unlink(got)
+                        return r,o.getvalue(),g
+                    for lbl,kw in (('local',{}),('sendenv (preBorg env)',{'preBorg':['env']})):
+                        r,o,g=bx(1,**kw)
+                        res[f'boex -d {lbl}']=(isinstance(r,dict) and r.get('exitcode')==0 and r['stdout']==[{'pw':PW}] and g==[PW]
+                            and "'BORG_PASSPHRASE': '***'" in o and ' BORG_PASSPHRASE=***' in o and not leak(o),r if not isinstance(r,dict) else r.get('exitcode'),g,leak(o),o[-300:])
+                    seen=[]
+                    def rd(fh): seen.append(fh.read()); return None
+                    r,o,g=bx(1,args=['export-tar','--x','::a','-'],stream=rd)
+                    res['boex -d en flux (_boex_stream)']=(isinstance(r,dict) and r.get('exitcode')==0 and g==[PW] and seen==[('flux '+PW).encode()]
+                        and "'BORG_PASSPHRASE': '***'" in o and not leak(o),r if not isinstance(r,dict) else r.get('exitcode'),g,leak(o),o[-300:])
+                    sv=set(_DBG_SECRETS); _DBG_SECRETS.clear(); r,o,g=bx(0); kept=set(_DBG_SECRETS); _DBG_SECRETS.update(sv)
+                    res['sans -d : rien imprimé, résultat intact, aucun secret retenu']=(isinstance(r,dict) and r['stdout']==[{'pw':PW}] and o==''
+                        and g==[PW] and not kept,o[-200:],len(kept))
+                    ent=[{'type':'log_message','levelname':'DEBUG','message':'dbg '+PW},{'type':'log_message','levelname':'INFO','message':'info '+PW},'texte '+PW,
+                         {'type':'log_message','levelname':'WARNING','sans_message':PW}]
+                    o1,o0=io.StringIO(),io.StringIO()
+                    with contextlib.redirect_stderr(o1): _print_borg_stderr(ent,1)
+                    with contextlib.redirect_stderr(o0): _print_borg_stderr(ent,0)
+                    res['_print_borg_stderr : debug masqué (enregistrement sans message compris), sinon inchangé']=('[DEBUG] dbg ***' in o1.getvalue()
+                        and '[INFO] info ***' in o1.getvalue() and 'texte ***' in o1.getvalue() and "'sans_message': '***'" in o1.getvalue()
+                        and not leak(o1.getvalue()) and o0.getvalue()==f"[INFO] info {PW}\ntexte {PW}\n[WARNING] {ent[3]!s}\n",o1.getvalue()[-300:],o0.getvalue())
+            finally:
+                _DBG_SECRETS.clear(); _DBG_SECRETS.update(saved)
+            bad=[]
+            for fn in (BorgRunner.boex,BorgRunner._boex_stream,_print_borg_stderr,BorgHelper.prep_report):
+                tree=ast.parse(textwrap.dedent(inspect.getsource(fn)))
+                for n in ast.walk(tree):
+                    if not (isinstance(n,ast.If) and any(isinstance(x,ast.Name) and x.id=='debug' for x in ast.walk(n.test))): continue
+                    for c in (x for st in n.body for x in ast.walk(st)):
+                        if isinstance(c,ast.Call) and isinstance(c.func,ast.Name) and c.func.id in ('printer','print'):
+                            for a in c.args:
+                                if not ((isinstance(a,ast.Constant) and isinstance(a.value,str))
+                                        or (isinstance(a,ast.Call) and isinstance(a.func,ast.Name) and a.func.id=='_dbg_mask')):
+                                    bad.append(f"{fn.__name__}:{c.lineno} {ast.unparse(a)[:60]}")
+            res['garde : sous if debug, printer/print = constante ou _dbg_mask']=(not bad,bad)
+            bad_=[(k,v) for k,v in res.items() if not v[0]]
+            for k,v in bad_: print(f"    {k} : {v[1:]}")
+            return not bad_
+        check("trace -d : secrets masqués (_dbg_mask) — dict, formes, CLÉ=valeur, boex local/sendenv/en flux, borg reçoit la passphrase exacte, garde de source (story 116)",_dbg_mask_116)
         def _borg_env_path():
             """1.0.195 (story 72, revue 2 ; mutation E2 survivante) : PATH absent ou vide dans l'environnement de borgHelper -> borg
             reçoit os.defpath, jamais une chaîne vide (Popen chercherait borg/ssh dans le dossier courant) ; PATH présent : gardé ;
@@ -33131,6 +33273,79 @@ sys.exit(0)
             for x in fails: print(f"  {x}")
             return not fails
         _rbc("Restore mode sûr sur vrai borg : = --fidele (sauf xattr/ACL), seul export-tar lancé, zones, racines imbriquées, flux coupé, tar",_s114_real)
+        def _s116_real():
+            """1.0.215 (story 116, décision de l'utilisateur du 2026-11-09) : trace -d sans passphrase, tous modes — CLI réelle avec -d
+            sur vrai borg (BORG_EXE de bac qui exporte BORG_BASE_DIR, HOME de bac, Sentry neutralisé) : Bkp local, Bkp tiré
+            (SSH_REMFO ; relais `ssh` du PATH qui note son argv et exécute la commande distante par `sh -c`, environnement transmis comme
+            un sshd `AcceptEnv BORG_*`) en sendenv puis en commande, Index, Restore (mode sûr : export-tar). Passphrase du rc à caractères
+            spéciaux (\\, ', ", $, espace, ;, %, é ; dépôt repokey) cherchée dans stdout+stderr sous toutes ses formes (brute, repr,
+            shlex, json, fragment, `%%` du rc) et dans les fichiers texte de CACHE_DIR ; chaque commande réussit (borg a reçu la
+            passphrase exacte) et sa trace imprime l'environnement masqué ; relais lancé en sendenv (-o SendEnv) et en commande (-T),
+            passphrase dans aucun de ses argv. Attentes en dur."""
+            d=os.path.join(tmp,'s116real'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); home=os.path.join(d,'home')
+            repo=os.path.join(d,'repo'); w=os.path.join(d,'borgw'); bind=os.path.join(d,'bin'); relay=os.path.join(bind,'ssh')
+            cache=os.path.join(d,'cache'); rlog=os.path.join(d,'relais.jsonl'); out=os.path.join(d,'out')
+            for x in (src,bb,home,bind): os.makedirs(x)
+            with open(os.path.join(src,'f'),'w') as f: f.write('contenu 116\n')
+            PW="Zq9s\\e'c\" $HOME;x%yé"
+            forms=(PW,repr(PW),repr(PW)[1:-1],shlex.quote(PW),json.dumps(PW),json.dumps(PW)[1:-1],json.dumps(PW,ensure_ascii=False)[1:-1],
+                   PW.replace('%','%%'),'Zq9s')
+            r=subprocess.run([shutil.which('borg'),'init','-e','repokey',repo],env=_rb_env(bb,BORG_PASSPHRASE=PW),capture_output=True,
+                             text=True,timeout=300,stdin=subprocess.DEVNULL)
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
+            _rb_wrapper(w,bb)
+            with open(relay+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json,subprocess
+a=sys.argv[1:]; i=0
+while i<len(a):
+    x=a[i]
+    if x in ('-o','-R','-i','-p','-L','-l','-F','-J','-E','-S','-W','-b','-c','-m','-D','-e','-w','-B','-Q','-O','-I'): i+=2; continue
+    i+=1
+    if not x.startswith('-'): break
+open({rlog!r},'a').write(json.dumps(a)+chr(10))
+sys.exit(subprocess.run(['sh','-c',' '.join(a[i:])]).returncode)
+''')
+            os.chmod(relay+'.tmp',0o700); os.replace(relay+'.tmp',relay)
+            rc=os.path.join(d,'rc')
+            base=(f"BORG_REPO={repo}\nBORG_PASSPHRASE={PW.replace('%','%%')}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\nBORG_EXE={w}\n"
+                  f"EXCLUDE=--exclude-caches\nBORG_ROOTBKP={src}\nSER_LOGIN=x\nSER_NAME=h\n")
+            tire="SSH_REMFO=2222:localhost:22\nNOIDX=1\n"
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cache}\nDB_ENCRYPT=false\nSTORAGE_ALERT=off\n\n[loc]\n{base}BORG_ARCHNAME=loc\nGLOB_ARCH=*-loc-*\n\n"
+                        f"[pse]\n{base}BORG_ARCHNAME=pse\nGLOB_ARCH=*-pse-*\n{tire}SSH_ENV=sendenv\n\n"
+                        f"[pcm]\n{base}BORG_ARCHNAME=pcm\nGLOB_ARCH=*-pcm-*\n{tire}SSH_ENV=commande\n")
+            os.chmod(rc,0o600)
+            me=os.path.realpath(__file__)
+            cenv=_rb_cli_env(bb,HOME=home,PATH=bind+os.pathsep+os.environ.get('PATH',os.defpath))
+            fails=[]
+            for lbl,args in (('Bkp local',['-c','Bkp','-n','loc']),('Bkp tiré sendenv',['-c','Bkp','-n','pse']),
+                             ('Bkp tiré commande',['-c','Bkp','-n','pcm']),('Index',['-c','Index','-n','loc']),
+                             ('Restore (export-tar)',['-c','Restore','-n','loc','-f',src.lstrip('/'),'-w',out])):
+                with contextlib.suppress(OSError): os.unlink(rlog)
+                p=_rb_run([me,'-C',rc,'-d',*args],600,env=cenv); o=p.stdout+p.stderr
+                try: rl=[json.loads(x) for x in open(rlog).read().splitlines()]
+                except OSError: rl=[]
+                lk=[f for f in forms if f in o]
+                ok=p.returncode==0 and "'BORG_PASSPHRASE': '***'" in o and not lk
+                if lbl=='Bkp local': ok=ok and ' BORG_PASSPHRASE=***' in o and not rl
+                if lbl=='Bkp tiré sendenv': ok=ok and ' BORG_PASSPHRASE=***' in o and len(rl)==1 and rl[0][:2]==['-o','SendEnv BORG_*']
+                if lbl=='Bkp tiré commande': ok=ok and len(rl)==1 and rl[0][0]=='-T' and 'exec env BORG_EXIT_CODES=legacy' in o
+                if lbl.startswith('Restore'):
+                    try: ok=ok and open(os.path.join(out,src.lstrip('/'),'f')).read()=='contenu 116\n'
+                    except OSError: ok=False
+                if rl and any(f in x for f in forms for a_ in rl for x in a_): ok=False; lk.append('argv du relais')
+                if not ok: fails.append(f"{lbl} : code {p.returncode}, fuites {lk}, relais {[a_[:2] for a_ in rl]} {o[-600:]!r}")
+            for root,_ds,fs in os.walk(cache):
+                for n in fs:
+                    if n.endswith(('.db','-wal','-shm','-journal')): continue
+                    try:
+                        with open(os.path.join(root,n),'rb') as f:
+                            if b'Zq9s' in f.read(): fails.append(f"passphrase dans {os.path.join(root,n)}")
+                    except OSError: pass
+            for x in fails: print(f"  {x}")
+            return not fails
+        _rbc("trace -d sur vrai borg : passphrase jamais en clair — Bkp local, Bkp tiré sendenv et commande, Index, Restore export-tar (story 116)",_s116_real)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE

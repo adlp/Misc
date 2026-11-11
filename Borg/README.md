@@ -307,8 +307,8 @@ Limites de `commande` :
 - ces refus viennent au même moment que celui d'un `BORG_ROOTBKP` illisible : après l'attente d'un Index en cours et le
   rapprochement d'un Bkp tué précédent (qui peut lancer un `borg list` local) ; « rien lancé » = ni ssh ni `borg create`.
 
-Avec `-d`, la passphrase est masquée (`***`) dans la trace de l'environnement en `commande` (en `sendenv`, trace inchangée :
-elle y reste en clair, comme avant 1.0.213).
+Avec `-d`, la passphrase est masquée (`***`) dans la trace, en `commande` comme en `sendenv` (1.0.215 ; avant, en clair en
+`sendenv` et pour tout borg local).
 
 ### Dépôts borg externes (1.0.142)
 
@@ -510,7 +510,7 @@ Options communes :
 |--------|-------------|
 | `-n <nickname>` | Dépôt cible (défaut : hostname) |
 | `-n ALL` | Tous les dépôts du fichier de conf |
-| `-d` | Mode debug (cumulable : `-dd`) |
+| `-d` | Mode debug (cumulable : `-dd`) — trace sans secret (1.0.215) : `BORG_PASSPHRASE`, `BORG_NEW_PASSPHRASE`, `BORG_PASSCOMMAND` et `BORGHELPERC_RUNTIME_PASSPHRASE` affichées `***`, et leurs valeurs remplacées par `***` partout dans la trace ; une passphrase très courte masque aussi d'autres mots, et pas seulement dans la trace : sous `-d`, aussi dans le JSON de Report sur stdout, les messages de borg affichés et le message d'échec d'Index (`index-last.json`) ; restent visibles : les identifiants dans l'URL de `BORG_REPO` et les valeurs de `BORG_RSH` (ex. `sshpass -p …`) |
 | `-C <fichier>` | Fichier de conf alternatif |
 | `-P <passphrase>` | Complète/supplante `BORG_PASSPHRASE` du fichier de conf pour cet appel |
 

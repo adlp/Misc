@@ -1,5 +1,32 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.215 — Trace -d sans passphrase, tous modes — 2026-11-11
+
+Story 116 (constat de la story 115, deferred-work « Constaté pendant la story 115 » ; décision de l'utilisateur du 2026-11-09 :
+masquer partout, `***` dans toute trace `-d`, contrôle dédié).
+
+- **borgHelper — trace `-d`** : `BORG_PASSPHRASE` n'est plus jamais affichée en clair. Avant : en clair dans l'environnement
+  imprimé par `boex` (dict, puis une ligne `CLÉ=valeur` par variable) pour tout borg local (Bkp, Index, Restore, Report…) et pour
+  un Bkp tiré en `SSH_ENV = sendenv` (défaut) ; seule `SSH_ENV = commande` la masquait (1.0.213). Un seul masquage,
+  `_dbg_mask`, appliqué à tout ce que la trace imprime : environnement, lignes par clé, argv (liste et ligne jointe), résultat de
+  borg (`boex`, lecture en flux de Restore), enregistrements et lignes de borg affichés avec `-d` (DEBUG compris), JSON de
+  `borg info`/`list` de Report `-d`. Masqués : `BORG_PASSPHRASE`, `BORG_NEW_PASSPHRASE`, `BORG_PASSCOMMAND`,
+  `BORGHELPERC_RUNTIME_PASSPHRASE` (`***` par leur nom ; leurs valeurs remplacées par `***` partout dans la trace, sous forme
+  brute, citée par shlex, repr ou JSON — une passphrase très courte masque donc aussi d'autres mots de la trace). Ce que borg
+  reçoit et le résultat rendu par `boex` (bibliothèque) sont inchangés ; sans `-d`, aucune sortie ne change et aucun secret n'est
+  retenu par le masquage. Sous `-d`, une passphrase très courte est aussi masquée hors de la trace (JSON de Report sur stdout,
+  messages de borg, message d'échec d'Index).
+- Inventaire : Sentry ne reçoit jamais la trace (`printer` écrit sur stderr, aucune intégration de journalisation) ; le message
+  d'échec d'Index (`<conf>-<nick>-index-last.json`, lu par `/access`), tiré des dernières lignes affichées, est masqué à la source ;
+  borgHelperWWW ne passe jamais `-d` (inchangé). Limites : identifiants dans l'URL de `BORG_REPO` et valeurs de `BORG_RSH`
+  (`sshpass -p …`) non masqués (TECHNICAL.md : liste des cas limites acceptés en revue).
+- Contrôles : « trace -d : secrets masqués (_dbg_mask)… » (unités, `boex` réel avec borg factice en local, sendenv et en flux,
+  passphrase exacte reçue par borg, garde de source par AST) et « trace -d sur vrai borg… » (CLI `-d`, vrai borg 1.2.6 par un
+  BORG_EXE qui exporte un BORG_BASE_DIR de bac, HOME de bac, Sentry neutralisé, passphrase du rc avec `\`, `'`, `"`, `$`, espace,
+  `;`, `%`, `é` cherchée sous toutes ses formes dans stdout+stderr : Bkp local, Bkp tiré sendenv et commande, Index, Restore
+  export-tar). Témoin sur le code d'avant (1.0.214) : passphrase en clair pour Bkp local, Bkp tiré sendenv, Index et Restore,
+  masquée en commande — `work/s116/temoin/`. `~/.config/borg/security` (36) et `~/.cache/borg` (37) inchangés.
+
 ## borgHelper 1.0.214, borgHelperWWW 1.34.2, UI 1.27.1 — Restore : mode sûr par défaut — 2026-10-23
 
 Chantier « reconstruction progressive », story 114 (décisions de l'utilisateur du 2026-10-22 et 2026-10-23, dont la 16 : « on arrête

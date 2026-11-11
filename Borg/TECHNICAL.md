@@ -2985,8 +2985,8 @@ valeurs `BORG_*` autres que la passphrase (`BORG_REPO`, `BORG_RSH`, `BORG_KEY_FI
 fermée dès ce premier appel. La boucle d'arrêt prioritaire (`self._stop` posé) repasse `inp=None` après un délai
 (`communicate` refuse une entrée après le premier appel, ValueError) : branche INATTEIGNABLE aujourd'hui — `_stop` n'est posé que
 par l'Index et le rapprochement, jamais pendant le `borg create` d'un Bkp, seul lanceur en `commande` — gardée pour un futur
-appelant arrêtable, sans contrôle qui la couvre. Trace `-d` en `commande` : `BORG_PASSPHRASE` affichée `***` (en `sendenv`, trace
-inchangée : en clair, comme avant). Arguments de borg inchangés (déjà écrits pour le shell distant : `--comment` cité,
+appelant arrêtable, sans contrôle qui la couvre. Trace `-d` : `BORG_PASSPHRASE` affichée `***` dans tous les modes depuis 1.0.215
+(« Trace -d sans secret » ci-dessous ; en 1.0.213-1.0.214, masquée en `commande` seulement). Arguments de borg inchangés (déjà écrits pour le shell distant : `--comment` cité,
 `BORG_ROOTBKP` tel quel). Limites (README) : shell distant POSIX et non restreint (`rbash` interdit `exec`) ; clé à commande forcée
 (préfixe jamais exécuté) ; `sudo` dans `BORG_EXE` (env_reset retire les `BORG_*`, comme en `sendenv`) ; `BORG_EXE` dont le premier
 mot contient `=` (pris par `env` pour une affectation). Contrôle « SSH_ENV : Bkp tiré… » (relais `ssh` par PATH qui exécute la
@@ -2994,6 +2994,31 @@ commande distante par `sh -c` sans `BORG_*`, entrée à EOF sur demande ; borg f
 de `boex` appelées directement ; borg local d'un nick en `commande` ; `SSH_ENV` dans `[DEFAULT]` ; `autre` sans `SSH_REMFO`) ;
 mesure vrai borg (dépôt repokey, passphrase à caractères spéciaux, relais) : `work/s115/mesure_reel.out`, `mesure_reel2.out`
 (après la revue 1).
+
+**Trace -d sans secret (1.0.215, story 116, décision de l'utilisateur du 2026-11-09)** : seul masquage de la trace, `_dbg_mask(obj)`
+(copie : `dict`, `list`, `tuple` récursifs, texte ; autre type tel quel). Clés `_DBG_SECRET_KEYS` (`BORG_PASSPHRASE`,
+`BORG_NEW_PASSPHRASE`, `BORG_PASSCOMMAND`, `BORGHELPERC_RUNTIME_PASSPHRASE`) -> `'***'` dans un dict ; dans un texte, chaque forme
+(brute, `shlex.quote`, intérieur de `repr` et de `json.dumps` avec et sans `ensure_ascii`) d'une valeur secrète connue -> `***`, les
+plus longues d'abord, quelle que soit la longueur (une passphrase courte masque aussi d'autres mots de la trace : préféré à une
+fuite), puis `CLÉ=valeur` d'une de ces clés (valeur sans espace ou citée par shlex, `_DBG_KV_RE`) -> `CLÉ=***`. Valeurs connues :
+`_DBG_SECRETS`, rempli par `_dbg_note(varfut)` dans `boex` SOUS `debug` seulement, avant toute impression (revue 116 row 2 : sans
+`-d`, aucun secret gardé dans la variable globale ; sous `_DBG_LOCK` ; jamais vidé ; la passphrase injectée par
+`-P`/`BORGHELPERC_RUNTIME_PASSPHRASE`/`passphrase=` y passe par `cfgread`), plus les clés secrètes de `os.environ` ; les autres
+sites (`_print_borg_stderr`, `prep_report`) impriment après un `boex` du même `debug`. Sites :
+`boex` (environnement, lignes `CLÉ=valeur`, `+<cwd>`, argv en liste et joint, résultat JSON), `_boex_stream` (résultat),
+`_print_borg_stderr` avec `debug` (enregistrements bruts ET lignes affichées, DEBUG de borg compris ; enregistrement sans
+`message` masqué avant son `str`, revue row 1 — sans `debug` : sortie inchangée), `prep_report` (`debug>0` : JSON de `borg info`/`list`). Ce que borg reçoit (`varfut`, `commande`, entrée de ssh) et le
+résultat rendu par `boex` sont inchangés. Inventaire des autres sorties : les autres `if debug` impriment des noms (nick, archive,
+table) ; `printer` n'atteint jamais Sentry (`print` sur stderr, aucune intégration de journalisation) — mais ses lignes texte vont
+dans `_PRINT_TAIL`, d'où `_record_index_last` tire le message de `<conf>-<nick>-index-last.json` (lu par `/access`) : masquées à la
+source ; borgHelperWWW ne passe jamais `-d`. Limites : identifiants dans l'URL de `BORG_REPO` (`sftp://u:mdp@…`) et valeurs de
+`BORG_RSH` (`sshpass -p …`) non masqués (ni dans la trace ni dans l'argv de borg) ; un secret court remplacé partout sous `-d`
+déborde de la trace (JSON de Report sur stdout, messages de borg du Bkp, JSON d'erreur par nick de `_stop_text`, message de
+`index-last.json`). Limites acceptées (revue 116 row 4, inatteignables ou défense en profondeur) : masquage après le `strip` de `_borg_err_lines` (passphrase à espaces en bout de ligne), secret court qui casse les noms de clés (`_DBG_KV_RE` aveugle ensuite), `KEY="v w"`/`"KEY": "v"`/`KEY: v` non reconnus, secrets chevauchants (1-2 caractères), secret multi-ligne coupé par ligne, coût ×2 de la trace, clé papier dans la trace de `Key -d`, garde AST contournable (`sys.stderr.write`, test sans `debug`, `_dbg_mask(<tout>)`, aucun minimum d'appels), `prep_report` sans contrôle de comportement, `.db` exclus du balayage du contrôle réel. Contrôles : « trace -d : secrets masqués (_dbg_mask)… » (unités, `boex` réel avec borg factice
+local, sendenv et en flux, garde de source par AST : sous `if debug…` de ces quatre fonctions, `printer`/`print` n'impriment qu'une
+constante ou un appel `_dbg_mask`) et « trace -d sur vrai borg… » (CLI `-d`, vrai borg : Bkp local, Bkp tiré sendenv et commande
+par un relais `ssh`, Index, Restore export-tar ; témoin sur le code d'avant : fuites en local, sendenv, Index, Restore —
+`work/s116/temoin/`).
 
 **Téléchargements, index_last, sondes lecteur (1.0.177 / WWW 1.30.2 / UI 1.22.1, story 40)** : borgHelperWWW `_borg_stream(request,
 cmd, env, what, decoy, path, missing)` remplace `_stream_proc` — stderr de borg lu dans un thread, premier bloc lu AVANT la

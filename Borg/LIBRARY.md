@@ -369,6 +369,8 @@ for nick in nicks.split(','):
 # BORG_* dans la commande distante et passphrase sur l'entrée de ssh — SSH_ENV inconnue avec preBorg : ValueError ;
 # paramètre sshEnv='sendenv'|'commande' : décision imposée, SSH_ENV du rc non lue ; sans preBorg : sans effet)
 # — exitcode en codes hérités (0, 1, 2…) même avec borg 1.4 ; un wrapper BORG_EXE qui force `modern` n'est pas couvert
+# 1.0.215 : debug=1 -> trace sur stderr sans secret (BORG_PASSPHRASE, BORG_NEW_PASSPHRASE, BORG_PASSCOMMAND,
+# BORGHELPERC_RUNTIME_PASSPHRASE : '***', valeurs remplacées partout) ; ce que borg reçoit et le résultat rendu : inchangés
 rb = bh.borg.boex('mon-serveur', ['list', '--json'])
 archives = rb['stdout'][0]['archives']
 for a in archives:
