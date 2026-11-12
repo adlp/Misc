@@ -948,9 +948,16 @@ _PEM_RE = re.compile(
     rb"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", re.DOTALL)
 
 
+_RAW_KEY_RE = re.compile(rb"[A-Za-z0-9_-]{43}=?")
+
+
 def _parse_key_material(data):
     """Octets d'une clé (PEM, DER, ou base64url texte) -> scalaire privé."""
     data = bytes(data).strip()
+    # Clé brute base64url (32 octets : 43 caractères, `=` final toléré — format de push_vapid_keys) reconnue AVANT tout
+    # test DER/PEM : le caractère « 0 » vaut l'octet 0x30 (SEQUENCE DER), une clé brute en « 0… » partait en lecture DER.
+    if _RAW_KEY_RE.fullmatch(data):
+        return _coerce_scalar(b64urldecode(data))
     if b"-----BEGIN" in data:
         for label, body in _PEM_RE.findall(data):
             if label in (b"EC PRIVATE KEY", b"PRIVATE KEY"):

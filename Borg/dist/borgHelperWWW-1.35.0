@@ -3,7 +3,7 @@
 # borgHelperWWW — VERSION AUTONOME. FICHIER GÉNÉRÉ : NE PAS ÉDITER À LA MAIN.
 # Version source : borgHelperWWW 1.35.0
 # Origine        : commit cf69d2ad1510aec2d1e131ef8936d46d125d85a8 (blob e5c9b77ab4d2, Borg/borgHelperWWW @ HEAD)
-# Couche compat  : Borg/dist/compat/ (sha256 15bf5e5b2b026531)
+# Couche compat  : Borg/dist/compat/ (sha256 60b3b3dcda2232ec)
 # Générateur     : Borg/dist/build_standalone.py — régénérer à chaque nouvelle WWW_VERSION :
 #                  python3 Borg/dist/build_standalone.py --rev HEAD
 # Dépendances à l'exécution : bibliothèque standard Python >= 3.10 + borgHelper (à côté) + fichiers UI/JS.
@@ -13,7 +13,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # ── Couche de compatibilité embarquée (générée) ─────────────────────────────────────────────────────────
 # Modules servis par un importeur en tête de sys.meta_path : fastapi, starlette, pydantic, uvicorn, anyio, pywebpush,
-# py_vapid. Sources : Borg/dist/compat/ (hash 15bf5e5b2b026531). Ce code remplace les paquets homonymes, même installés.
+# py_vapid. Sources : Borg/dist/compat/ (hash 60b3b3dcda2232ec). Ce code remplace les paquets homonymes, même installés.
 def _bh_install_embedded():
     import importlib.abc, importlib.util, sys
     mods = {
@@ -4439,9 +4439,16 @@ _PEM_RE = re.compile(
     rb"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", re.DOTALL)
 
 
+_RAW_KEY_RE = re.compile(rb"[A-Za-z0-9_-]{43}=?")
+
+
 def _parse_key_material(data):
     """Octets d'une clé (PEM, DER, ou base64url texte) -> scalaire privé."""
     data = bytes(data).strip()
+    # Clé brute base64url (32 octets : 43 caractères, `=` final toléré — format de push_vapid_keys) reconnue AVANT tout
+    # test DER/PEM : le caractère « 0 » vaut l'octet 0x30 (SEQUENCE DER), une clé brute en « 0… » partait en lecture DER.
+    if _RAW_KEY_RE.fullmatch(data):
+        return _coerce_scalar(b64urldecode(data))
     if b"-----BEGIN" in data:
         for label, body in _PEM_RE.findall(data):
             if label in (b"EC PRIVATE KEY", b"PRIVATE KEY"):

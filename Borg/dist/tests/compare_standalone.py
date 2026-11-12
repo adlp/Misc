@@ -4,9 +4,11 @@
 mêmes requêtes HTTP et compare statut, en-têtes significatifs et corps (JSON normalisé).
 
     python3 compare_standalone.py --orig-dir D1 --dep-dir D2 --rc RC --state-src ETAT_PRISTINE --state-dst ETAT_COURANT \
-        [--out RAPPORT.json] [--scenario defaut|groupes|nodl]
+        [--workdir DOSSIER] [--scenario defaut|groupes|nodl]
 
 D1 : dossier de l'original (borgHelperWWW + borgHelper(.py) + UI), D2 : dossier de déploiement de l'autonome.
+Sorties dans --workdir (défaut : dossier courant) : `result-<scénario>.json` (bilan et écarts), journaux des serveurs
+`orig-<scénario>.log`, `dep-<scénario>.log` et `spec.log`, dossier `restoreroot/`. Ports fixes 18910 à 18912 (libres).
 Les routes GET sont extraites automatiquement de /openapi.json de l'ORIGINAL (plus les routes de l'UI)."""
 import argparse
 import http.client
@@ -71,9 +73,45 @@ def req(port, method, path, headers=None, body=None, timeout=30):
 _TS = re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?")
 _HEX32 = re.compile(r"\b[0-9a-f]{32}\b")
 _RUNID = re.compile(r"run_id=\S+")
+# `reste` du Report = place libre du disque des dépôts, mesurée en direct (df) : elle bouge entre les deux serveurs dès qu'un
+# autre processus écrit sur ce disque (artefact de la comparaison 1.34.2). Seule la taille est remplacée : un suffixe
+# (« — 🔌 client absent … », « ⚠ … ») reste comparé.
+_SIZE = re.compile(r"~?\d+(?:\.\d+)? [KMGTPE]?B")
+_RESTE_JSON = re.compile(r'("reste": ")(~?\d+(?:\.\d+)? [KMGTPE]?B)')
+
+
+def _norm_reste_tables(s):
+    """Colonne `reste` des tableaux prettytable du Report texte : taille -> <RESTE>, cellule et bordure sans remplissage
+    (la largeur de la colonne suit la valeur)."""
+    lines = s.split("\n")
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith(("|", "+")):
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and lines[j].startswith(("|", "+")):
+            j += 1
+        col = None
+        for line in lines[i:j]:   # en-tête du bloc (tableau) : colonne nommée exactement « reste »
+            if line.startswith("|") and "reste" in [c.strip() for c in line.split("|")]:
+                col = [c.strip() for c in line.split("|")].index("reste")
+                break
+        if col is not None:
+            for k in range(i, j):
+                sep = "|" if lines[k].startswith("|") else "+"
+                parts = lines[k].split(sep)
+                if col < len(parts):
+                    parts[col] = _SIZE.sub("<RESTE>", parts[col].strip(), count=1) if sep == "|" else "-"
+                    lines[k] = sep.join(parts)
+        i = j
+    return "\n".join(lines)
 
 
 def norm_text(s):
+    s = _RESTE_JSON.sub(r"\1<RESTE>", s)
+    if "| reste |" in re.sub(r" +", " ", s):
+        s = _norm_reste_tables(s)
     s = _TS.sub("<TS>", s)
     s = _HEX32.sub("<HEX32>", s)
     s = re.sub(r"\b\d+ms\b", "<ms>", s)

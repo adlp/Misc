@@ -29,7 +29,13 @@ transformation textuelle, voir plus bas), précédé d'une couche de compatibili
 Copier le fichier généré **à la place** de `borgHelperWWW`, dans le dossier qui contient déjà `borgHelper`,
 `borgHelper.py`, `borgHelperWWW_ui.html`, `borgHelperWWW_sw.js` et `vendor/chartjs/` :
 
-    cp Borg/dist/borgHelperWWW-1.34.1 /opt/borg/borgHelperWWW
+    cp Borg/dist/borgHelperWWW-1.35.0 /opt/borg/borgHelperWWW
+
+La version autonome n'embarque ni l'UI ni le service worker : les fichiers déposés à côté doivent être ceux de la même
+release. **Avec 1.35.0**, déposer aussi `borgHelperWWW_sw.js` 1.5.0 et `borgHelperWWW_ui.html` 1.28.0 (sinon l'ancien
+service worker afficherait « Dernière sauvegarde il y a X » pour un nick qui n'en a aucune, et l'ancienne UI ne griserait
+pas « ▶ Backup » d'un client absent), ainsi que `borgHelper` 1.0.217 (1.35.0 en importe `_is_pull` et `_pull_probe` : avec
+un `borgHelper` plus ancien, le serveur ne démarre pas).
 
 Mêmes options CLI, mêmes variables `BORGHELPERWWW_*`, mêmes routes, mêmes codes HTTP, mêmes en-têtes, même journal
 `[req]` que l'original. Les fichiers sont cherchés relativement à l'emplacement du fichier (liens symboliques résolus),
@@ -69,7 +75,9 @@ dit tout de suite : compléter `compat/` (jamais le fichier généré).
 - Serveur HTTP plus strict qu'`uvicorn`/h11 sur quelques entrées mal formées : `Content-Length` avec
   `Transfer-Encoding` -> 400 (anti request smuggling), versions autres que HTTP/1.0 et 1.1 -> 400, URI absolue
   (`GET http://hôte/chemin`) servie comme son chemin. Pas d'en-tête `server:`. Un échec de bind (port pris) sort avec le
-  code 3 (celui que l'original attend ; uvicorn 0.15 sort en 1).
+  code 3 (celui que l'original attend ; uvicorn 0.15 sort en 1). Requête avec corps refusée par le middleware
+  (`--require-user`, groupes) avant que le corps soit reçu : même statut et même réponse, mais `Connection: close` et
+  connexion fermée (l'original la garde ouverte) — mesuré en 1.35.0 (`compat/uvicorn.py`).
 - `/docs` et `/redoc` : gabarits HTML équivalents (mêmes scripts CDN, jsdelivr) mais pas octet pour octet ;
   `/docs/oauth2-redirect` est une page minimale (aucune authentification OAuth2 dans l'API) ; `/openapi.json` couvre
   chemins, méthodes, paramètres (type, défaut, description), corps et schémas des modèles, sans les raffinements de

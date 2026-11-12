@@ -69,6 +69,10 @@ RFC_BODY = ("DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlm"
 KEY_RAW = "vMQ9pOnw_TVIYuA81R91jFPd6mzR0eKZsUX4gPnmOGY"
 KEY_PUB = ("BGTasrtqzM6TlzOrpVZ4Bu7Pwqfp3e5URqf6efvk9T6NgeYJsEA7Z_9oPjo4ZbvDnmqj"
            "87zqc3KscO591nTJU9E")
+# Clé brute dont le texte base64url commence par « 0 » (= octet 0x30, étiquette SEQUENCE du DER) : 1 clé sur 64.
+# Publique calculée par cryptography et recoupée par py_vapid (Vapid.from_string) — cmp1350, 2026-11-12.
+KEY0_RAW = "0IwmzX1OGP_DYVyNK18bcQI5UMuN4vw3w_5zAWPmGHA"
+KEY0_PUB = ("BDIO2P4uKIhyvZsWW1Yr6UXuEwNIFkSsaKEuPu-3MatRj38EC5WV-wzGgQUHxpq3Q7ssHX3aLzLuKlwL9S-I81M")
 KEY_PEM_SEC1 = """-----BEGIN EC PRIVATE KEY-----
 MHcCAQEEILzEPaTp8P01SGLgPNUfdYxT3eps0dHimbFF+ID55jhmoAoGCCqGSM49
 AwEHoUQDQgAEZNqyu2rMzpOXM6ulVngG7s/Cp+nd7lRGp/p5++T1Po2B5gmwQDtn
@@ -398,6 +402,19 @@ class KeysTest(unittest.TestCase):
             self.assertEqual(
                 b64e(wl.Vapid.from_file(pem_path).public_key_raw), KEY_PUB)
 
+    def test_vapid_cle_brute_en_zero(self):
+        """Clé brute en « 0… » (comme push_vapid_keys) : jamais lue comme du DER binaire (régression cmp1350)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k.txt")
+            with open(path, "w") as fh:
+                fh.write(KEY0_RAW + "\n")
+            cas = {"brute": KEY0_RAW, "brute+padding": KEY0_RAW + "=", "texte en bytes": KEY0_RAW.encode(),
+                   "fichier texte": path, "32 octets": b64d(KEY0_RAW)}
+            for pure in backends():
+                for nom, valeur in cas.items():
+                    with self.subTest(pure=pure, cas=nom), backend(pure):
+                        self.assertEqual(b64e(wl.Vapid.from_string(valeur).public_key_raw), KEY0_PUB)
+
     def test_vapid_cles_invalides(self):
         for mauvais in ("", "pas une clé", "AAAA", b64e(b"\0" * 32),
                         b64e(b"\xff" * 32), b64e(b"x" * 33),
@@ -517,6 +534,19 @@ class WebPushEndToEndTest(unittest.TestCase):
 
     def sub(self):
         return make_subscription(self.origin + "/push/abc")
+
+    def test_envoi_cle_vapid_en_zero(self):
+        """webpush() avec une clé VAPID brute en « 0… » : envoyée, JWT signé par la bonne clé (en-tête k=)."""
+        for pure in backends():
+            with self.subTest(pure=pure), backend(pure):
+                self.srv.requests.clear()
+                info, _d, _auth = self.sub()
+                resp = wl.webpush(info, data="x", vapid_private_key=KEY0_RAW,
+                                  vapid_claims={"sub": "mailto:admin@example.org"})
+                self.assertEqual(resp.status_code, 201)
+                self.assertEqual(len(self.srv.requests), 1)
+                h = {k.lower(): v for k, v in self.srv.requests[0]["headers"].items()}
+                self.assertIn("k=" + KEY0_PUB, h["authorization"])
 
     def test_envoi_complet(self):
         claims = {"sub": "mailto:admin@example.org"}
