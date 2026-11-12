@@ -86,7 +86,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.35.0"
+WWW_VERSION="1.35.1"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -9334,7 +9334,7 @@ def push_selftest():
         check("require_user : 403 sans header d'identité (sauf /healthz), 200 avec ; utilisateur journalisé",_require_user_ok)
         def _prefs_user_ok():
             global PUSH_PREFS_FILE
-            old=PUSH_PREFS_FILE; PUSH_PREFS_FILE=os.path.join(tempfile.mkdtemp(prefix='bhw-user-'),'prefs.json')
+            old=PUSH_PREFS_FILE; ud=tempfile.mkdtemp(prefix='bhw-user-'); PUSH_PREFS_FILE=os.path.join(ud,'prefs.json')   # 1.35.1 : retiré au finally
             c=_TC(app); H={'X-API-Key':API_KEY}; P=API_PREFIX; ep='https://push.example.invalid/ep-user'
             body={'endpoint':ep,'keys':{'p256dh':'p','auth':'a'}}
             try:
@@ -9349,7 +9349,7 @@ def push_selftest():
                 return (u1=='alice@example.org' and u2=='alice@example.org' and u3=='bob@example.org'
                         and r.json().get('user')=='bob@example.org')
             finally:
-                PUSH_PREFS_FILE=old
+                PUSH_PREFS_FILE=old; shutil.rmtree(ud,ignore_errors=True)
         check("notifications : utilisateur enregistré à l'abonnement, conservé sans header, mis à jour au PATCH",_prefs_user_ok)
 
     # ── Mode dossier (1.32.0, story 86, D194) : plusieurs rc, nicks « préfixe:nick » ──

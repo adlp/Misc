@@ -1,5 +1,13 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.35.1 — selftest : plus de dossier /tmp/bhw-user-* laissé — 2026-11-12
+
+- **borgHelperWWW — selftest** : le contrôle « notifications : utilisateur enregistré à l'abonnement… » (`_prefs_user_ok`,
+  depuis 1.25.0) créait un dossier `tempfile.mkdtemp(prefix='bhw-user-')` sans le retirer : chaque `--selftest` laissait
+  un `/tmp/bhw-user-*` (`prefs.json`). Il est maintenant retiré dans le `finally`, comme les autres dossiers du selftest.
+  Aucun changement de comportement du serveur (deferred-work « Constaté pendant la story 114 »).
+- Vérifié : push selftest 177/177 en 3.10 et 3.14 ; nombre de `/tmp/bhw-user-*` identique avant et après chaque passe.
+
 ## borgHelper 1.0.217, borgHelperWWW 1.35.0, UI 1.28.0, SW 1.5.0 — Bkp tiré : client absent, ni échec ni succès — 2026-11-12
 
 Story 118 (chantier « Bkp tiré / client à IP flottante, ProxyJump », étude `work/proxyjump/etude.md` ; décisions de l'utilisateur des
