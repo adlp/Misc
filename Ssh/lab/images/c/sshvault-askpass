@@ -1,0 +1,11 @@
+#!/bin/sh
+# `sshvault-askpass` du client de la maquette (SSH_ASKPASS) : `python3 -m sshvault.askpass` de la source
+# montée (même pid : exec ; sshvault reconnaît son askpass à ce nom). SSHVAULT_TEST_ASKPASS_LOG : chaque appel y
+# ajoute une ligne (texte de l'invite, jamais une réponse).
+export PYTHONPATH=/src
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${SSHVAULT_TEST_ASKPASS_LOG:-}" ]; then
+    printf '%s' "$1" | tr '\n' ' ' >> "$SSHVAULT_TEST_ASKPASS_LOG"
+    echo >> "$SSHVAULT_TEST_ASKPASS_LOG"
+fi
+exec python3 -m sshvault.askpass "$@"

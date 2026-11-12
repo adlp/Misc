@@ -529,7 +529,7 @@ class Bench:
         env.update(HOME=str(self.home), SSHVAULT_SSH_HOME=str(self.home), XDG_RUNTIME_DIR=str(self.runtime),
                    SSHVAULT_BW=str(self.bw), FAKE_BW_VAULT=str(self.vault_file),
                    FAKE_BW_LOG=str(self.log), FAKE_BW_PIDS=str(self.pids),
-                   PYTHONPATH=SRC, SSHVAULT_PROMPT_TIMEOUT="10", SSHVAULT_TEST_BENCH="1",
+                   PYTHONPATH=SRC, SSHVAULT_PROMPT_TIMEOUT="10", SSHVAULT_TEST_BENCH="1", SSHVAULT_TEST_RUN=RUN_ID,
                    PATH=str(self.exe.parent) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
                    SSHVAULT_SSH_ADD=str(self.ssh_add), SSHVAULT_KNOWN_HOSTS=str(self.known_hosts))
         env.pop("SSH_AGENT_PID", None)
@@ -946,14 +946,67 @@ def b64_fragments(text):
     return out
 
 
+#: Identifiant de cette session pytest. `SSHVAULT_TEST_RUN=<RUN_ID>` est posé dans l'environnement de tout processus lancé
+#: par les bancs (banc unitaire, HOME de l'intégration, conteneur client de la maquette) : lui seul rattache au test un
+#: processus qui n'en descend pas (agent ou surveillant détaché, processus d'un conteneur). `SSHVAULT_TEST_BENCH` ne sert
+#: qu'aux enveloppes (garde contre un usage hors banc).
+RUN_ID = uuid.uuid4().hex
+RUN_VAR = "SSHVAULT_TEST_RUN"
+
+
+def _stat_fields(pid):
+    """(ppid, date de début) du processus `pid` d'après /proc/<pid>/stat ; OSError s'il a disparu."""
+    with open("/proc/%s/stat" % pid) as f:
+        rest = f.read().rsplit(")", 1)[1].split()
+    return int(rest[1]), rest[19]
+
+
+def descends_from(pid, root):
+    """`pid` est-il `root` ou un de ses descendants (chaîne des ppid) ?"""
+    p, steps = int(pid), 0
+    while p > 1 and steps < 128:
+        if p == root:
+            return True
+        try:
+            p = _stat_fields(p)[0]
+        except (OSError, ValueError, IndexError):
+            return False
+        steps += 1
+    return False
+
+
+def scope_of(pid, root, run_id=None):
+    """Le processus `pid` (texte) est-il du test ? True : descendant de `root` (pytest), ou environnement portant
+    SSHVAULT_TEST_RUN=<run_id>. False : ni l'un ni l'autre. None : disparu avant d'être lu (rien à relever). Un
+    environnement illisible (droits : agent non « dumpable »…) compte comme du test (échec fermé : jamais ignoré faute
+    de lecture)."""
+    if descends_from(pid, root):
+        return True
+    want = ("%s=%s" % (RUN_VAR, run_id or RUN_ID)).encode()
+    try:
+        with open("/proc/%s/environ" % pid, "rb") as f:
+            return want in f.read().split(b"\0")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as e:
+        return None if e.errno == 3 else True  # ESRCH : disparu ; autre (EACCES…) : du test
+
+
+def in_scope(pid, root, run_id=None):
+    return scope_of(pid, root, run_id) is True
+
+
 class ArgvWatch:
     """Relève, pendant un appel, la ligne de commande (/proc/<pid>/cmdline) de chaque processus
-    de l'utilisateur ; garde celles qui contiennent `needle` et signale tout argument suspect :
+    du test (`scope_of`) ; garde celles qui contiennent `needle` et signale tout argument suspect :
     clé privée ou son base64 (tout processus) ; pour bw et sshvault, tout argument (hors argv[0])
     de plus de 80 caractères, d'allure base64, ou contenant « { » (`heuristics` faux : seulement
     la clé et les `secrets`, pour les bancs dont les chemins ressemblent à du base64).
     `keep_all` : garde aussi chaque ligne de commande relevée (`all`), pour un contrôle après
-    coup contre un secret inconnu avant l'appel (clé générée)."""
+    coup contre un secret inconnu avant l'appel (clé générée).
+    Seuls comptent les processus du test : descendants de pytest, ou dont l'environnement porte
+    SSHVAULT_TEST_RUN=<RUN_ID> ; `seen`, `all` et `suspect` ignorent ceux des autres sessions de l'utilisateur (la
+    décision est gardée par processus pendant tout le relevé)."""
 
     def __init__(self, needle, secrets, heuristics=True, keep_all=False):
         self.needle, self.secrets, self.heuristics = needle, [s for s in secrets if s], heuristics
@@ -964,6 +1017,22 @@ class ArgvWatch:
         # ancêtres de pytest (shell qui l'a lancé, dont la ligne de commande peut contenir
         # n'importe quoi) : hors du relevé (faux positif mesuré)
         self.ancestors = ancestors()
+        self.pid = os.getpid()
+        self._scopes = {}
+
+    def _scope(self, d):
+        """Du test ? (True, False ; None : disparu). Décidé avant toute lecture de la ligne de commande, gardé par
+        (pid, date de début) : un pid réutilisé est une autre décision."""
+        try:
+            key = (d, _stat_fields(d)[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        if key not in self._scopes:
+            r = scope_of(d, self.pid)
+            if r is None:
+                return None
+            self._scopes[key] = r
+        return self._scopes[key]
 
     def _run(self):
         me = os.getuid()
@@ -974,6 +1043,11 @@ class ArgvWatch:
                 try:
                     if os.stat("/proc/" + d).st_uid != me:
                         continue
+                except OSError:
+                    continue
+                if not self._scope(d):  # hors du test (la commande d'une autre session n'est pas une fuite), ou disparu
+                    continue
+                try:
                     with open("/proc/%s/cmdline" % d, "rb") as f:
                         argv = f.read().decode(errors="replace").split("\0")
                 except OSError:

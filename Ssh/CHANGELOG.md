@@ -1,5 +1,43 @@
 # Changelog — sshvault
 
+## sshvault 0.16.2 — Client OpenSSH récent en conteneur dans la maquette — 2026-11-11
+
+Tests et maquette seulement : aucun changement du comportement de sshvault.
+
+- **Conteneur client C** (`lab/images/c/`, service `c` de `lab/compose.yaml`, profil Compose `client` : jamais
+  démarré par `lab.sh up`) : Debian 13 (OpenSSH 10.0, Python 3.13, `keyutils`), attaché au seul réseau `front`
+  (B, sur `back`, lui est injoignable : ni nom ni route). sshvault y tourne depuis `src/` du dépôt et le vrai `bw`
+  y est monté, en lecture seule (comme le certificat de `NODE_EXTRA_CA_CERTS` du compte, s'il est défini) ;
+  enveloppes `sshvault` et `sshvault-askpass` sur le PATH (`python3 -m sshvault…`). Système de fichiers en
+  lecture seule ; HOME, `/tmp` (`exec` gardé : `bw` peut extraire un module natif à `login`) et
+  `XDG_RUNTIME_DIR` sur des tmpfs détruits avec le conteneur ; aucun port publié, `cap_drop: ALL`,
+  `no-new-privileges`, profil seccomp par défaut : le keyring est refusé et la session est rangée dans un fichier
+  du tmpfs (repli fichier). Utilisateur de même uid/gid que celui du poste (arguments de construction
+  `LAB_UID`/`LAB_GID`).
+- **Série `lab`** : `test_sshvault_depuis_le_client_openssh_recent` rejoue depuis C les scénarios du test
+  précédent avec le vrai `bw` et le compte de test (rebond A puis B par `ensure`, B en direct sans nom, absolu ou
+  non, ni connexion jusqu'à B (paquets perdus), transfert restreint `ssh -A`, mot de passe de P par
+  `sshvault-askpass` direct et par A, `generate` puis `deploy` puis connexion). Il vérifie `ssh -V` = OpenSSH
+  10.0, la session rangée dans le fichier du tmpfs, les montages en lecture seule, le système de fichiers en
+  lecture seule (écriture hors tmpfs refusée : EROFS) et l'absence de secret dans le conteneur (fichiers, avec
+  témoins posés dans chaque racine ; environnements de processus, avec un témoin planté ; `ArgvWatch` avec témoins
+  positifs) et dans `docker inspect`. La ligne `Include` écrite par `sshvault ssh-config install` est lue par le
+  client 10.0, comme la forme sans guillemets. `sshvault login` y est tapé sous le pty de la série
+  (`docker exec -it`). Précondition : `bw` est un exécutable ELF autonome de l'architecture du poste (sinon le
+  test est sauté) ; serveur du compte sur la boucle locale (adresses résolues, non spécifiées et IPv4 mappées
+  comprises) : sauté aussi.
+- **`ArgvWatch`** (`tests/bench.py`) ne relève plus que les processus du test : descendants de pytest (chaîne des
+  ppid) ou dont l'environnement porte `SSHVAULT_TEST_RUN=<identifiant de la session pytest>` (posé par le banc, le
+  HOME de l'intégration et le conteneur client ; agents et surveillants détachés compris). Un environnement
+  illisible compte comme du test, un processus disparu n'est pas relevé, la décision est gardée par processus.
+  La commande d'une autre session du même utilisateur (mesurée deux fois sur un vrai run : `grep -rqF 'OPENSSH
+  PRIVATE KEY'` dans un autre projet Compose) n'est plus une fuite. `SSHVAULT_TEST_BENCH` ne garde plus que les
+  enveloppes. Test : `tests/test_argvwatch.py`.
+- `Lab.client_up` et la classe `Client` (`tests/integration/labenv.py`) ; `pty_login` accepte une commande de
+  login autre que `python -m sshvault login` (`home["login_argv"]`). Un login bloqué du conteneur est arrêté
+  (et vérifié) avant le `bw logout` du nouvel essai. `lab.sh down` et `status` portent aussi sur le conteneur
+  client (`--profile client`) ; le contrôle final « rien ne reste » le compte.
+
 ## sshvault 0.16.1 — Maquette de test à conteneurs ssh — 2026-11-11
 
 Tests et maquette seulement : aucun changement du comportement de sshvault.

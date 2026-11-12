@@ -3,7 +3,8 @@
 #
 #   lab.sh up [CLES_PUBLIQUES]   construit les images, démarre A, B, P, D ; CLES_PUBLIQUES : fichier
 #                                de clés publiques admises sur A, B et D (une par ligne)
-#   lab.sh down                  détruit conteneurs, réseaux et volumes du projet, efface mot de passe et known_hosts (images gardées)
+#   lab.sh down                  détruit conteneurs (le client C de la série de tests compris), réseaux et volumes du projet,
+#                                efface mot de passe et known_hosts (images gardées)
 #   lab.sh status                état et ports publiés (127.0.0.1)
 #   lab.sh config                extrait de ssh_config (Host, HostName, Port, User, ProxyJump, known_hosts à part) à inclure
 #   lab.sh password              mot de passe de P (compte labpw), nouveau à chaque `up`
@@ -132,7 +133,8 @@ cmd_up() {
 cmd_down() {
     [ $# -eq 0 ] || usage
     rc=0
-    dc down -v --remove-orphans --timeout 5 >&2 || rc=1
+    # --profile client : le conteneur client de la série de tests (story 21, jamais démarré par `up`) est supprimé aussi
+    dc --profile client down -v --remove-orphans --timeout 5 >&2 || rc=1
     rm -f "$DIR/password" "$DIR/password.new" "$DIR/known_hosts" "$DIR/keys/authorized_keys"
     rmdir "$DIR/keys" "$DIR" 2>/dev/null || true
     left=$(leftovers) || { echo "lab.sh: projet $PROJECT : $left" >&2; rc=1; }
@@ -142,7 +144,7 @@ cmd_down() {
 
 cmd_status() {
     [ $# -eq 0 ] || usage
-    dc ps -a
+    dc --profile client ps -a
 }
 
 cmd_config() {

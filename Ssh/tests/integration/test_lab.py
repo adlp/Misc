@@ -15,6 +15,11 @@ interne), P (mot de passe seul, 10.0) et D (cible de deploy, 10.0). Ports publi�
   (`itbase.py`) : rebond réel par clé (CAP-7), B en direct refusé, transfert restreint (CAP-8),
   mot de passe d'hôte par `sshvault-askpass` (CAP-11, dont le rebond A→P), `generate` puis
   `deploy` puis connexion avec la clé déployée.
+- `test_sshvault_depuis_le_client_openssh_recent` (story 21) : les mêmes scénarios depuis un conteneur
+  client C (Debian 13 : OpenSSH 10.0, Python 3.13) attaché à `front` seulement ; sshvault (source du dépôt) et
+  le vrai `bw` y sont montés en lecture seule, HOME et XDG_RUNTIME_DIR sont des tmpfs, le login est tapé sous
+  un pty (`docker exec -it`), la session est rangée dans un fichier du tmpfs (keyring refusé par le profil
+  seccomp par défaut), B est injoignable (ni nom, ni route). Sauté si le serveur du compte est sur la boucle locale.
 - `test_interruption` : SIGINT, pendant le démarrage ou après, puis SIGTERM : conteneurs,
   réseaux et volumes du projet supprimés (sonde `labenv.py sonde`).
 
@@ -32,12 +37,18 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
+import warnings
+import ipaddress
+import socket
+from urllib.parse import urlsplit
 
 import pytest
 
-from bench import HAVE_OPENSSH, ArgvWatch, agent_list, write_askpass
+from bench import HAVE_OPENSSH, RUN_ID, ArgvWatch, agent_list, write_askpass
 from itbase import ALIAS, MARK, RUN, TAG, Report, Scrub, check, home, ssh_keys, sv, sv_login, vault  # noqa: F401
-from labenv import COMPOSE, LAB_SH, UP_TIMEOUT, docker_available, running
+from labenv import (CLIENT_BW, CLIENT_CA, COMPOSE, LAB_SH, UP_TIMEOUT, ClientUnavailable, LabError, LabTimeout, docker_available,
+                    running)
 
 pytestmark = pytest.mark.lab
 
@@ -253,6 +264,8 @@ def test_maquette_a_la_main(lab, ssh_keys, tmp_path, report):
         hc = c["HostConfig"]
         svc = c["Config"]["Labels"]["com.docker.compose.service"]
         assert not hc.get("Privileged") and not hc.get("CapAdd"), "%s : privilège ou capacité ajoutée" % svc
+        if svc == "c":  # client (story 21, démarré par son seul test) : montages vérifiés par ce test
+            continue
         want = [] if svc == "p" else [(keys_dir, "/keys", False)]
         assert [(os.path.realpath(m["Source"]), m["Destination"], m["RW"]) for m in c["Mounts"]] == want, \
             "%s : montages %s" % (svc, c["Mounts"])
@@ -419,6 +432,405 @@ def test_sshvault_sur_la_maquette(scrubbed, account, bw_exe, vault, ssh_keys, ho
              if (it.get("sshKey") or {}).get("keyFingerprint") == fp_gen]
     assert len(found) == 1 and found[0]["sshKey"]["publicKey"] == public
     assert not files_with("BEGIN OPENSSH PRIVATE KEY", [h, home["runtime"]]), "clé privée écrite sur disque"
+
+
+# --- 2 bis. le même, depuis un client OpenSSH 10.0 en conteneur (story 21) -----------------------
+
+#: ~/.ssh/config du conteneur client avant `sshvault ssh-config install` (qui y met sa ligne `Include`, en tête) : la maquette vue de C
+#: (réseau `front` seulement : A, P et D par leur nom de service ; B seulement par A). Noms d'hôtes propres au
+#: client pour les éléments créés ici (`svlab-cp`, `svlab-cpj`, `svlab-cdg`) : ceux du test précédent, dans le même
+#: coffre, n'y gênent pas ; `svlab-a`, `svlab-b`, `svlab-b-direct` et `svlab-d` sont ceux des hôtes de la clé admise.
+CLIENT_CONFIG = """Host svlab-a
+    HostName a
+    User lab
+
+Host svlab-b
+    HostName b
+    User lab
+    ProxyJump svlab-a
+
+# nom absolu : jamais complété par un domaine de recherche
+Host svlab-b-direct
+    HostName b.
+    User lab
+
+Host svlab-cp
+    HostName p
+    User labpw
+
+Host svlab-cpj
+    HostName p
+    User labpw
+    ProxyJump svlab-a
+
+Host svlab-d
+    HostName d
+    User lab
+
+Host svlab-cdg
+    HostName d
+    User lab
+
+Host svlab-*
+    UserKnownHostsFile %(home)s/.ssh/known_hosts
+    StrictHostKeyChecking accept-new
+    GlobalKnownHostsFile /dev/null
+    ConnectTimeout 20
+    IdentityFile /nonexistent/sshvault-lab-aucune-identite
+"""
+
+
+class ClientBw:
+    """`bw` brut du conteneur client (monté), sur les données de sshvault du compte : `logout` d'un login bloqué."""
+
+    def __init__(self, client):
+        self.client = client
+
+    def run(self, *args):
+        """Comme `Bw.run` : un `bw` sans réponse ne lève rien, code 124 (toute autre erreur est levée). `logout` arrête
+        d'abord les logins en cours ; le logout a lieu même si cet arrêt échoue (l'échec est levé ensuite)."""
+        data = "%s/.local/share/sshvault/accounts/%s/bw" % (self.client.home, ALIAS)
+        argv = [CLIENT_BW, "--nointeraction", *args]
+        stop_error = None
+        if args and args[0] == "logout":
+            try:
+                self.client.stop_logins()
+            except LabError as e:
+                stop_error = e
+        try:
+            r = self.client.run(argv, env={"BITWARDENCLI_APPDATA_DIR": data}, timeout=90)
+        except LabTimeout as e:
+            r = subprocess.CompletedProcess(argv, 124, "", str(e))
+        if stop_error is not None:
+            raise stop_error
+        return r
+
+
+def client_files_with(client, secret, roots):
+    """Fichiers (tous, sans limite de taille ; binaires lus comme du texte) sous `roots`, dans le conteneur, qui
+    contiennent `secret` (lu sur stdin par grep : jamais en argv). Code de grep lu : 0 (trouvé) ou 1 (rien) ; 2 n'est
+    toléré que si chaque erreur est « fichier disparu pendant la recherche », sinon LabError (une erreur de lecture
+    n'est pas « rien »)."""
+    r = client.run(["grep", "-rlFa", "-D", "skip", "-f", "-", "--", *roots], input=secret + "\n")
+    if r.returncode == 2:
+        errors = [l for l in r.stderr.splitlines() if l.strip()]
+        if errors and all("No such file or directory" in l for l in errors):
+            return r.stdout.split()
+    if r.returncode not in (0, 1):
+        raise LabError("grep dans le conteneur : code %d : %s" % (r.returncode, r.stderr.strip()[-500:]))
+    return r.stdout.split()
+
+
+def client_scan_control(client, roots):
+    """Témoin de `client_files_with` : un fichier posé dans chaque racine (HOME, XDG_RUNTIME_DIR, /tmp) avec un marqueur
+    neuf est trouvé par la recherche."""
+    marker = "sshvault-lab-temoin-" + uuid.uuid4().hex
+    paths = [root + "/.scan-control" for root in roots]
+    try:
+        for path in paths:
+            client.write(path, marker + "\n")
+        found = client_files_with(client, marker, roots)
+        assert sorted(found) == sorted(paths), "la recherche de secrets ne voit pas ses témoins : %s" % found
+    finally:
+        client.run(["rm", "-f", *paths])
+
+
+def client_ssh(client, argv_tail, env=None, batch=True, timeout=300):
+    argv = ["ssh", "-F", client.home + "/.ssh/config"] + (["-o", "BatchMode=yes"] if batch else []) + list(argv_tail)
+    return client.run(argv, env=env, timeout=timeout)
+
+
+def local_address(a):
+    """Adresse de la boucle locale du poste ou non spécifiée (0.0.0.0, ::), IPv4 mappée en IPv6 comprise."""
+    ip = ipaddress.ip_address(a.split("%")[0])
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return any(x.is_loopback or x.is_unspecified for x in ((ip, mapped) if mapped else (ip,)))
+
+
+def server_is_loopback(server):
+    """Le serveur du compte est-il sur la boucle locale du poste (une des adresses du nom, résolu, en est une) ?"""
+    host = urlsplit(server).hostname or ""
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+    except OSError:
+        return host in ("localhost",)  # non résolu : bw en dira l'erreur ; « localhost » seul est certain
+    return any(local_address(a) for a in addrs)
+
+
+def test_sshvault_depuis_le_client_openssh_recent(request, scrubbed, account, bw_exe, vault, ssh_keys, report, lab):
+    """Les scénarios du test précédent, rejoués depuis C (Debian 13 : OpenSSH 10.0, Python 3.13), qui n'est que sur
+    `front` : sshvault et le vrai `bw` y tournent (source du dépôt et `bw` montés en lecture seule, système de
+    fichiers en lecture seule, HOME, /tmp et XDG_RUNTIME_DIR sur des tmpfs), le login est tapé sous un pty
+    (`docker exec -it`), la session est rangée dans un fichier du tmpfs (keyring refusé par le profil seccomp par
+    défaut de docker)."""
+    if server_is_loopback(account.server):
+        pytest.skip("serveur du compte de test sur la boucle locale du poste : injoignable depuis un conteneur")
+    ca = account.extra_env.get("NODE_EXTRA_CA_CERTS") or None
+    try:
+        client = lab.client_up(bw_exe, ca, RUN_ID)
+    except ClientUnavailable as e:
+        pytest.skip(account.scrub(str(e)))
+    except LabError as e:
+        raise AssertionError(account.scrub(str(e))) from None
+    home, runtime = client.home, client.runtime
+    uid = os.getuid()
+    fp_hotes, fp_fwd = ssh_keys["hotes"]["fingerprint"], ssh_keys["sans-hotes"]["fingerprint"]
+    sock = runtime + "/sshvault/agent.sock"
+    main = home + "/.ssh/config"
+    tenv = {"SSHVAULT_TEST_TRACE": "1"}
+    cbw = ClientBw(client)
+
+    def final_logout():
+        """bw déconnecté à la fin quoi qu'il arrive (logins en cours arrêtés d'abord), comme la fixture `home` ; un
+        échec est écrit dans le rapport et en avertissement."""
+        try:
+            r = cbw.run("logout")
+            # « You are not logged in. » : déjà déconnecté (par le `sshvault logout` du test), pas un échec
+            ok = r.returncode == 0 or "You are not logged in" in r.stderr
+            problem = None if ok else "code %d : %s" % (r.returncode, r.stderr.strip()[-300:])
+        except LabError as e:
+            problem = str(e)
+        if problem:
+            report.add("bw logout (client) en échec", note=account.scrub(problem))
+            warnings.warn("bw logout (client) en échec : " + account.scrub(problem))
+
+    request.addfinalizer(final_logout)
+
+    def sv(*args, **kw):
+        return client.sv(*args, **kw)
+
+    def stop_agent():
+        check(account, sv("agent", "stop"), 0, "agent stop")
+
+    def bw_seen(w, *words):
+        """Lignes de commande de `bw` (monté) relevées par `w` qui contiennent chacun de `words`."""
+        return [a for a in w.seen if a[0] == CLIENT_BW and all(x in a for x in words)]
+
+    # --- le client : version, utilisateur, montages, réseau, privilèges ---
+    r = client.run(["ssh", "-V"])
+    assert r.returncode == 0 and re.match(r"OpenSSH_10\.0", r.stderr), "client OpenSSH 10.0 attendu : %r" % r.stderr
+    report.add("client ssh du conteneur (ssh -V)", note=r.stderr.strip())
+    assert client.run(["id", "-u"]).stdout.strip() == str(uid) and client.run(["id", "-g"]).stdout.strip() == str(os.getgid())
+    assert client.run(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"]).stdout.strip() == "3.13"
+    c = [x for x in lab.inspect() if x["Config"]["Labels"]["com.docker.compose.service"] == "c"]
+    assert len(c) == 1, "un seul conteneur client"
+    hc = c[0]["HostConfig"]
+    assert not hc.get("Privileged") and not hc.get("CapAdd") and not hc.get("PortBindings"), "ni privilège, ni capacité ajoutée, ni port"
+    assert hc.get("ReadonlyRootfs") is True, "système de fichiers du conteneur en lecture seule"
+    assert [x.upper() for x in (hc.get("CapDrop") or [])] == ["ALL"], "toutes les capacités retirées : %s" % hc.get("CapDrop")
+    opts = hc.get("SecurityOpt") or []
+    assert any(o in ("no-new-privileges:true", "no-new-privileges=true", "no-new-privileges") for o in opts), \
+        account.scrub("no-new-privileges : %s" % opts)
+    assert not [o for o in opts if "seccomp" in o], account.scrub("profil seccomp par défaut : %s" % opts)
+    assert set(c[0]["NetworkSettings"]["Networks"]) == {lab.project + "_front"}, "C n'est que sur front"
+    want = {("/src", True), (CLIENT_BW, True), (CLIENT_CA, True)}
+    got = {(m["Destination"], not m["RW"]) for m in c[0]["Mounts"]}
+    assert got == want, account.scrub("montages en lecture seule : %s" % c[0]["Mounts"])
+    src = {m["Destination"]: os.path.realpath(m["Source"]) for m in c[0]["Mounts"]}
+    repo_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src")
+    sources_ok = (src["/src"] == os.path.realpath(repo_src) and src[CLIENT_BW] == os.path.realpath(bw_exe)
+                  and src[CLIENT_CA] == (os.path.realpath(ca) if ca else "/dev/null"))
+    assert sources_ok, "sources des montages : le dépôt (src), bw, et le certificat (ou /dev/null)"
+    assert set(hc["Tmpfs"]) == {home, runtime, "/tmp"}, "HOME, /tmp et XDG_RUNTIME_DIR sur des tmpfs : %s" % hc["Tmpfs"]
+    mounts = client.read("/proc/self/mounts")
+    assert all(re.search(r"^tmpfs %s tmpfs " % re.escape(d), mounts, re.M) for d in (home, runtime, "/tmp"))
+    r = client.run(["keyctl", "padd", "user", "sshvault-lab-sonde", "@u"], input="x")
+    assert r.returncode != 0 and "Operation not permitted" in r.stderr, "keyring refusé dans le conteneur : %s" % r
+    # B injoignable depuis C au niveau réseau : ni nom (absolu ou non), ni route
+    assert client.run(["getent", "hosts", "b"]).returncode == 2, "le nom de B n'est pas résolu depuis C"
+    assert client.run(["getent", "hosts", "b."]).returncode == 2, "le nom absolu de B n'est pas résolu depuis C"
+
+    # --- témoin de la lecture des environnements : un processus planté avec un jeton neuf en est le détenteur ---
+    token = "sshvault-lab-plant-" + uuid.uuid4().hex
+    client.plant_environ(token)
+    holders = []
+    for _ in range(50):
+        holders, _readable = client.environ_holders(token)
+        if holders:
+            break
+        time.sleep(0.2)
+    assert holders, "la lecture des environnements du conteneur ne voit pas son témoin"
+    client.run(["sh", "-c", 'kill "$@"', "sh", *holders])
+
+    # --- compte, login sous pty (docker exec -it), session rangée dans le tmpfs ---
+    r = sv("account", "add", ALIAS, "--server", account.server, "--email", account.email)
+    check(account, r, 0, "account add (client)")
+    chome = {"login_argv": client.login_argv(), "login_env": client.login_env(), "bw": cbw}
+    with ArgvWatch(CLIENT_BW, [account.password], heuristics=False) as w:
+        sv_login(chome, account, report)
+    assert not w.suspect, "mot de passe du compte en argument : %s" % w.suspect[:3]
+    assert bw_seen(w, "login"), account.scrub("le relevé ne voit pas le `bw login` du conteneur : %s" % sorted(w.seen)[:3])
+    # environnement des processus du conteneur : pas de mot de passe (relevé juste après le login, pas pendant
+    # l'exécution de bw)
+    holders, readable = client.environ_holders(account.password)
+    assert readable >= 1 and not holders, "mot de passe du compte dans l'environnement de processus du conteneur : %s" % holders
+    r = sv("status")
+    check(account, r, 0, "status (client)")
+    assert re.search(r"^coffre : déverrouillé$", r.stdout, re.M) and re.search(r"^session : file$", r.stdout, re.M), \
+        account.scrub(r.stdout)
+    session_file = "%s/sshvault/sessions/%s" % (runtime, ALIAS)
+    st = client.run(["stat", "-c", "%a %u %F", session_file])
+    assert st.returncode == 0 and st.stdout.strip() == "600 %d regular file" % uid, \
+        "session en fichier ordinaire 0600 de l'utilisateur dans le tmpfs : %s %s" % (st.stdout, st.stderr)
+    report.add("sshvault login (client, docker exec -it)", note="session rangée dans %s" % session_file)
+
+    # --- coffre : mêmes réglages que le test précédent (hôtes de la clé admise, transfert, générée, mot de passe) ---
+    r = sv("--nointeraction", "hosts", "add", "--id", vault["hotes"], "svlab-a", "svlab-b", "svlab-b-direct", "svlab-d")
+    check(account, r, 0, "hosts add (client)")
+    r = sv("--nointeraction", "forward", "add", "--id", vault["sans-hotes"], "svlab-a")
+    check(account, r, 0, "forward add (client)")
+    check(account, sv("config", "set", "forward-confirm", "false"), 0, "config set forward-confirm")
+    gen_name = "sshvault-lab %s générée (client)" % TAG
+    r = sv("--nointeraction", "generate", "--name", gen_name, "--hosts", "svlab-cdg", env=MARKER_ENV)
+    check(account, r, 0, "generate (client)")
+    public = r.stdout.splitlines()[0]
+    assert public.startswith("ssh-ed25519 ")
+    fp_gen = key_fp(public)
+    pw_name = "sshvault-lab %s mot de passe (client)" % TAG
+    with ArgvWatch(CLIENT_BW, [lab.password, account.password], heuristics=False) as w:
+        r = sv("--nointeraction", "password", "add", pw_name, "--host", "labpw@svlab-cp", "--host", "labpw@svlab-cpj",
+               env=MARKER_ENV, input=lab.password + "\n")
+    check(account, r, 0, "password add (client)")
+    assert not w.suspect, "mot de passe en argument : %s" % w.suspect[:3]
+    assert bw_seen(w, "create"), "le relevé voit le `bw create` du conteneur : %s" % sorted(a[:4] for a in w.seen)[:3]
+    # ~/.ssh/config : la maquette seule ; sshvault y met lui-même sa ligne Include (lue ensuite par le client 10.0)
+    client.write(main, CLIENT_CONFIG % {"home": home}, "600")
+    generated = home + "/.ssh/sshvault/config"
+    # `install` ne régénère pas (mesuré : « n'existe pas encore » s'il manque) : elle doit déjà exister, écrite par
+    # les commandes d'écriture du coffre (hosts add, generate…)
+    assert client.run(["test", "-s", generated]).returncode == 0, "config générée par les écritures du coffre"
+    r = sv("--nointeraction", "ssh-config", "install")
+    check(account, r, 0, "ssh-config install (client)")
+    assert "avertissement" not in (r.stdout + r.stderr).lower(), account.scrub("avertissement de install : " + r.stdout + r.stderr)
+    assert client.read(main).splitlines()[0] == 'Include "~/.ssh/sshvault/config"', client.read(main)[:200]
+    text = client.read(generated)
+    m = re.search(r'^Match originalhost (\S+) exec "[^"\n]* --id %s"$' % vault["hotes"], text, re.M)
+    assert m and {"svlab-a", "svlab-b", "svlab-b-direct", "svlab-d"} <= set(m.group(1).split(",")), text
+    # le client 10.0 lit la ligne `Include` de sshvault : la config générée s'applique (agent dédié de l'hôte)
+    r = client.run(["ssh", "-G", "-F", main, "svlab-a"])
+    assert r.returncode == 0 and "identityagent %s" % sock in r.stdout.lower(), r.stderr[-1000:]
+    # la forme sans guillemets est lue de même par le client 10.0
+    bare = home + "/.ssh/config-sans-guillemets"
+    client.write(bare, "Include ~/.ssh/sshvault/config\n", "600")
+    r = client.run(["ssh", "-G", "-F", bare, "svlab-a"])
+    assert r.returncode == 0 and "identityagent %s" % sock in r.stdout.lower(), r.stderr[-1000:]
+
+    # --- rebond réel par clé (CAP-7) : A puis B par `ensure`, agent vide ---
+    stop_agent()
+    off_b = len(lab.logs("b"))
+    t0 = time.monotonic()
+    r = client_ssh(client, ["-v", "svlab-b", "uname -n"], tenv)
+    report.add("client : ssh svlab-b (rebond par A, agent vide, vrai bw)", note="rc=%d durée=%.2fs" % (
+        r.returncode, time.monotonic() - t0))
+    if r.returncode != 0:
+        raise AssertionError(account.scrub("ssh svlab-b : code %d ; stderr : %s" % (r.returncode, r.stderr[-3000:])))
+    assert r.stdout == "b\n", "commande exécutée sur B"
+    ends = ENSURE_END.findall(r.stderr)
+    assert ends and all(rc == "0" for _, rc in ends) and {i for i, _ in ends} == {vault["hotes"]}, ends
+    assert set(OFFERED.findall(r.stderr)) == {fp_hotes}, "une seule clé offerte : %s" % OFFERED.findall(r.stderr)
+    assert not [l for l in r.stderr.splitlines() if l.startswith("sshvault:")], "ensure silencieux"
+    assert "PRIVATE KEY" not in r.stdout + r.stderr
+    assert "OpenSSH_10.0" in r.stderr.splitlines()[0], "client 10.0 : %s" % r.stderr.splitlines()[0]
+    log_b = lab.logs("b")[off_b:]
+    assert accepted_in(log_b, "lab", fp_hotes), "B a admis la clé, venue de A : %s" % log_b[-1500:]
+    r = client.run(["ssh-add", "-L"], env={"SSH_AUTH_SOCK": sock})
+    assert r.returncode == 0 and [l.split()[1] for l in r.stdout.splitlines()] == [ssh_keys["hotes"]["public"].split()[1]]
+    stop_agent()
+
+    # --- B en direct : ni nom ni route depuis C, aucune connexion jusqu'à B ---
+    off_b = len(lab.logs("b"))
+    r = client_ssh(client, ["-v", "svlab-b-direct", "uname -n"], tenv)
+    report.add("client : ssh svlab-b-direct (sans A)", note="rc=%d" % r.returncode)
+    assert r.returncode != 0 and r.stdout == "", "aucune session"
+    assert "Could not resolve hostname b." in r.stderr and "Connecting to" not in r.stderr \
+        and "Connection established" not in r.stderr, "aucune connexion ne part du laboratoire : %s" % r.stderr[-1000:]
+    b_ip = [x for x in lab.inspect() if x["Config"]["Labels"]["com.docker.compose.service"] == "b"][0][
+        "NetworkSettings"]["Networks"][lab.project + "_back"]["IPAddress"]
+    r = client.run(["ssh", "-F", "/dev/null", "-v", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                    "-o", "StrictHostKeyChecking=no", "lab@" + b_ip, "uname -n"], timeout=60)
+    assert r.returncode != 0 and r.stdout == "" and "Connection established" not in r.stderr, r.stderr[-1000:]
+    assert re.search(r"connect to host %s port 22: (Connection timed out|No route to host)" % re.escape(b_ip), r.stderr), \
+        "aucune connexion n'arrive jusqu'à B (paquets perdus) : %s" % r.stderr[-500:]
+    log_b = lab.logs("b")[off_b:]
+    assert "Connection from" not in log_b and "AllowUsers" not in log_b, "B n'a vu aucune connexion : %s" % log_b[-500:]
+
+    # --- transfert restreint (CAP-8) : sur A, `ssh-add -l` ne liste que la clé transférée ---
+    r = client_ssh(client, ["-A", "svlab-a", "ssh-add -l"], tenv)
+    report.add("client : ssh -A svlab-a 'ssh-add -l' (transfert restreint)", note="rc=%d" % r.returncode)
+    if r.returncode != 0:
+        raise AssertionError(account.scrub("ssh -A : code %d ; stdout %r ; stderr : %s" % (
+            r.returncode, r.stdout, r.stderr[-3000:])))
+    seen = [l.split()[1] for l in r.stdout.splitlines() if re.match(r"\d+ SHA256:", l)]
+    assert seen == [fp_fwd], "seule la clé transférée : %s" % r.stdout
+    assert fp_hotes not in r.stdout and "PRIVATE KEY" not in r.stdout + r.stderr
+    assert not [l for l in r.stderr.splitlines() if l.startswith("sshvault:")], account.scrub(r.stderr)
+    stop_agent()
+
+    # --- mot de passe d'hôte par sshvault-askpass (CAP-11), direct puis par le rebond A→P ---
+    ask_log = home + "/askpass.log"
+    pw_env = dict(tenv, SSH_ASKPASS="/usr/local/bin/sshvault-askpass", SSH_ASKPASS_REQUIRE="force",
+                  SSHVAULT_TEST_ASKPASS_LOG=ask_log)
+    with ArgvWatch(CLIENT_BW, [lab.password, account.password], heuristics=False) as w:
+        for host in ("svlab-cp", "svlab-cpj"):
+            before = len(client.run(["cat", ask_log]).stdout.splitlines())
+            r = client_ssh(client, [host, "uname -n"], pw_env, batch=False)
+            report.add("client : ssh %s (mot de passe par sshvault-askpass)" % host, note="rc=%d" % r.returncode)
+            if r.returncode != 0:
+                raise AssertionError(account.scrub("ssh %s : code %d ; stderr : %s" % (host, r.returncode, r.stderr[-3000:])))
+            assert r.stdout == "p\n", "commande exécutée sur P"
+            prompts = [l.rstrip() for l in client.read(ask_log).splitlines()[before:]]
+            assert prompts == ["labpw@p's password:"], "une seule invite, de mot de passe : %s" % prompts
+            assert lab.password not in r.stdout + r.stderr
+            stop_agent()
+    assert not w.suspect, "mot de passe en argument : %s" % w.suspect[:3]
+    assert bw_seen(w), "le relevé voit un `bw` du conteneur pendant les connexions par mot de passe : %s" % sorted(
+        a[:4] for a in w.seen)[:3]
+    holders, readable = client.environ_holders(lab.password)
+    assert readable >= 1 and not holders, "mot de passe de P dans l'environnement de processus du conteneur : %s" % holders
+    roots = [home, runtime, "/tmp"]
+    client_scan_control(client, roots)
+    assert not client_files_with(client, lab.password, roots), "mot de passe de P écrit dans le conteneur"
+    assert not client_files_with(client, account.password, roots), "mot de passe du compte écrit dans le conteneur"
+
+    # --- generate puis deploy (D, par la clé admise) puis connexion avec la clé déployée ---
+    authorized = "/home/lab/.ssh/authorized_keys"
+    before = lab.exec("d", "cat", authorized).stdout
+    r = sv("--nointeraction", "deploy", "--fingerprint", fp_gen, "svlab-d", "--", "-F", main)
+    check(account, r, 0, "deploy (client)")
+    assert r.stdout.startswith("ajoutée : « %s » %s → svlab-d" % (gen_name, fp_gen)), r.stdout
+    after = lab.exec("d", "cat", authorized).stdout
+    assert after.startswith(before), "lignes existantes de D gardées"
+    added = after[len(before):].splitlines()
+    assert len(added) == 1 and added[0].split()[:2] == public.split()[:2], "seule la clé déployée est ajoutée : %s" % added
+    r = sv("--nointeraction", "deploy", "--fingerprint", fp_gen, "svlab-d", "--", "-F", main)
+    check(account, r, 0, "deploy relancé (client)")
+    assert r.stdout.startswith("déjà présente : "), r.stdout
+    assert lab.exec("d", "cat", authorized).stdout == after, "second passage : rien écrit"
+    stop_agent()
+    r = client_ssh(client, ["-v", "svlab-cdg", "uname -n"], tenv)
+    report.add("client : ssh svlab-cdg (clé générée puis déployée)", note="rc=%d" % r.returncode)
+    if r.returncode != 0:
+        raise AssertionError(account.scrub("ssh svlab-cdg : code %d ; stderr : %s" % (r.returncode, r.stderr[-3000:])))
+    assert r.stdout == "d\n"
+    assert set(OFFERED.findall(r.stderr)) == {fp_gen}, "seule la clé générée est offerte"
+    assert accepted_in(lab.logs("d"), "lab", fp_gen), "D a admis la clé déployée"
+    stop_agent()
+
+    # --- rien de secret dans le conteneur ni dans `docker inspect` ; coffre relu par un autre client bw ---
+    assert not client_files_with(client, "BEGIN OPENSSH PRIVATE KEY", roots), "clé privée écrite dans le conteneur"
+    text = lab.inspect_text()
+    for secret in (lab.password, account.password, ssh_keys["hotes"]["private"].splitlines()[1],
+                   ssh_keys["sans-hotes"]["private"].splitlines()[1]):
+        assert secret not in text, "secret dans docker inspect"
+    pop, session = vault["_reader"]
+    assert pop.sync(session).returncode == 0
+    found = [it for it in json.loads(pop.ok("list", "items", session=session).stdout)
+             if (it.get("sshKey") or {}).get("keyFingerprint") == fp_gen]
+    assert len(found) == 1 and found[0]["sshKey"]["publicKey"] == public
+    check(account, sv("logout", "--account", ALIAS), 0, "logout (client)")
+    # système de fichiers en lecture seule : témoin négatif, une écriture hors des tmpfs échoue (EROFS)
+    r = client.run(["sh", "-c", "echo x > /usr/lib/sshvault-lab-ecriture 2>&1"])
+    assert r.returncode != 0 and "Read-only file system" in r.stdout + r.stderr, "écriture hors tmpfs refusée : %s" % r
 
 
 # --- 3. interruption ------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.16.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.16.2) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -1512,6 +1512,7 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   | B, hôte interne | Alpine 3.18 | 9.3 | `back` (interne) | clé seule ; `AllowUsers lab@<adresse de A>`, résolue au démarrage : `ssh` direct vers B depuis le poste est refusé, par A il passe |
   | P, hôte à mot de passe | Alpine 3.22 | 10.0 | `front` | mot de passe seul (compte `labpw`), clés refusées |
   | D, cible de `deploy` | Debian 13 | 10.0 | `front` | clé seule (compte `lab`, `authorized_keys` écrit par le compte) |
+  | C, client (série de tests seulement) | Debian 13 | 10.0 (client) | `front` seulement | profil Compose `client` : jamais démarré par `lab.sh up` ; Python 3.13, sshvault de la source du dépôt et vrai `bw` montés en lecture seule |
 
   Ports de A, P et D publiés sur 127.0.0.1 seulement, choisis par docker (`docker compose
   port`) ; B n'est pas publié. Ni `--privileged` ni capacité ajoutée ; un seul montage, en
@@ -1529,8 +1530,9 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   lab/lab.sh status                       # état et ports
   lab/lab.sh down                         # détruit conteneurs, réseaux, volumes ; efface mot de passe et known_hosts
   ```
-  `down` garde les images `sshvault-lab/a`, `b`, `p`, `d` (cache de construction) ; pour les retirer :
-  `docker image rm sshvault-lab/a sshvault-lab/b sshvault-lab/p sshvault-lab/d`.
+  `down` garde les images `sshvault-lab/a`, `b`, `p`, `d`, `c` (cache de construction) ; pour les retirer :
+  `docker image rm sshvault-lab/a sshvault-lab/b sshvault-lab/p sshvault-lab/d sshvault-lab/c`.
+  `down` et `status` portent aussi sur le conteneur client C (`--profile client`) s'il existe.
   `config` donne les hôtes `svlab-a`, `svlab-b` (`ProxyJump svlab-a`), `svlab-b-direct` (B sans
   A : refusé), `svlab-p`, `svlab-pj` (P par A), `svlab-d` et `svlab-dg` (D, pour une seconde
   clé), puis un bloc `Host svlab-*` (`UserKnownHostsFile <dossier d'état>/known_hosts`,
@@ -1539,9 +1541,9 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   `Host *`** : pour chaque paramètre, la première valeur obtenue gagne. Le vrai
   `~/.ssh/known_hosts` n'est jamais touché ; `down` supprime ce fichier.
   Le mot de passe de P est écrit dans `$XDG_RUNTIME_DIR/sshvault-lab/password` (fichier 0600,
-  dossier 0700, hors dépôt), nouveau à chaque `up`, supprimé par `down`. Le client ssh est celui
-  du poste (sa version, `ssh -V`, est écrite dans le rapport `.lab`, si `SSHVAULT_IT_REPORT` est
-  défini) ; un client OpenSSH 10.0 en conteneur est une autre story.
+  dossier 0700, hors dépôt), nouveau à chaque `up`, supprimé par `down`. Le client ssh de la plupart des
+  tests est celui du poste (sa version, `ssh -V`, est écrite dans le rapport `.lab`, si `SSHVAULT_IT_REPORT` est
+  défini) ; le client OpenSSH 10.0 est celui du conteneur C (voir ci-dessous).
   Environnement : `SSHVAULT_LAB_PROJECT` (projet Compose, défaut `sshvault-lab`),
   `SSHVAULT_LAB_DIR` (dossier d'état : chemin absolu, sans `:`, `%` ni `"`). La première construction des images télécharge les
   paquets OpenSSH (apt, apk) : accès réseau nécessaire.
@@ -1563,6 +1565,36 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   mot de passe d'hôte par `sshvault-askpass` (`ssh svlab-p`, puis `svlab-pj` par le rebond A→P :
   une invite de mot de passe chacun, aucun mot de passe en argument ni sur disque), `generate`,
   `deploy` vers D (relancé : « déjà présente ») puis connexion avec la clé déployée.
+  `test_sshvault_depuis_le_client_openssh_recent` (vrai `bw`, story 21) : les mêmes scénarios depuis le
+  conteneur client C (`sshvault-lab/c` : Debian 13, OpenSSH 10.0, Python 3.13, `keyutils`), pour que les lignes
+  `Match exec`, l'askpass, `Include` et la session hors keyring soient vus par un client récent. C n'est
+  attaché qu'à `front` : B (réseau `back`) y est injoignable (nom, absolu aussi, non résolu ; vers son adresse,
+  les paquets sont perdus : aucune connexion n'arrive jusqu'à B). Montages en lecture seule seulement : `src/` du
+  dépôt (`/src`, d'où les enveloppes `sshvault` et `sshvault-askpass` du PATH lancent `python3 -m sshvault…`),
+  le vrai `bw` (`/opt/bw/bw`) et le certificat de `NODE_EXTRA_CA_CERTS` du compte s'il est défini. Le reste du
+  système de fichiers est en lecture seule (le test vérifie qu'une écriture hors tmpfs est refusée) ; HOME,
+  `/tmp` et `XDG_RUNTIME_DIR` sont des tmpfs, détruits avec le conteneur (`exec` gardé sur HOME et `/tmp` :
+  `bw` peut extraire un module natif à `login`). Aucun port, `cap_drop: ALL`, `no-new-privileges`, profil
+  seccomp par défaut de docker : le keyring est refusé (`add_key: Operation not permitted`), sshvault range
+  donc la session dans un fichier du tmpfs (`session : file` à `sshvault status`). L'utilisateur du conteneur
+  a l'uid et le gid de celui qui lance la série (arguments de construction : la ligne de commande des
+  processus du conteneur est relevée par `ArgvWatch` côté poste, qui les reconnaît à
+  `SSHVAULT_TEST_RUN`). `sshvault login` : `docker exec -it` sous le pty de la série, mot de passe tapé au
+  terminal (jamais en argv, en variable d'environnement du conteneur ni dans `docker inspect`) ; une
+  connexion de plus au compte de test ; un login bloqué est arrêté dans le conteneur avant le nouvel essai.
+  Hôtes propres au client pour les éléments créés par ce test (`svlab-cp`, `svlab-cpj`, `svlab-cdg`), pour ne
+  pas gêner ceux du test précédent. `sshvault ssh-config install` écrit lui-même la ligne `Include` du
+  `~/.ssh/config` du client (il ne régénère pas la config : elle existe déjà, écrite par les commandes du
+  coffre) ; le client 10.0 la lit, comme la forme sans guillemets. Recherche de secrets dans les fichiers du
+  conteneur (témoins posés dans chaque racine) et dans l'environnement de ses processus (relevé après le
+  login et après les connexions par mot de passe, pas pendant l'exécution de `bw` ; témoin planté).
+  Préconditions, sinon le test est sauté : serveur du compte hors de la boucle locale (adresses résolues,
+  non spécifiées et IPv4 mappées comprises : injoignable depuis un conteneur) et `bw` exécutable ELF autonome
+  (sans Node) de l'architecture du poste, monté seul dans le conteneur ; le certificat de
+  `NODE_EXTRA_CA_CERTS` doit être un fichier ordinaire, et ni lui ni `bw` ne peuvent avoir `:` ou `,` dans
+  leur chemin. Le client est créé par la série (`Lab.client_up`, même projet Compose, profil `client`) et
+  supprimé avec la maquette ; le contrôle final « rien ne reste » le compte. Aucune commande de `lab.sh` ne
+  le démarre.
   `test_interruption` : SIGINT pendant le démarrage (dès le premier conteneur, avant `PRET`) ou
   après, puis SIGTERM, envoyé au groupe de processus d'une sonde (`labenv.py sonde`) :
   conteneurs, réseaux et volumes du projet supprimés, dossier d'état de la sonde effacé (nettoyage
@@ -1570,6 +1602,12 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   chaque connexion. En fin de série, même en échec : `docker compose down -v`, puis contrôle que
   `docker ps -a`, `docker network ls` et `docker volume ls` ne montrent plus rien du projet et
   que le fichier du mot de passe a disparu, éléments marqués purgés, `bw logout`.
+- `tests/test_argvwatch.py` : `ArgvWatch` (`tests/bench.py`) ne relève que les processus du test : descendants
+  de pytest (chaîne des ppid), ou dont l'environnement porte `SSHVAULT_TEST_RUN=<identifiant de la session
+  pytest>` (posé par le banc, le HOME de l'intégration et le conteneur client ; agents et surveillants détachés
+  compris). Un environnement illisible compte comme du test (échec fermé), un processus disparu n'est pas relevé.
+  La commande d'une autre session du même utilisateur n'est pas une fuite : processus étranger sans marqueur
+  ou avec le marqueur d'une autre session ignoré, processus détaché marqué et descendant de pytest signalés.
 - `tests/test_it_pty.py` : `pty_login` de l'intégration (`tests/integration/itbase.py`), sans réseau ni vrai sshvault (faux
   paquet `sshvault` par PYTHONPATH, qui laisse un petit-enfant écrire sans fin sur le terminal
   et garder la sortie standard ouverte) : reste du terminal et sortie standard lus 5 s au

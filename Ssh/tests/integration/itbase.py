@@ -33,7 +33,7 @@ import uuid
 import pytest
 
 from accounts import Scrub, alias as alias_of
-from bench import SRC, check_witness, kill_agents_under, private_runtime_dir, write_exe
+from bench import RUN_ID, SRC, check_witness, kill_agents_under, private_runtime_dir, write_exe
 
 MARK = "sshvault-test-run"
 RUN = uuid.uuid4().hex
@@ -392,7 +392,7 @@ def home(account, bw_exe, ring, report, witness):
     # `sshvault` des lignes Match exec : l'enveloppe du banc (dépôt), jamais celle du poste
     exe = write_exe(os.path.join(tmp, "exe"))
     env.update(HOME=h, SSHVAULT_SSH_HOME=h, XDG_RUNTIME_DIR=rt, SSHVAULT_BW=bw_exe, PYTHONPATH=SRC,
-               SSHVAULT_PROMPT_TIMEOUT="30", SSHVAULT_BW_TIMEOUT="180", SSHVAULT_TEST_BENCH="1",
+               SSHVAULT_PROMPT_TIMEOUT="30", SSHVAULT_BW_TIMEOUT="180", SSHVAULT_TEST_BENCH="1", SSHVAULT_TEST_RUN=RUN_ID,
                PATH=str(exe.parent) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"))
     env.pop("SSH_AGENT_PID", None)
     env.pop("SSH_AUTH_SOCK", None)
@@ -486,7 +486,9 @@ def pty_login(home, account, alias=None):
     en échec : la fin (300 caractères) de ce que le terminal a reçu après l'invite du mot de
     passe (sans écho), ou de tout le terminal si l'invite n'est pas venue, masquée par
     `account.scrub`. Renvoie {rc, out, invites, tail, blocked, duration} ; bloqué (réseau) :
-    sshvault interrompu (SIGTERM), `blocked` vrai."""
+    sshvault interrompu (SIGTERM), `blocked` vrai.
+    `home["login_argv"]` (et `home["login_env"]`) : commande de login à lancer à la place de `python -m sshvault login`
+    (`docker exec -it` dans le conteneur client de la maquette, story 21) : `--account ALIAS` lui est ajouté."""
     master, slave = pty.openpty()
     name = os.ttyname(slave)
 
@@ -494,8 +496,12 @@ def pty_login(home, account, alias=None):
         os.close(os.open(name, os.O_RDWR))
 
     t0 = time.monotonic()
-    p = subprocess.Popen([sys.executable, "-m", "sshvault", "login"] + (["--account", alias] if alias else []),
-                         env=home["env"], stdin=slave, stdout=subprocess.PIPE, stderr=slave,
+    p = subprocess.Popen(list(home.get("login_argv") or [sys.executable, "-m", "sshvault", "login"])
+                         + (["--account", alias] if alias else []),
+                         env=home.get("login_env") or home["env"], stdin=slave,
+                         # docker exec -t : tout ce que le conteneur écrit revient sur la sortie du client docker, qui
+                         # doit donc être le terminal (la sortie de sshvault est alors dans `seen`, pas dans `out`)
+                         stdout=slave if home.get("login_argv") else subprocess.PIPE, stderr=slave,
                          start_new_session=True, preexec_fn=ctty)
     seen, sent, blocked = b"", set(), False
     deadline = time.monotonic() + NET_TIMEOUT + 30
@@ -520,7 +526,7 @@ def pty_login(home, account, alias=None):
                     sent.add(what)
         # reste du terminal après la sortie (message d'erreur écrit juste avant), borné
         seen += drain_pty(master)
-        out = read_pipe(p.stdout).decode(errors="replace")
+        out = read_pipe(p.stdout).decode(errors="replace") if p.stdout else ""
         tail = ""
         if p.returncode:
             i = seen.rfind(b"Master password")
@@ -530,7 +536,8 @@ def pty_login(home, account, alias=None):
         if p.poll() is None:
             p.kill()
             p.wait()
-        p.stdout.close()
+        if p.stdout:
+            p.stdout.close()
         os.close(master)
         os.close(slave)
         del seen  # e-mail tapé, écho du terminal : jamais conservé

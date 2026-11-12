@@ -1,0 +1,13 @@
+#!/bin/sh
+# `sshvault` du client de la maquette : `python3 -m sshvault` de la source du dépôt (montée en lecture seule
+# dans /src). SSHVAULT_TEST_TRACE=1 : une ligne « sshvault-test: fin <arguments> rc=N » sur stderr après chaque
+# appel (ordre des appels dans la sortie de `ssh -v`).
+export PYTHONPATH=/src
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${SSHVAULT_TEST_TRACE:-}" ]; then
+    python3 -m sshvault "$@"
+    rc=$?
+    printf 'sshvault-test: fin %s rc=%d\n' "$*" "$rc" >&2
+    exit $rc
+fi
+exec python3 -m sshvault "$@"

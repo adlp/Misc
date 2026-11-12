@@ -3,6 +3,8 @@
 #
 #   front : A (bastion), P (mot de passe), D (cible de deploy)
 #   back  : A et B (hôte interne, qui n'accepte que les connexions venant de A) ; réseau interne
+#   C (client OpenSSH 10.0, story 21) : sur `front` seulement, profil `client` : jamais démarré par `lab.sh up` ;
+#   la série de tests le démarre (`--profile client`, voir tests/integration/labenv.py)
 #
 # Ports publiés sur 127.0.0.1 seulement, choisis par docker (`docker compose port`). Aucun secret
 # ici : le mot de passe de P est posé après le démarrage par `chpasswd` sur stdin (lab.sh).
@@ -64,6 +66,49 @@ services:
     ports: ["127.0.0.1::22"]
     networks: [front]
     healthcheck: *hc
+
+  # C : client OpenSSH 10.0 (Debian 13) pour la série de tests ; sshvault tourne depuis la source du dépôt et le vrai `bw`,
+  # montés en lecture seule ; système de fichiers en lecture seule, HOME, /tmp et XDG_RUNTIME_DIR sur des tmpfs (détruits
+  # avec lui) ; aucun port publié, `cap_drop: ALL`, `no-new-privileges`, profil seccomp par défaut (le keyring est refusé :
+  # repli fichier de la session). Seul `front` : B (réseau
+  # `back`) lui est injoignable. Variables fournies par la série : SSHVAULT_LAB_UID/GID (celui qui lance), SSHVAULT_LAB_BW
+  # (chemin réel de `bw`), SSHVAULT_LAB_CA (certificat de NODE_EXTRA_CA_CERTS, sinon /dev/null).
+  c:
+    profiles: [client]
+    image: sshvault-lab/c
+    build:
+      context: images/c
+      args:
+        LAB_UID: ${SSHVAULT_LAB_UID:-1000}
+        LAB_GID: ${SSHVAULT_LAB_GID:-1000}
+    hostname: c
+    user: "${SSHVAULT_LAB_UID:-1000}:${SSHVAULT_LAB_GID:-1000}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command: ["sleep", "infinity"]
+    environment:
+      HOME: /home/lab
+      XDG_RUNTIME_DIR: /run/user/${SSHVAULT_LAB_UID:-1000}
+      SSHVAULT_BW: /opt/bw/bw
+      SSHVAULT_TEST_BENCH: "1"  # garde des enveloppes des bancs
+      SSHVAULT_TEST_RUN: ${SSHVAULT_TEST_RUN:-}  # session pytest : rattache les processus du conteneur à `ArgvWatch` (tests/bench.py)
+      SSHVAULT_PROMPT_TIMEOUT: "30"
+      SSHVAULT_BW_TIMEOUT: "180"
+    tmpfs:
+      # exec gardé sur HOME et /tmp. Mesuré côté session principale : le vrai `bw` lance `--version` et `status` dans ce
+      # conteneur (système en lecture seule, tmpfs noexec) ; `exec` reste pour `login` (bw peut extraire un module natif,
+      # p. ex. le KDF Argon2)
+      - /home/lab:exec,mode=0700,uid=${SSHVAULT_LAB_UID:-1000},gid=${SSHVAULT_LAB_GID:-1000}
+      - /tmp:exec,mode=1777
+      - /run/user/${SSHVAULT_LAB_UID:-1000}:mode=0700,uid=${SSHVAULT_LAB_UID:-1000},gid=${SSHVAULT_LAB_GID:-1000}
+    volumes:
+      - ../src:/src:ro
+      - ${SSHVAULT_LAB_BW:-/dev/null}:/opt/bw/bw:ro
+      - ${SSHVAULT_LAB_CA:-/dev/null}:/lab/ca.pem:ro
+    networks: [front]
+    stop_grace_period: 1s
 
 networks:
   front: {}
