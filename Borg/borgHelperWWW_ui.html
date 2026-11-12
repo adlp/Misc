@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.27.1 -->
+<!-- UI_VERSION: 1.28.0 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -72,6 +72,7 @@
   .badge.ok{background:#e3f6e8;color:var(--ok)}
   .badge.warn{background:#fdf2df;color:var(--warn)}
   .badge.err{background:#fbe4e1;color:var(--danger)}
+  .badge.absent{background:#eceff3;color:var(--muted)}
   .pass-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .pass-row input{max-width:260px}
   .pill{font-size:11px;color:var(--muted)}
@@ -451,6 +452,9 @@ function stateBadges(nick){
   // Résultat du dernier Index (UI 1.19.2, index_last de /access) : échec ou refus jusqu'au prochain succès (un « déjà en
   // cours » ou une échéance le reportent dans last_failure) ; « déjà en cours » seulement s'il vient d'un lancement HTTP
   // de moins d'une heure (un chevauchement cron est normal). Heures ISO avec décalage : âge juste quel que soit le fuseau.
+  // UI 1.28.0 (story 118, décisions de l'utilisateur) : Bkp tiré, client injoignable selon la sonde (GET /bkp/probe, gardée 30 s)
+  const pb=bkpProbe[nick];
+  if(pb && pb.state==='absent') h+=`<span class="badge absent" title="${escapeAttr(bkpAbsentTitle(pb))}">🔌 client absent</span> `;
   const il=a.index_last;
   if(il && il.outcome){
     const when=x=>(x||'').replace('T',' ').slice(0,16), via=x=>x==='http'?'lancé depuis l\'interface':'CLI/cron';
@@ -465,6 +469,52 @@ function stateBadges(nick){
     }
   }
   return h;
+}
+// Sonde du client des nicks à Bkp tiré (UI 1.28.0, WWW 1.35.0, story 118) : /access bkp_pull ; GET /bkp/probe par nick tiré dont
+// l'appelant peut lancer un Bkp (ops), jamais pour un autre nick ; relancée à chaque relecture de /access (30 s : le serveur garde
+// chaque résultat 30 s, une sonde à la fois par nick). Client absent : badge gris « client absent » et ▶ Backup grisé (info-bulle :
+// dernière ligne de ssh) ; joignable, inconnu (authentification, clé d'hôte, délai de la sonde) ou erreur : bouton actif.
+const bkpProbe={};
+let bkpProbeBusy=false;
+function bkpAbsentTitle(pb){ return 'Client absent — injoignable par ssh'+(pb.message?` (ssh : ${pb.message})`:'')+' : Bkp impossible pour l\'instant'; }
+function bkpButtonAttrs(nick){
+  const pb=bkpProbe[nick];
+  return (pb && pb.state==='absent') ? ` disabled title="${escapeAttr(bkpAbsentTitle(pb))}"` : '';
+}
+function refreshBkpButtons(){
+  document.querySelectorAll('.bkp-now-btn[data-nick]').forEach(b=>{
+    if(b.textContent!=='▶ Backup') return;   // lancement en cours (runBackupNow) : état laissé à runBackupNow
+    const pb=bkpProbe[b.dataset.nick], abs=!!(pb && pb.state==='absent');
+    b.disabled=abs; if(abs) b.title=bkpAbsentTitle(pb); else b.removeAttribute('title');
+  });
+}
+// only (revue 2 row 30) : ce nick seulement (ouverture de sa page détail) ; les résultats des autres nicks sont gardés.
+async function probePullNicks(only){
+  if(bkpProbeBusy || !myAccess || !myAccess.nicks) return;
+  let nicks=Object.entries(myAccess.nicks).filter(([n,a])=>a.bkp_pull===true && opAllowed(n,'bkp')).map(([n])=>n);
+  if(only!==undefined){ if(!nicks.includes(only)) delete bkpProbe[only]; nicks=nicks.filter(n=>n===only); }
+  else Object.keys(bkpProbe).forEach(n=>{ if(!nicks.includes(n)) delete bkpProbe[n]; });   // plus tiré, ou plus de droit : oublié
+  if(!nicks.length){ refreshBkpViews(); return; }   // revue 1 row 10 : un bouton grisé d'un nick oublié est rendu
+  bkpProbeBusy=true;
+  try{
+    await Promise.all(nicks.map(async n=>{
+      const r=await apiCall('GET','/bkp/probe',{nick:n},false);
+      if(r.httpStatus===200 && r.pull===true && typeof r.state==='string') bkpProbe[n]={state:r.state,message:r.message||null};
+      else delete bkpProbe[n];   // refus, erreur : rien de grisé
+    }));
+  }finally{ bkpProbeBusy=false; }
+  refreshBkpViews();
+}
+// Badges, ▶ Backup de la liste et, page détail (revue 1 row 2, décision de l'utilisateur), action « Lancer un backup » et son
+// bouton Exécuter : redessinés d'après bkpProbe.
+function refreshBkpViews(){
+  refreshStateBadges(); refreshBkpButtons();
+  if(currentViewId==='view-detail' && currentNick){
+    renderActionList();
+    const b=document.getElementById('runActionBtn');
+    if(b && currentActionId==='bkp'){ const pb=bkpProbe[currentNick], abs=!!(pb && pb.state==='absent');
+      b.disabled=abs; if(abs) b.title=bkpAbsentTitle(pb); else b.removeAttribute('title'); }
+  }
 }
 function refreshStateBadges(){
   document.querySelectorAll('.state-badges[data-nick]').forEach(el=>{ el.innerHTML=stateBadges(el.dataset.nick); });
@@ -820,6 +870,7 @@ async function loadMachines(){
     ? groups.map(g=>`<span class="jump-group"><span class="jump-prefix">${escapeHtml(rcGroupLabel(g.prefix))} :</span> `
         +g.items.map(it=>jumpLink(it.nick,it.bare)).join(' · ')+'</span>').join(' <span class="jump-sep">│</span> ')
     : nicks.map(nick=>jumpLink(nick)).join(' · ');
+  probePullNicks();   // UI 1.28.0 (story 118) : jamais attendue par la liste
 }
 
 // ── Mode dossier : groupes par fichier de conf (UI 1.25.0, borgHelperWWW 1.32.1, story 86b) ─────────────────
@@ -903,7 +954,7 @@ function machineCardHtml(nick,s,hasPass,isErr,label){
         <div class="machine-head">
           <h3${isErr?' class="nick-err"':''}>${label===undefined?escapeHtml(nick):`<span title="${escapeAttr(nick)}">${escapeHtml(label)}</span>`} ${badgeFor(s['depuis'])} ${plainDbBadge(nick)} <span class="state-badges" data-nick="${escapeAttr(nick)}">${stateBadges(nick)}</span></h3>
           <div>
-            ${opAllowed(nick,'bkp')?`<button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}">▶ Backup</button>`:''}
+            ${opAllowed(nick,'bkp')?`<button class="secondary bkp-now-btn" data-nick="${escapeAttr(nick)}"${bkpButtonAttrs(nick)}>▶ Backup</button>`:''}
             <button class="secondary explore-btn" data-nick="${escapeAttr(nick)}">🗂 Explorer</button>
             <button class="secondary history-btn" data-nick="${escapeAttr(nick)}">📜 Historique complet</button>
             <button class="open-machine-btn" data-nick="${escapeAttr(nick)}">Ouvrir →</button>
@@ -982,6 +1033,7 @@ async function pollAccess(){
   try{ r=await loadMyAccess(); } finally{ pollBusy=false; }
   if(!r) return;
   refreshStateBadges();
+  probePullNicks();   // UI 1.28.0 (story 118) : sonde des nicks tirés (résultat gardé 30 s par le serveur)
   Object.entries(r.nicks||{}).forEach(([n,a])=>{
     const p=pendingBkp[n];
     if(p){
@@ -1572,7 +1624,7 @@ async function runBackupNow(nick,btn){
   try{ await loadMyAccess(); }catch(e){}
   const ref=bkpRef(nick);
   const r=await apiCall('POST','/bkp',{nick},true,nick);
-  btn.disabled=false; btn.textContent=orig;
+  btn.textContent=orig; btn.disabled=false; refreshBkpButtons();   // UI 1.28.0 : client absent -> grisé de nouveau
   if(r.httpStatus===401) return;
   if(r.exitcode===0){
     notePendingBkp(nick,ref);   // fin repérée par pollAccess (run_id nouveau et fini), même courte ou tardive
@@ -1691,6 +1743,7 @@ function openMachine(nick){
   document.getElementById('actionPanel').innerHTML='<p class="hint">Choisir une action à gauche.</p>';
   currentActionId=null;
   showView('view-detail');
+  probePullNicks(nick);   // UI 1.28.0 (revue 1 row 2, revue 2 row 30) : page détail (lien direct compris) — ce nick seul, sans attendre /access
 }
 
 function showMachines(){ showView('view-machines'); loadMachines(); }
@@ -1709,7 +1762,7 @@ function renderActionList(){
   // a.op : nature d'opération (UI 1.19.0) — action interdite sur un dépôt externe (EXTERNAL_OPS) jamais proposée
   ul.innerHTML=ACTIONS.filter(a=>(!a.requiresDestructive||allowDestructive) && (!a.requiresRestoreRoot||restoreEnabled)
                          && opAllowed(currentNick,a.op||'read'))
-    .map(a=>`<li><button class="${a.destructive?'danger-item':''}${a.id===currentActionId?' active':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')">${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
+    .map(a=>`<li><button class="${a.destructive?'danger-item':''}${a.id===currentActionId?' active':''}" id="abtn_${a.id}" onclick="selectAction('${a.id}')"${a.id==='bkp'?bkpButtonAttrs(currentNick):''}>${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</button></li>`).join('');
 }
 
 function selectAction(id){
@@ -1733,7 +1786,7 @@ function selectAction(id){
     <h3>${a.needsPass?'🔑 ':''}${escapeHtml(a.label)}</h3>
     <div id="actionDesc">${a.method} ${escapeHtml(a.path)}${a.needsPass?' — nécessite la passphrase de ce serveur':''}${a.sensitive?' — <strong>résultat sensible</strong>':''}</div>
     ${fieldsHtml}
-    <button class="${a.destructive?'danger':''}" onclick="runAction()">${a.destructive?'⚡ Exécuter':'Exécuter'}</button>
+    <button class="${a.destructive?'danger':''}" id="runActionBtn" onclick="runAction()"${a.id==='bkp'?bkpButtonAttrs(currentNick):''}>${a.destructive?'⚡ Exécuter':'Exécuter'}</button>
     <div class="result-meta" id="resultMeta"></div>
     <div id="resultBox" hidden>
       <div><strong>stdout</strong></div><pre id="resultStdout"></pre>

@@ -1,5 +1,63 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.217, borgHelperWWW 1.35.0, UI 1.28.0, SW 1.5.0 — Bkp tiré : client absent, ni échec ni succès — 2026-11-12
+
+Story 118 (chantier « Bkp tiré / client à IP flottante, ProxyJump », étude `work/proxyjump/etude.md` ; décisions de l'utilisateur des
+2026-11-09 — Q3 « client absent », Q4 bouton Backup grisé — et 2026-11-11 : critère, code 1, texte, options ssh, sonde ; absent =
+échec RÉSEAU seulement). Messages d'OpenSSH relevés par mesure : `work/s118/messages.md` (OpenSSH 8.9, sshd de bac non root,
+espaces de noms réseau jetables ; `~/.ssh` de l'utilisateur jamais lu, listing identique).
+
+- **borgHelper — options du ssh du pull** : `-o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30 -o
+  ServerAliveCountMax=6` juste avant `<SER_LOGIN>@<SER_NAME>` (Bkp tiré seulement). Client injoignable par délai : échec réseau en
+  30 s ; client mis en veille pendant le Bkp : ssh sort en ~3 min 30 (mesuré) au lieu d'attendre le keepalive TCP (heures) — un
+  **échec** (borg avait démarré). `BatchMode` : jamais d'invite.
+- **borgHelper — client absent** : ssh du pull sorti en 255, AUCUNE ligne `--log-json` de borg ni sortie, et toutes ses lignes
+  reconnues « réseau » (refus, délai, hôte/réseau injoignable, nom non résolu, coupure avant l'échange de clés ; derrière un saut :
+  cible ou saut injoignable avec la ligne réseau du saut, ou délai de bannière — voir revues 1 et 2) -> `[ABSENT] <nick>: client injoignable (ssh : <dernière ligne de ssh>) — Bkp reporté, pas un échec`,
+  code **1**, `bkp_status.result = 'absent'` (ligne fermée), ni Sentry `bkp_error`, ni Index de fin, ni mesure de place,
+  `index-pending` inchangé ; `-n ALL` : le pire des codes (absent = 1). Clé d'hôte changée, authentification refusée (aussi d'un
+  saut), option invalide, algorithme refusé, route interdite, coupure après l'échange de clés, borg démarré puis coupé, message
+  inconnu : **échec** comme avant (push, Sentry). Bkp non tiré : jamais absent.
+- **borgHelper — Status / Report** : « Client absent au dernier Bkp : tentative à … » (Status, JSON `bkp_absent {attempted_at}`)
+  et « 🔌 client absent (tentative à …) » dans la colonne reste de Report (JSON `client_absent`) tant que le dernier Bkp fini est
+  un absent ; ni alerte ni code changé — la dernière archive et `MAX_AGE_BKP` restent l'alerte. Un absent n'est jamais « Bkp
+  précédent en erreur ».
+- **borgHelperWWW 1.35.0** : le watcher réclame une fin `absent` sans AUCUN push (ni « échec » ni « succès ») ni Sentry, une
+  ligne au journal ; `_send_bkp_push` n'envoie rien pour une fin `absent`. Nouvelle route `GET /bkp/probe?nick=` (niveau
+  écriture) : sonde ssh du client d'un nick tiré (même destination, clé et options que le Bkp, `ConnectTimeout=3`, commande
+  `true`), `joignable` / `absent` / `inconnu`, résultat gardé 30 s par nick, une sonde à la fois par nick, 8 s au plus ; nick non
+  tiré : aucune sonde. `/access` : `bkp_pull` par nick.
+- **UI 1.28.0** : nick tiré dont la sonde dit le client absent -> badge gris « 🔌 client absent » et bouton « ▶ Backup » grisé
+  (info-bulle : dernière ligne de ssh) ; sonde relancée à chaque affichage de la liste et relecture de `/access` (30 s).
+- **Revue 1** (mesures `work/s118/messages.md`, section « Revue 1 ») : paire finale visant `UNKNOWN port 65535` (saut
+  `ProxyJump`/`ProxyCommand`) absente seulement après une ligne réseau reconnue — un saut silencieux (`ssh -q`, `LogLevel QUIET`)
+  rend la même paire pour une authentification refusée ou une clé changée au saut : échec ; `-o LogLevel=ERROR` NON posé (mesuré :
+  il retire des lignes d'échec) ; vrai `ProxyJump` : `BatchMode`/`ConnectTimeout` ne vont pas au ssh du saut (README) ; écriture
+  `absent` refusée -> `[WARN]` ; Report : un absent n'est jamais « le Bkp précédent » ; WWW : retard d'un nick SANS archive compté
+  depuis la 1re tentative absente, « inconnu » de la sonde sur 255 gardé 10 min, `message` de la sonde pour `absent` seulement,
+  verrou de sonde borné, `DEFAULT`/`_borgHelperWWW` -> 404, route taguée `mutation` ; UI : « Lancer un backup » et Exécuter de la
+  page détail grisés (décision de l'utilisateur), sonde à l'ouverture de la page détail, bouton rendu quand plus aucun nick n'est
+  tiré. Push de DÉBUT d'un Bkp absent gardé (décision de l'utilisateur). Versions : borgHelper 1.0.217 avec borgHelperWWW < 1.35.0
+  -> push « échec » pour un absent : les mettre à jour ensemble.
+- **Revue 2** (mesure R22, `work/s118/messages.md`) : délai derrière un saut (cible muette derrière un saut joignable, tunnel mort
+  sur le bastion, bastion muet : paire `… UNKNOWN port 65535 timed out`) = **absent** (« délai dépassé ») — les échecs silencieux
+  d'un saut donnent `closed`, jamais `timed out` ; l'exigence de preuve réseau ne vise plus que `closed`/`reset`. Retard « sans
+  archive » seulement pour un nick SANS AUCUN Bkp réussi (plus de fausse alerte quand diff.db est absente ou illisible) ; texte
+  « Aucune sauvegarde — client absent depuis X » (charge `no_backup`, service worker SW 1.5.0, Sentry). Sonde : toute section `_…`
+  -> 404 ; à l'ouverture d'une page détail, sonde du seul nick ouvert.
+- **Revue 3** : sonde (décision de l'utilisateur du 2026-11-12) — délai derrière un saut (`… UNKNOWN port 65535 timed out`) =
+  `inconnu`, bouton actif (les 3 s de la sonde couvrent aussi la connexion au saut) ; le Bkp garde « absent ». Docs : `BatchMode`
+  n'atteint pas le saut d'un ProxyJump ; un Bkp lancé à la main avec une invite au saut sans réponse en 30 s finit « absent ».
+- **Déploiement** : avec borgHelperWWW 1.35.0 (original ou version autonome de `dist/`), déposer aussi `borgHelperWWW_sw.js` 1.5.0
+  et `borgHelperWWW_ui.html` 1.28.0 à côté — la version autonome n'embarque ni le service worker ni l'UI ; l'ancien service
+  worker afficherait « Dernière sauvegarde il y a X » pour un nick qui n'en a aucune, l'ancienne UI ne griserait pas « ▶ Backup ».
+- Contrôles (CodecSelfTest) : « Bkp tiré, client absent : messages de ssh mesurés… », « … par le vrai backup()… », « … sur vrai sshd
+  de bac et vrai ssh… » ; contrôles d'avant qui figent l'argv du pull mis à jour (« SSH_ENV : Bkp tiré… » story 115, « Bkp tiré
+  construit par le vrai backup()… » story 117 : options du pull ajoutées avant `x@h` ; « D148 Status, une base corrompue sur deux »
+  et « D148 Status, exception isolée d'un nick » : clé `bkp_absent` ajoutée aux clés figées). push_selftest : « watcher : fin
+  « absent »… », « GET /bkp/probe… », « retard : nick sans archive, client absent… ». `borgHelperWWW_ui_test.js` : badge, bouton
+  grisé, sonde des seuls nicks tirés, page détail, `openMachine`, texte du service worker.
+
 ## borgHelper 1.0.216 — Bkp tiré : BORG_REPO et BORG_RSH du client construits depuis le rc — 2026-11-11
 
 Story 117 (chantier « Bkp tiré / client à IP flottante, ProxyJump », étude `work/proxyjump/etude.md` ; décisions de l'utilisateur

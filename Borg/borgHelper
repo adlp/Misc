@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.216"
+Version="1.0.217"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3195,6 +3195,114 @@ def _pull_openssh_old(stderr):
         if isinstance(s,str) and 'bad configuration option: knownhostscommand' in s.lower(): return True
     return False
 
+# 1.0.217 (story 118, décisions de l'utilisateur des 2026-11-09 et 2026-11-11) : Bkp tiré — client ABSENT (injoignable au moment du
+# Bkp) = ni échec ni succès. Options du ssh du pull (D2) : BatchMode (jamais d'invite), ConnectTimeout (client absent : échec réseau en
+# 30 s au plus), ServerAlive (client en veille pendant le Bkp : ssh sort en ~3 min, 30 s × 6 sans réponse, au lieu du keepalive TCP —
+# heures). Valeurs : mesure `work/s118/messages.md`. Placées juste avant la destination (OpenSSH garde la 1re valeur d'une option ;
+# aucune autre de ces options sur la ligne de commande du pull ; la ligne de commande l'emporte sur ~/.ssh/config).
+_PULL_SSH_OPTS=('-o','BatchMode=yes','-o','ConnectTimeout=30','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6')
+_PULL_PROBE_CONNECT=3   # sonde de borgHelperWWW (bouton ▶ Backup) : ConnectTimeout
+_PULL_PROBE_WAIT=8      # sonde : délai total (résolution de nom comprise, que ConnectTimeout ne borne pas) ; au-delà : « inconnu »
+# Messages d'OpenSSH reconnus « réseau » (MESURÉS, OpenSSH 8.9p1, work/s118/messages.md ; textes de strerror/gai_strerror en anglais
+# même sous LC_ALL=fr_FR.UTF-8 — ssh ne traduit que LC_CTYPE). Ancrés en entier : tout autre message (clé d'hôte changée, « Permission
+# denied (publickey) », option invalide, « Unable to negotiate », route `prohibit` = « Permission denied », coupure APRÈS l'échange de
+# clés, « Timeout, server … not responding ») = ÉCHEC, jamais absent par défaut.
+_SSH_NET_ERR=r'(?:Connection refused|Connection timed out|No route to host|Network is unreachable)'
+_SSH_DNS_ERR=r'(?:Name or service not known|Temporary failure in name resolution)'
+_SSH_NET_LINE=rf'(?:ssh: connect to host \S+ port [0-9]+: {_SSH_NET_ERR}|ssh: Could not resolve hostname \S+: {_SSH_DNS_ERR})'
+_SSH_ABSENT_LAST=re.compile(_SSH_NET_LINE+r'\Z')
+# coupure avant l'échange de clés : deux lignes, dans cet ordre, en dernier (la 2e seule ne suffit pas : « Connection closed by … port »
+# vient aussi d'une coupure pendant l'authentification)
+_SSH_ABSENT_PAIRS=((re.compile(r'kex_exchange_identification: (?:Connection closed by remote host|read: Connection reset by peer)\Z'),
+                    re.compile(r'Connection (?:closed|reset) by \S+ port [0-9]+\Z')),
+                   (re.compile(r'Connection timed out during banner exchange\Z'),re.compile(r'Connection to \S+ port [0-9]+ timed out\Z')))
+# lignes permises AVANT la (ou les) dernière(s) : saut (ProxyJump/ProxyCommand -W) dont la cible est injoignable, clé d'hôte du saut
+# ajoutée (accept-new) — mesurés ; toute autre ligne (ex. « Permission denied » du saut) : échec
+_SSH_ABSENT_BEFORE=re.compile(rf"(?:{_SSH_NET_LINE}|channel [0-9]+: open failed: connect failed: (?:{_SSH_NET_ERR}|{_SSH_DNS_ERR})"
+                              r"|stdio forwarding failed|Warning: Permanently added '[^'\n]*' \([^)\n]*\) to the list of known hosts\.)\Z")
+# revue 1 row 1 (mesuré, work/s118/messages.md R1) : saut silencieux (`ProxyCommand ssh -q`, `LogLevel QUIET`) — authentification refusée,
+# clé d'hôte changée AU SAUT, cible fermée, saut fermé : la même paire nue `closed`/`reset` visant `UNKNOWN port 65535` ; elle n'est
+# « absent » que précédée d'une ligne réseau reconnue (du saut : `ssh: connect to host …`, `channel N: open failed: connect failed: …`).
+# Revue 2 row 22 (mesuré R22) : la paire `… UNKNOWN port 65535 timed out` (cible muette derrière un saut joignable, tunnel mort sur le
+# bastion, bastion muet) = délai dépassé -> absent ; les échecs silencieux d'un saut ne donnent jamais `timed out`
+_SSH_ABSENT_PROXY=re.compile(r'Connection (?:closed|reset) by UNKNOWN port 65535\Z')
+_SSH_ABSENT_EVIDENCE=re.compile(rf"(?:{_SSH_NET_LINE}|channel [0-9]+: open failed: connect failed: (?:{_SSH_NET_ERR}|{_SSH_DNS_ERR}))\Z")
+
+def _ssh_absent_line(lines):
+    """1.0.217 (story 118) : lignes de stderr d'un ssh sorti en 255 -> sa dernière ligne si TOUTES sont des messages « réseau » reconnus
+    (dernière : _SSH_ABSENT_LAST, ou paire finale _SSH_ABSENT_PAIRS ; avant : _SSH_ABSENT_BEFORE), sinon None (échec). Aucune ligne :
+    None (cause inconnue = échec). Paire `closed`/`reset` visant `UNKNOWN port 65535` (ProxyCommand/ProxyJump) : absent seulement si
+    une ligne réseau reconnue (_SSH_ABSENT_EVIDENCE) la précède (revue 1 row 1) ; paire `… UNKNOWN port 65535 timed out` : absent
+    (revue 2 row 22)."""
+    ls=[x.strip() for x in lines or () if isinstance(x,str) and x.strip()]
+    if not ls: return None
+    if _SSH_ABSENT_LAST.match(ls[-1]): body=ls[:-1]
+    elif len(ls)>=2 and any(a.match(ls[-2]) and b.match(ls[-1]) for a,b in _SSH_ABSENT_PAIRS):
+        body=ls[:-2]
+        if _SSH_ABSENT_PROXY.match(ls[-1]) and not any(_SSH_ABSENT_EVIDENCE.match(x) for x in body): return None   # revue 1 row 1
+    else: return None
+    return ls[-1] if all(_SSH_ABSENT_BEFORE.match(x) for x in body) else None
+
+def _pull_absent(rb):
+    """1.0.217 (story 118, décision de l'utilisateur du 2026-11-11) : résultat boex du ssh d'un Bkp tiré -> dernière ligne de ssh si le
+    client est ABSENT : code 255, borg non tué, aucune ligne --log-json de borg (aucun enregistrement JSON sur stderr) ni sortie, et
+    lignes de ssh toutes « réseau » (_ssh_absent_line) ; sinon None — un borg démarré puis coupé reste un échec."""
+    if rb.get('exitcode')!=255 or rb.get('killed'): return None
+    err=rb.get('stderr') or []
+    if any(not isinstance(x,str) for x in err): return None
+    if any(not isinstance(x,str) or x.strip() for x in rb.get('stdout') or []): return None
+    return _ssh_absent_line(err)
+
+def _pull_ssh_tail(cfg,opts=_PULL_SSH_OPTS):
+    """1.0.217 (story 118) : fin de l'argv du ssh d'un Bkp tiré, après `ssh <SendEnv|-T> [-R …]` : `-A -o VisualHostKey=no -o
+    StrictHostKeyChecking=accept-new <opts> <SER_LOGIN>@<SER_NAME> [-i <SSH_KEY>]` (découpage sur les espaces de 1.0.216 gardé).
+    SER_LOGIN/SER_NAME absentes : KeyError (comme avant)."""
+    a=f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_LOGIN"]}@{cfg["SER_NAME"]}'.split(' ')
+    a[5:5]=list(opts)
+    if 'SSH_KEY' in cfg.keys(): a+=['-i',cfg['SSH_KEY']]
+    return a
+
+def _is_pull(cfg):
+    """1.0.217 (story 118) : Bkp tiré (SSH_REMFO non vide, la règle de backup()). Valeur à « % » mal formée : _RcValueError."""
+    try: return cfg is not None and 'SSH_REMFO' in cfg.keys() and len(cfg['SSH_REMFO'])>0
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None
+
+def _pull_probe_argv(cfg):
+    """1.0.217 (story 118, décision de l'utilisateur Q4) : sonde du client d'un Bkp tiré — même destination, clé et options que le ssh
+    du Bkp (_pull_ssh_tail), ConnectTimeout réduit à _PULL_PROBE_CONNECT, commande `true` ; ni SendEnv (aucune variable utile) ni -R (un
+    tunnel déjà ouvert par un Bkp en cours ne se dispute pas). KeyError : SER_LOGIN/SER_NAME absentes."""
+    return ['ssh']+_pull_ssh_tail(cfg,('-o','BatchMode=yes','-o',f'ConnectTimeout={_PULL_PROBE_CONNECT}'))+['true']
+
+_SSH_PROBE_PROXY_TIMEOUT=re.compile(r'Connection to UNKNOWN port 65535 timed out\Z')
+
+def _pull_probe(cfg,wait=None):
+    """1.0.217 (story 118) : sonde du client d'un Bkp tiré -> {'state','message','code'} ; state 'joignable' (tout code ≠ 255 : une
+    commande forcée qui refuse `true` répond quand même), 'absent' (255, lignes « réseau » : _ssh_absent_line ; message = sa dernière
+    ligne), 'inconnu' (autre 255 — authentification, clé d'hôte… : bouton gardé —, délai total `wait` dépassé, ssh introuvable, rc sans
+    SER_LOGIN/SER_NAME ; message = dernière ligne ou cause). Session propre, tout le groupe tué au délai. Environnement du ssh du Bkp
+    sans BORG_* (PATH, LC_ALL). Jamais d'exception."""
+    wait=_PULL_PROBE_WAIT if wait is None else wait
+    try: argv=_pull_probe_argv(cfg)
+    except KeyError as e: return {'state':'inconnu','message':f"clé {e.args[0]} absente du rc",'code':None}
+    except configparser.InterpolationError as e: return {'state':'inconnu','message':f"rc illisible ({_rc_err_text(e)})",'code':None}
+    env={'PATH':os.environ.get('PATH') or os.defpath,'LC_ALL':'fr_FR.UTF-8'}
+    try: p=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env,start_new_session=True)
+    except OSError as e: return {'state':'inconnu','message':f"ssh non lancé ({e.strerror or e})",'code':None}
+    try: _,err=p.communicate(timeout=wait)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError): os.killpg(p.pid,signal.SIGKILL)
+        with contextlib.suppress(Exception): p.communicate(timeout=5)
+        return {'state':'inconnu','message':f"sonde sans réponse en {wait} s",'code':None}
+    lines=[x for x in err.decode('utf-8','replace').split('\n') if x.strip()]
+    last=lines[-1].strip()[:300] if lines else None
+    if p.returncode!=255: return {'state':'joignable','message':None,'code':p.returncode}
+    a=_ssh_absent_line(lines)
+    # revue 3 row 34 (décision de l'utilisateur du 2026-11-12) : SONDE seulement — délai derrière un saut (`… UNKNOWN port 65535 timed
+    # out`) : les 3 s de ConnectTimeout couvrent aussi la connexion au saut (bastion lent) -> « inconnu », bouton actif ; le Bkp (30 s)
+    # garde « absent » (_pull_absent inchangé)
+    if a and _SSH_PROBE_PROXY_TIMEOUT.match(a): a=None
+    return {'state':'absent' if a else 'inconnu','message':(a[:300] if a else last),'code':255}
+
 def _borg_ok(rb):
     """1.0.176 (story 39, A77, décision de l'utilisateur) : résultat boex utilisable — code 0, ou 1 (avertissement de borg, sortie
     valide), et borg non tué (sortie tronquée, jamais parsée). Code >= 2 ou négatif (signal) : échec. Avant : 0 seul aux sites de
@@ -3532,7 +3640,9 @@ _HELP={
               "Plusieurs nicks : un Bkp après l'autre ; un nick en échec n'arrête pas les suivants ; code = le pire.",
               "En fin de Bkp : place libre du stockage mesurée (borgHelper_storage ; voir Storage), jamais un échec du Bkp.",
               "Bkp tiré (SSH_REMFO) avec SSH_REPO_USER : BORG_REPO et BORG_RSH du client construits ici (clé d'hôte",
-              "épinglée : /etc/ssh ou SSH_REPO_HOSTKEY ; OpenSSH >= 8.5 sur le client) ; vus par Status et -d.")),
+              "épinglée : /etc/ssh ou SSH_REPO_HOSTKEY ; OpenSSH >= 8.5 sur le client) ; vus par Status et -d.",
+              "Bkp tiré, client injoignable (ssh en échec réseau avant borg) : « [ABSENT] », code 1, ni push ni",
+              "Sentry — pas un échec ; ssh du pull : BatchMode, ConnectTimeout=30, ServerAlive 30 s × 6.")),
     'prune':_H('Prune',0,"Supprime les vieilles archives selon les règles KEEP_*","-c Prune [-n nick|a,b|ALL]",(_HNALL,),
         (("élague le dépôt du nick (irréversible)","borgHelper -c Prune -n mon-serveur"),
          ("tous les nicks du fichier de conf","borgHelper -c Prune -n ALL")),
@@ -3730,7 +3840,7 @@ _HELP={
               "(« ⚠ stockage presque plein », 1.0.209) ; code 2 : un dépôt inaccessible, ou erreur d'arguments.",
               "Dépôt distant : « reste » = dernière place mesurée à la fin d'un Bkp (« ~ » : capacité déclarée).")),
     'status':_H('Status',3,"État rapide par nick (dernier backup, Bkp en cours), sans borg","-c Status [-n nick|a,b|ALL] [-j]",
-        (_HNALL,('-j',"JSON, toujours une liste [{nick,last_backup,bkp_running,bkp_stale,priority_op_running,build,rebuild},…]")),
+        (_HNALL,('-j',"JSON, toujours une liste [{nick,last_backup,bkp_running,bkp_stale,bkp_absent,priority_op_running,build,rebuild},…]")),
         (("un seul nick, texte","borgHelper -c Status -n mon-serveur"),
          ("plusieurs nicks","borgHelper -c Status -n a,b"),
          ("tous les nicks configurés, JSON","borgHelper -c Status -n ALL -j")),
@@ -3740,6 +3850,7 @@ _HELP={
               "bkp_running null) ; délai = clé BKP_STATUS_TIMEOUT du nick ou de [DEFAULT] (90s, 5m, 12h), sinon",
               "variable BORGHELPERWWW_BKP_STATUS_TIMEOUT, sinon 6 h — le même que borgHelperWWW.",
               "build/rebuild : construction de la base servie / du fantôme (Index par tranches).",
+              "Bkp tiré, client injoignable au dernier Bkp fini : « Client absent » (bkp_absent {attempted_at}).",
               "Restore, Prune et DelBkp ne sont pas distingués (priority.lock ne porte pas cette info).",
               "Code 1 : nick en erreur (base illisible, verrou, passphrase absente, migration, exception) ou",
               "[ERREUR] SQLite. Code 2 aussi : erreur d'arguments.")),
@@ -6833,7 +6944,8 @@ class BorgHelperDB:
 
     def store_bkp_status_finish(self,nick,run_id,result,db_path=None,changed_during_backup=None,read_errors=None):
         """Écrite par backup() à la fin normale, avant sys.exit(newretC) — result dérivé du même
-        newretC qu'aujourd'hui ('success' si 0, sinon 'error'). changed_during_backup/read_errors
+        newretC qu'aujourd'hui ('success' si 0, sinon 'error') ; 1.0.217 (story 118) : 'absent' (Bkp tiré, client injoignable,
+        sys.exit(1)). Rend True, ou False si l'écriture a échoué (SQLite, dit). changed_during_backup/read_errors
         (1.0.118) : statuts C/E de borg create --list, repris dans la notification push de fin."""
         db_path=self._hist(nick,db_path,create=True)
         def _do():
@@ -6917,6 +7029,36 @@ class BorgHelperDB:
         finally: conn.close()
         return dict(zip(('run_id','started_at','finished_at','result'),r)) if r else None
 
+    def last_bkp_absent(self,nick,db_path=None):
+        """1.0.217 (story 118, décision de l'utilisateur) : client absent au DERNIER Bkp fini — dernière ligne bkp_status FINIE du nick
+        parmi 'success', 'error', 'absent' (fin la plus récente, puis ordre d'écriture) en 'absent' -> {run_id, started_at (heure de la
+        tentative), finished_at} ; sinon None (aucune, dernière fin succès/échec, history.db absente — jamais de création, AD-12). Lecture
+        impossible : None (Status/Report best-effort, comme get_running_bkp_status)."""
+        try:
+            db_path=self._hist(nick,db_path)
+            if db_path is None: return None
+            conn=_open_db(db_path,nick=None,role='read')
+            try:
+                r=conn.execute("SELECT run_id,started_at,finished_at,result FROM bkp_status WHERE nick=? AND finished_at IS NOT NULL "
+                               "AND result IN ('success','error','absent') ORDER BY finished_at DESC, rowid DESC LIMIT 1",(nick,)).fetchone()
+            finally: conn.close()
+        except (sqlite3.Error,OSError,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError): return None
+        return {'run_id':r[0],'started_at':r[1],'finished_at':r[2]} if r and r[3]=='absent' else None
+
+    def first_bkp_absent(self,nick,db_path=None):
+        """1.0.217 (story 118, revue 1 row 4) : `started_at` (UTC) de la PREMIÈRE ligne 'absent' du nick, ou None (aucune, base absente
+        — jamais de création —, lecture impossible). Sert à l'alerte de retard de borgHelperWWW d'un nick sans archive. Revue 2 row 23 :
+        None aussi dès que le nick a UN Bkp réussi (`success`) — diff.db absente, illisible ou vide ne fait jamais alerter un nick sauvegardé."""
+        try:
+            db_path=self._hist(nick,db_path)
+            if db_path is None: return None
+            conn=_open_db(db_path,nick=None,role='read')
+            try: r=conn.execute("SELECT MIN(started_at) FROM bkp_status WHERE nick=? AND result='absent' AND NOT EXISTS "
+                                "(SELECT 1 FROM bkp_status s WHERE s.nick=? AND s.result='success')",(nick,nick)).fetchone()
+            finally: conn.close()
+        except (sqlite3.Error,OSError,DbKeyError,DbModeError,DbTamperError,DbCodecError,SchemaVersionError): return None
+        return r[0] if r and r[0] else None
+
     def previous_bkp_status(self,nick,run_id,db_path=None):
         """1.0.183 (story 50, décisions de l'utilisateur) : Bkp PRÉCÉDENT de celui de `run_id` = dernière ligne bkp_status du nick
         démarrée avant lui (started_at, puis ordre d'écriture) — un Bkp lancé APRÈS lui (refusé sur le verrou du dépôt) n'en est
@@ -6924,7 +7066,8 @@ class BorgHelperDB:
         finished_at, result, failed} ; failed = fini en 'error' OU jamais fini et son marqueur de Bkp n'est pas vivant (tué :
         SIGKILL, redémarrage — comme le watcher, AD-7) ; jamais fini au marqueur vivant (Bkp concurrent encore en cours, revue 2) :
         pas en échec. Un Bkp concurrent refusé (fini en 'error') compte (décision de l'utilisateur). None : aucun précédent.
-        Lecture impossible : [WARN] dit, None (Report reste best-effort, la règle « précédent en erreur » n'est alors pas appliquée)."""
+        Lecture impossible : [WARN] dit, None (Report reste best-effort, la règle « précédent en erreur » n'est alors pas appliquée).
+        1.0.217 (story 118, revue 1 row 11) : lignes 'absent' (client absent) sautées — jamais « le précédent » (un échec d'avant reste vu)."""
         conn=None
         try:
             db_path=self._hist(nick,db_path)
@@ -6932,10 +7075,10 @@ class BorgHelperDB:
             conn=_open_db(db_path,nick=None,role='read')
             if run_id is None:
                 r=conn.execute("SELECT run_id,started_at,finished_at,result FROM bkp_status WHERE nick=? "
-                               "ORDER BY started_at DESC, rowid DESC LIMIT 1",(nick,)).fetchone()
-            else:
+                               "AND result IS NOT 'absent' ORDER BY started_at DESC, rowid DESC LIMIT 1",(nick,)).fetchone()
+            else:   # revue 1 row 11 (story 118) : un Bkp « client absent » n'est pas un résultat de Bkp — sauté, jamais le précédent
                 r=conn.execute("SELECT p.run_id,p.started_at,p.finished_at,p.result FROM bkp_status p, bkp_status c "
-                               "WHERE c.nick=? AND c.run_id=? AND p.nick=c.nick AND p.run_id<>c.run_id "
+                               "WHERE c.nick=? AND c.run_id=? AND p.nick=c.nick AND p.run_id<>c.run_id AND p.result IS NOT 'absent' "
                                "AND (p.started_at<c.started_at OR (p.started_at=c.started_at AND p.rowid<c.rowid)) "
                                "ORDER BY p.started_at DESC, p.rowid DESC LIMIT 1",(nick,run_id)).fetchone()
             if not r: return None
@@ -10305,9 +10448,8 @@ class BorgHelper:
         preBorg=['ssh','-T'] if ssh_env=='commande' else ['ssh','-o','SendEnv BORG_*']   # revue 1 row 3 : -T, jamais d'écho par un pty
         if 'SSH_REMFO' in cfg.keys():
             preBorg.append('-R'); preBorg.append(cfg['SSH_REMFO'])
-        preBorg.extend(f'-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new {cfg["SER_LOGIN"]}@{cfg["SER_NAME"]}'.split(' '))
-        if 'SSH_KEY' in cfg.keys():
-            preBorg.append('-i'); preBorg.append(cfg['SSH_KEY'])
+        # 1.0.217 (story 118) : + BatchMode, ConnectTimeout, ServerAlive* (_PULL_SSH_OPTS) juste avant la destination
+        preBorg.extend(_pull_ssh_tail(cfg))
         if 'SSH_REMFO' not in cfg.keys() or len(cfg['SSH_REMFO'])==0:
             preBorg=None
         # 1.0.216 (story 117) : Bkp tiré avec SSH_REPO_USER (ni SSH_REPO ni BORG_RSH) -> BORG_REPO et BORG_RSH du client construits, transmis
@@ -10404,6 +10546,16 @@ class BorgHelper:
             anaRet=self.borg.boex(nick,create,preBorg=preBorg,debug=debug,sshEnv=ssh_env,   # revue 1 row 1 : sa décision, jamais relue
                                   cmdEnv=pull if ssh_env=='sendenv' else None,   # 1.0.216 : en commande, déjà dans le préfixe
                                   forceEnv=dict(forceEnv or {},BORGHELPER_BKP_RUN=run_id,BORGHELPER_BKP_PID=f"{os.getpid()}:{_proc_start(os.getpid())}"))
+            # 1.0.217 (story 118, décisions de l'utilisateur) : Bkp tiré, ssh sorti en 255 AVANT borg sur une erreur RÉSEAU (_pull_absent)
+            # -> client absent : ni échec ni succès — bkp_status 'absent' (ligne fermée), aucun Sentry, aucun Index ni mesure de place
+            # (aucune archive), index_pending inchangé, code 1 ; le watcher de borgHelperWWW n'envoie aucun push pour 'absent'
+            absent=_pull_absent(anaRet) if preBorg is not None else None
+            if absent is not None:
+                if debug: _print_borg_stderr(anaRet.get('stderr') or [],debug)
+                printer(f"[ABSENT] {nick}: client injoignable (ssh : {absent}) — Bkp reporté, pas un échec")
+                if not self.db.store_bkp_status_finish(nick,run_id,'absent',bkp_status_db):   # revue 1 row 12 : le filet écrira 'error'
+                    printer(f"[WARN] {nick}: fin « absent » non enregistrée (run_id={run_id}) — la ligne sera fermée en échec (notification d'échec possible)")
+                sys.exit(1)
             newretC=0
             if anaRet['exitcode']:
                 for i in anaRet['stderr']:
@@ -12904,10 +13056,19 @@ class BorgHelper:
             'nick':nick,
             'last_backup':last_backup,
             'bkp_running':bs['bkp_running'],'bkp_interrupted':bs['bkp_interrupted'],'bkp_stale':bs['bkp_stale'],
+            'bkp_absent':self._bkp_absent_view(nick),   # 1.0.217 (story 118) : client absent au dernier Bkp fini
             'priority_op_running':bool(self.db.check_priority_lock(nick)),
             'build':build,
             'rebuild':rebuild,
         }
+
+    def _bkp_absent_view(self,nick):
+        """1.0.217 (story 118, décision de l'utilisateur) : Status/Report — {'attempted_at': début de la tentative (UTC, forme de
+        started_at)} si le dernier Bkp fini du nick a trouvé son client absent (last_bkp_absent : plus récent que la dernière fin
+        succès/échec), sinon None. Jamais d'exception."""
+        try: a=self.db.last_bkp_absent(nick)
+        except Exception: return None
+        return {'attempted_at':a['started_at']} if a else None
 
     def _bkp_pull_view(self,nick):
         """1.0.216 (story 117) : Status d'un nick — BORG_REPO et BORG_RSH construits pour le borg du client d'un Bkp tiré (_bkp_pull_env),
@@ -13007,6 +13168,11 @@ class BorgHelper:
             t=st['bkp_stale'].get('timeout_s') or _bkp_status_timeout()
             printer(f"  Bkp sans fin depuis {readable} — probablement interrompu "
                     f"(délai {f'{t//3600} h' if t%3600==0 else f'{t} s'} dépassé)")
+        ab=st.get('bkp_absent')   # 1.0.217 (story 118) : ni échec ni succès — la dernière archive et MAX_AGE_BKP restent l'alerte
+        if ab:
+            try: readable=_bkp_running_readable(ab['attempted_at'])
+            except (ValueError,TypeError): readable=ab['attempted_at']
+            printer(f"  Client absent au dernier Bkp : tentative à {readable} — client injoignable, Bkp reporté (pas un échec)")
         if st['priority_op_running'] and not (run and not run.get('orphelin')):   # 1.0.186 : l'orphelin ne tient pas priority.lock
             # Ambiguïté assumée (Boundaries spec-status-cli-etat-rapide) : les fichiers priority.lock ne disent
             # pas quelle opération (Restore, Prune ou DelBkp) les tient. Affiché seulement si aucun Bkp détecté (sinon redondant : le Bkp
@@ -13057,7 +13223,7 @@ class BorgHelper:
                 # Isolation par nick : une anomalie sur UN nick (base chiffrée sans passphrase, base
                 # 'migrating' AD-11, erreur SQLite non prévue…) ne doit jamais faire échouer tout
                 # l'appel -n ALL/multi-nick — c'est précisément le cas d'usage principal de Status.
-                results.append({'nick':n,'last_backup':None,'bkp_running':None,'bkp_interrupted':None,'bkp_stale':None,
+                results.append({'nick':n,'last_backup':None,'bkp_running':None,'bkp_interrupted':None,'bkp_stale':None,'bkp_absent':None,
                                  'priority_op_running':False,'build':None,'rebuild':None,'error':_etxt(e)})   # revue 96, 2 (row 18)
                 if isinstance(e,configparser.Error): _rc_sentry_once(f"rc illisible, {_rc_err_text(e)}")
         if as_json:
@@ -14521,6 +14687,18 @@ class BorgHelper:
         elif not str(row.get('nom','')).startswith('*'): row['nom']=f"***{nick}"
         return 1
 
+    def _bkp_absent_mark(self,nick,row,as_json):
+        """1.0.217 (story 118, décision de l'utilisateur) : jumelles report/report_offline — client absent au dernier Bkp fini
+        (_bkp_absent_view) -> colonne « reste » suffixée « 🔌 client absent (tentative à … ) » ; -j : champ client_absent {attempted_at,
+        depuis}. Ni alerte ni code changé : la dernière archive et MAX_AGE_BKP restent l'alerte."""
+        ab=self._bkp_absent_view(nick)
+        if not ab: return
+        try: readable=_bkp_running_readable(ab['attempted_at'])
+        except (ValueError,TypeError): readable=ab['attempted_at']
+        cur=row.get('reste'); mention=f"🔌 client absent (tentative à {readable})"
+        row['reste']=f"{cur} — {mention}" if cur not in (None,'') else mention
+        if as_json: row['client_absent']={'attempted_at':ab['attempted_at'],'depuis':readable}
+
     def _report_space(self,nick,row):
         """1.0.209 (story 87b, décisions 5, 8, 15) : jumelles report/report_offline, AVANT la mise en forme des tailles — dernière place
         mesurée du DÉPÔT du nick (history.db, fin de Bkp ; jamais ssh ni borg) pour son dépôt COURANT (revue 87b rows 20, 40 : par
@@ -14613,6 +14791,7 @@ class BorgHelper:
                 if htrep: errhost.append(nick)
                 reshos[nick]=self._report_msg_row(nick,tcmpl,htrep)
                 self._report_space(nick,reshos[nick]); self._report_space_mark(nick,reshos[nick],as_json,htrep,errhost)   # 1.0.209 (row 26)
+                self._bkp_absent_mark(nick,reshos[nick],as_json)   # 1.0.217 (story 118, jumelles)
                 if live: self._bkp_live_mark(nick,reshos[nick],live,errhost,htrep,as_json)   # 1.0.183 : aucune archive = déjà alerte, code 1
                 resbck[nick]={}; continue
             maxage=25
@@ -14635,6 +14814,7 @@ class BorgHelper:
                     if nick not in errhost: errhost.append(nick)
                 elif not str(tcmpl[nick]['nom']).startswith('*'): tcmpl[nick]['nom']=f"*** {nick}"
             errcode=max(errcode,self._report_space_mark(nick,tcmpl[nick],as_json,htrep,errhost))   # 1.0.209 (jumelles) : « ~ », ⚠ (code 1)
+            self._bkp_absent_mark(nick,tcmpl[nick],as_json)   # 1.0.217 (story 118, jumelles) : client absent, sans alerte
             sd=tcmpl[nick].pop('size_delta_last','—')
             if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
@@ -14726,6 +14906,7 @@ class BorgHelper:
                 if htrep: errhost.append(nick)
                 reshos[nick]=self._report_msg_row(nick,tcmpl,htrep)
                 self._report_space(nick,reshos[nick]); self._report_space_mark(nick,reshos[nick],as_json,htrep,errhost)   # 1.0.209 (row 26)
+                self._bkp_absent_mark(nick,reshos[nick],as_json)   # 1.0.217 (story 118, jumelles)
                 self._bkp_live_mark(nick,reshos[nick],live,errhost,htrep,as_json)
                 resbck[nick]={}; continue
             if tcmpl[nick].get('duree')==-1:
@@ -14739,6 +14920,7 @@ class BorgHelper:
                     v=tcmpl[nick].get(i)
                     tcmpl[nick][i]=convert_octets_readable(v) if v is not None else ''
                 errcode=max(errcode,self._report_space_mark(nick,tcmpl[nick],as_json,htrep,errhost))
+                self._bkp_absent_mark(nick,tcmpl[nick],as_json)   # 1.0.217 (story 118)
                 tcmpl[nick].setdefault('modifications','—')
                 reshos[nick]=tcmpl[nick]; resbck[nick]={}; continue
             maxage=25
@@ -14761,6 +14943,7 @@ class BorgHelper:
                     if nick not in errhost: errhost.append(nick)
                 elif not str(tcmpl[nick]['nom']).startswith('*'): tcmpl[nick]['nom']=f"*** {nick}"
             errcode=max(errcode,self._report_space_mark(nick,tcmpl[nick],as_json,htrep,errhost))   # 1.0.209 (jumelles) : « ~ », ⚠ (code 1)
+            self._bkp_absent_mark(nick,tcmpl[nick],as_json)   # 1.0.217 (story 118, jumelles) : client absent, sans alerte
             sd=tcmpl[nick].pop('size_delta_last','—')
             if sd!='—': tcmpl[nick]['derniere']+=f" ({sd})"
             tcmpl[nick]['depuis']=f"{tcmpl[nick]['depuis']:.2f} h"
@@ -14974,7 +15157,7 @@ def _sqlite_close_scan(src,extra=(),tests=('codec_selftest','perf_bench','push_s
 # Liste blanche et compte exact de borgHelper ; ceux de borgHelperWWW sont SES constantes (_SCG_WL_WWW, _SCG_SEEN_WWW, 1.0.204 :
 # un changement de WWW seul ne touche plus borgHelper), lues par la garde de borgHelper dans sa source (_src_literal).
 _SCG_WL={'borgHelper':{'_open_db':5,'ensure_cache_db':1,'ensure_diff_db':1,'ensure_history_db':1,'_audit_witness':1}}
-_SCG_SEEN={'borgHelper':120}   # nombre EXACT d'ouvertures analysées (1.0.203 ; 1.0.207, story 85 : +3 — _index_old_snaps, _snap_meta_put, _direct_marker, forme (b) ; 1.0.208, story 87a : +2 — get_storage_measures, storage_unmigrated, forme (b) ; 1.0.209, story 87b : +2 — store_storage_space, get_storage_space, forme (b) ; 1.0.211, story 88 (revue 88-2 row 25) : −2 — idxtop et difftop, une seule connexion chacun ; décision 6 : +1 — _hl_store_pass, forme (b) ; revue 88-3 row 51 : +1 — _hl_write, connexion neuve par écriture, forme (b))
+_SCG_SEEN={'borgHelper':122}   # nombre EXACT d'ouvertures analysées (1.0.203 ; 1.0.207, story 85 : +3 — _index_old_snaps, _snap_meta_put, _direct_marker, forme (b) ; 1.0.208, story 87a : +2 — get_storage_measures, storage_unmigrated, forme (b) ; 1.0.209, story 87b : +2 — store_storage_space, get_storage_space, forme (b) ; 1.0.211, story 88 (revue 88-2 row 25) : −2 — idxtop et difftop, une seule connexion chacun ; décision 6 : +1 — _hl_store_pass, forme (b) ; revue 88-3 row 51 : +1 — _hl_write, connexion neuve par écriture, forme (b) ; 1.0.217, story 118 : +2 — last_bkp_absent, first_bkp_absent, forme (b))
 def _sqlite_close_file(nm,src,extra,wl,seen_want):
     """Partie fichier de la garde : sites non prouvés hors liste blanche `wl` ({fonction: nombre}), liste blanche au nombre exact
     par fonction, nombre exact d'ouvertures analysées `seen_want` (ouverture ajoutée ou retirée, ouvreur devenu invisible : liste à
@@ -25240,7 +25423,7 @@ fail()
             if not ok: print(f"  code {code} stdout {out[-200:]!r} stderr {err[-200:]!r}")
             return ok
         check("D138 ArchiveHistory -j, colonne absente (schéma abîmé) : {error} inchangé",_s68_ah_nocol)
-        _S68_KEYS={'nick','last_backup','bkp_running','bkp_interrupted','bkp_stale','priority_op_running','build','rebuild'}
+        _S68_KEYS={'nick','last_backup','bkp_running','bkp_interrupted','bkp_stale','bkp_absent','priority_op_running','build','rebuild'}   # bkp_absent : 1.0.217 (story 118)
         def _s68_status_corrupt():
             """D148 : Status -n sa,sb, diff.db de sa corrompue -> code 1 en texte et en -j (avant : 0) ; sorties inchangées : les deux
             nicks, sa « base illisible » (texte : « Dernier backup : base illisible (…) », JSON : last_backup.error, mêmes clés), sb
@@ -25304,6 +25487,7 @@ fail()
             try:
                 o=json.loads(out)
                 res['-j']=(code==1 and o[0]=={'nick':'sa','last_backup':None,'bkp_running':None,'bkp_interrupted':None,'bkp_stale':None,
+                                               'bkp_absent':None,   # 1.0.217 (story 118)
                                                'priority_op_running':False,'build':None,'rebuild':None,'error':'no such column: archive_date'}
                            and o[1]['last_backup']['archive']=='a1',code,out[-300:],err[-200:])
             except (ValueError,KeyError,TypeError,IndexError): res['-j']=(False,code,out[-300:],err[-200:])
@@ -25656,7 +25840,8 @@ sys.exit(0)
                     except Exception as e: r=f"{type(e).__name__}: {e}"
                 return (r,)+logs(n0)
             res={}
-            SSHOPT=['-R','2222:localhost:22','-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','x@h']
+            SSHOPT=['-R','2222:localhost:22','-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new',   # 1.0.217 (story 118) :
+                    '-o','BatchMode=yes','-o','ConnectTimeout=30','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6','x@h']   # options du pull
             norm=lambda a: [re.sub(r'borgHelper run [0-9a-f]{32}','borgHelper run R',x) for x in a]
             BORGENV={'BORG_REPO':repo,'BORG_PASSPHRASE':'pw','BORG_REMOTE_PATH':srv,'BORG_EXIT_CODES':'legacy'}
             READ="IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; "
@@ -25976,7 +26161,8 @@ sys.exit(0)
                                            '-o','GlobalKnownHostsFile=/dev/null','-o',f'HostKeyAlias=borghelper-{n}','-o','KnownHostsCommand='+KHC.format(n=n),
                                            '-o','IdentitiesOnly=yes','-i','/root/.ssh/id_borg'])
             BREPO='ssh://borg@127.0.0.1:2222'+repo
-            SSHOPT=['-R','2222:localhost:22','-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','x@h']
+            SSHOPT=['-R','2222:localhost:22','-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new',   # 1.0.217 (story 118) :
+                    '-o','BatchMode=yes','-o','ConnectTimeout=30','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6','x@h']   # options du pull
             ENV0={'BORG_PASSPHRASE':'pw-pull-117','BORG_EXIT_CODES':'legacy'}
             code,out,rl,bc,rows=run('pa',debug=1)
             a=rl[0]['argv'] if len(rl)==1 else []
@@ -26044,6 +26230,338 @@ sys.exit(0)
             if bad: print(f"  {bad}")
             return not bad
         check("Bkp tiré construit par le vrai backup() : SendEnv et commande, inactif = 1.0.215, refus avant ssh, aide OpenSSH < 8.5, Status (story 117)",_pull_bkp_117)
+        def _absent_unit_118():
+            """1.0.217 (story 118, décisions de l'utilisateur des 2026-11-09 et 2026-11-11) : client absent = ssh en 255 sur une erreur
+            RÉSEAU avant borg. Lignes de ssh MESURÉES (OpenSSH 8.9p1, work/s118/messages.md, LC_ALL=fr_FR.UTF-8 comme boex), en dur :
+            refus, délai TCP, réseau/hôte injoignable (IPv4, IPv6), nom non résolu (inconnu, DNS muet), coupure avant l'échange de clés
+            (fermeture, RST, bannière jamais reçue), saut (ProxyCommand -W) dont la cible est fermée ou non résolue, ou fermé -> absent,
+            dernière ligne rendue ; clé d'hôte changée, authentification refusée (aussi du saut), option invalide (aussi client absent),
+            algorithme refusé, route prohibit (« Permission denied »), fichier de clé absent + refus, coupure après l'échange de clés,
+            ServerAlive (« Timeout, server … not responding ») -> échec (None). Motifs ancrés : ligne inconnue avant, après, préfixe ou
+            suffixe, ligne finale de la paire seule -> échec. Revue 1 : paire nue visant `UNKNOWN port 65535` (saut silencieux, bastion
+            muet — mesurés R1) -> échec, absent seulement précédée d'une ligne réseau (R15a, R15b) ; revue 2 row 22 : paire `… UNKNOWN
+            port 65535 timed out` (cible muette derrière un saut, tunnel mort, bastion muet — R22, R15c) -> absent ; avant-dernière ligne
+            autorisée mais pas 1re de paire -> échec. _pull_absent : code ≠ 255, borg tué, enregistrement JSON sur stderr,
+            sortie non vide, stderr vide -> None. Options du pull (_PULL_SSH_OPTS, _pull_ssh_tail) et de la sonde (_pull_probe_argv) en
+            dur. _pull_probe par un `ssh` factice du PATH : argv reçu = _pull_probe_argv, environnement sans BORG_* (PATH, LC_ALL),
+            entrée fermée ; 255 réseau -> absent (dernière ligne) ; 255 authentification -> inconnu ; 1 et 0 -> joignable ; délai
+            total dépassé -> inconnu, groupe tué (aucun reste) ; SER_NAME absente -> inconnu, ssh jamais lancé."""
+            P='ssh: connect to host 127.0.0.1 port 49901: Connection refused'
+            KEX=['kex_exchange_identification: Connection closed by remote host','Connection closed by UNKNOWN port 65535']
+            ABS=[[P],['ssh: Could not resolve hostname bh-s118-absent.invalid: Name or service not known'],
+                 ['ssh: connect to host 10.1.1.2 port 22: Connection timed out'],['ssh: connect to host 10.1.1.2 port 22: Network is unreachable'],
+                 ['ssh: connect to host 10.2.2.2 port 22: No route to host'],['ssh: connect to host 2001:db8::1 port 22: Network is unreachable'],
+                 ['ssh: Could not resolve hostname bh-s118.example.org: Temporary failure in name resolution'],
+                 ['kex_exchange_identification: read: Connection reset by peer','Connection reset by 127.0.0.1 port 42003'],
+                 ['kex_exchange_identification: Connection closed by remote host','Connection closed by 127.0.0.1 port 36097'],
+                 ['Connection timed out during banner exchange','Connection to 127.0.0.1 port 42649 timed out'],
+                 ["Warning: Permanently added '[127.0.0.1]:38953' (ED25519) to the list of known hosts.",
+                  'channel 0: open failed: connect failed: Connection refused','stdio forwarding failed']+KEX,
+                 ['channel 0: open failed: connect failed: Name or service not known','stdio forwarding failed']+KEX,
+                 [P]+KEX,['ssh: connect to host 127.0.0.1 port 42827: Connection refused']+KEX,   # R15b : ProxyJump, saut fermé
+                 ['channel 0: open failed: connect failed: Connection refused','stdio forwarding failed']+KEX,   # R15a
+                 ['Connection timed out during banner exchange','Connection to UNKNOWN port 65535 timed out'],   # revue 2 row 22 : R22a/b, R15c
+                 ["Warning: Permanently added '[127.0.0.1]:38483' (ED25519) to the list of known hosts.",   # R22a2
+                  'Connection timed out during banner exchange','Connection to UNKNOWN port 65535 timed out']]
+            HK=['@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@','@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @',
+                'IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!',
+                'Host key for [127.0.0.1]:38953 has changed and you have requested strict checking.','Host key verification failed.']
+            FAILS=[HK,['claudia@127.0.0.1: Permission denied (publickey).'],['claudia@127.0.0.1: Permission denied (publickey).']+KEX,
+                   ['command-line: line 0: Bad configuration option: bogusoption'],
+                   ['Unable to negotiate with 127.0.0.1 port 38953: no matching host key type found. Their offer: ssh-ed25519'],
+                   ['ssh: connect to host 10.3.3.3 port 22: Permission denied'],
+                   ['Warning: Identity file /x/absente not accessible: No such file or directory.',P],
+                   ["Warning: Permanently added '[127.0.0.1]:36387' (ED25519) to the list of known hosts.",'Connection to 127.0.0.1 closed by remote host.'],
+                   ["Warning: Permanently added '[127.0.0.1]:39459' (ED25519) to the list of known hosts.",'Warning: remote port forwarding failed for listen port 28022',
+                    'Timeout, server 127.0.0.1 not responding.'],
+                   ['bash: line 1: borg-s118-absent: command not found'],
+                   [P,'ligne inconnue'],['ligne inconnue',P],['x'+P],[P+' x'],['Connection closed by 127.0.0.1 port 22'],[KEX[0]],
+                   [KEX[1],KEX[0]],['Connection to 127.0.0.1 port 1 timed out'],[],['   '],
+           KEX,['kex_exchange_identification: read: Connection reset by peer','Connection reset by UNKNOWN port 65535'],   # revue 1 row 1 : paire nue
+           ["Warning: Permanently added '[127.0.0.1]:1' (ED25519) to the list of known hosts.",'stdio forwarding failed']+KEX,   # saut silencieux (R1, R15c)
+           ['channel 0: open failed: connect failed: Connection refused','Connection closed by 127.0.0.1 port 22'],   # row 8 : avant-dernière
+           [P,'Connection reset by 127.0.0.1 port 22']]   # autorisée mais pas 1re de paire
+            res={}
+            for i,ls in enumerate(ABS):
+                rb={'exitcode':255,'stderr':list(ls),'stdout':[]}
+                res[f'absent {i}']=(_ssh_absent_line(ls)==ls[-1] and _pull_absent(rb)==ls[-1],ls)
+                rbn=dict(rb,stderr=[x+'\r' for x in ls]+[''])   # fins de ligne \r et ligne vide : ignorées
+                res[f'absent {i} (\\r, ligne vide)']=(_pull_absent(rbn)==ls[-1],)
+            for i,ls in enumerate(FAILS):
+                res[f'échec {i}']=(_ssh_absent_line(ls) is None and _pull_absent({'exitcode':255,'stderr':list(ls),'stdout':[]}) is None,ls)
+            for lbl,rb in (('code 2',{'exitcode':2,'stderr':[P],'stdout':[]}),('code 1',{'exitcode':1,'stderr':[P],'stdout':[]}),
+                           ('code 0',{'exitcode':0,'stderr':[P],'stdout':[]}),('signal',{'exitcode':-9,'stderr':[P],'stdout':[]}),
+                           ('tué',{'exitcode':255,'stderr':[P],'stdout':[],'killed':True}),
+                           ('ligne --log-json de borg',{'exitcode':255,'stderr':[{'type':'log_message','levelname':'INFO','message':'x'},P],'stdout':[]}),
+                           ('sortie',{'exitcode':255,'stderr':[P],'stdout':['{}']}),('sortie JSON',{'exitcode':255,'stderr':[P],'stdout':[{}]}),
+                           ('stderr vide',{'exitcode':255,'stderr':[],'stdout':[]})):
+                res[f'_pull_absent {lbl} -> None']=(_pull_absent(rb) is None,)
+            res['_pull_absent : sortie vide (lignes blanches) tolérée']=(_pull_absent({'exitcode':255,'stderr':[P],'stdout':['','  ']})==P,)
+            OPTS=('-o','BatchMode=yes','-o','ConnectTimeout=30','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6')
+            res['_PULL_SSH_OPTS en dur']=(_PULL_SSH_OPTS==OPTS and _PULL_PROBE_CONNECT==3 and _PULL_PROBE_WAIT==8,_PULL_SSH_OPTS)
+            c=configparser.ConfigParser(); c.optionxform=str
+            c.read_dict({'k':{'SER_LOGIN':'root','SER_NAME':'c1','SSH_KEY':'/k/id'},'n':{'SER_LOGIN':'root','SER_NAME':'c1'},'x':{'SER_LOGIN':'root'}})
+            T=['-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new',*OPTS,'root@c1']
+            res['_pull_ssh_tail']=(_pull_ssh_tail(c['k'])==T+['-i','/k/id'] and _pull_ssh_tail(c['n'])==T,_pull_ssh_tail(c['k']))
+            PA=['ssh','-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','-o','BatchMode=yes','-o','ConnectTimeout=3','root@c1','-i','/k/id','true']
+            res['_pull_probe_argv']=(_pull_probe_argv(c['k'])==PA,_pull_probe_argv(c['k']))
+            d=os.path.join(tmp,'absent118'); shutil.rmtree(d,ignore_errors=True); os.makedirs(os.path.join(d,'bin'))
+            fake=os.path.join(d,'bin','ssh'); log=os.path.join(d,'probe.jsonl'); mode=os.path.join(d,'mode'); pidf=os.path.join(d,'child.pid')
+            with open(fake+'.tmp','w') as f:
+                f.write(f"""#!{sys.executable}
+import sys,os,json,time,subprocess
+m=open({mode!r}).read()
+open({log!r},'a').write(json.dumps(dict(argv=sys.argv[1:],env={{k:v for k,v in os.environ.items() if k.startswith(('BORG','PATH','LC_ALL','HOME'))}},stdin=sys.stdin.read()))+chr(10))
+if m=='lent':
+    p=subprocess.Popen(['sleep','60']); open({pidf!r},'w').write(str(p.pid)); time.sleep(60)
+sys.stderr.write({{'refus':{P!r}+chr(10),'auth':'root@c1: Permission denied (publickey).'+chr(10),'un':'refus de la commande forcée'+chr(10),
+                  'saut':'Connection timed out during banner exchange'+chr(10)+'Connection to UNKNOWN port 65535 timed out'+chr(10)}}.get(m,''))
+sys.exit({{'refus':255,'auth':255,'un':1,'saut':255}}.get(m,0))
+""")
+            os.chmod(fake+'.tmp',0o700); os.replace(fake+'.tmp',fake)
+            def probe(m,cfg,wait=None):
+                with open(mode,'w') as f: f.write(m)
+                with contextlib.suppress(OSError): os.unlink(log)
+                with mock.patch.dict(os.environ,{'PATH':os.path.join(d,'bin')+os.pathsep+os.environ.get('PATH',os.defpath),'BORG_PASSPHRASE':'fuite'}):
+                    t=time.monotonic(); r=_pull_probe(cfg,wait=wait); dt=time.monotonic()-t
+                try: lg=[json.loads(x) for x in open(log).read().splitlines()]
+                except OSError: lg=[]
+                return r,lg,dt
+            r,lg,_=probe('refus',c['k'])
+            res['sonde : refus -> absent']=(r=={'state':'absent','message':P,'code':255} and len(lg)==1 and lg[0]['argv']==PA[1:]
+                                            and set(lg[0]['env'])=={'PATH','LC_ALL'} and lg[0]['env']['LC_ALL']=='fr_FR.UTF-8' and lg[0]['stdin']=='',r,lg)
+            r,lg,_=probe('saut',c['k'])   # revue 3 row 34 (décision de l'utilisateur) : sonde, délai derrière un saut -> inconnu ; Bkp : absent
+            TP=['Connection timed out during banner exchange','Connection to UNKNOWN port 65535 timed out']
+            res['sonde : délai derrière un saut -> inconnu ; Bkp : absent']=(r=={'state':'inconnu','message':TP[1],'code':255}
+                and _pull_absent({'exitcode':255,'stderr':list(TP),'stdout':[]})==TP[1],r)
+            r,lg,_=probe('auth',c['k'])
+            res['sonde : authentification -> inconnu']=(r=={'state':'inconnu','message':'root@c1: Permission denied (publickey).','code':255},r)
+            r,lg,_=probe('un',c['k']); r0,_,_=probe('zéro',c['k'])
+            res['sonde : codes 1 et 0 -> joignable']=(r=={'state':'joignable','message':None,'code':1} and r0=={'state':'joignable','message':None,'code':0},r,r0)
+            r,lg,dt=probe('lent',c['k'],wait=1.5)
+            try: cp=int(open(pidf).read())
+            except (OSError,ValueError): cp=None
+            gone=False
+            for _ in range(50):
+                if cp and not os.path.exists(f'/proc/{cp}'): gone=True; break
+                time.sleep(0.1)
+            res['sonde : délai dépassé -> inconnu, groupe tué']=(r=={'state':'inconnu','message':'sonde sans réponse en 1.5 s','code':None} and dt<10 and gone,r,dt,cp,gone)
+            r,lg,_=probe('refus',c['x'])
+            res['sonde : SER_NAME absente -> inconnu, ssh jamais lancé']=(r=={'state':'inconnu','message':'clé SER_NAME absente du rc','code':None} and lg==[],r,lg)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Bkp tiré, client absent : messages de ssh mesurés (réseau = absent ; authentification, clé d'hôte, option = échec), options du pull, sonde (story 118)",_absent_unit_118)
+        def _absent_bkp_118():
+            """1.0.217 (story 118, décisions de l'utilisateur) : Bkp tiré par le vrai backup() et le vrai boex ; `ssh` = relais du PATH
+            qui note chaque appel (événement « ssh ») et, selon la destination (SER_NAME), écrit sur stderr les lignes MESURÉES d'un
+            ssh en échec et sort en 255, ou exécute la commande distante (`sh -c`) — borg factice (BORG_EXE) qui note chaque appel
+            (événement « borg »). Sentry (sentry_alert) et mesure de place (_storage_measure) relevés. Client absent (refus ; coupure
+            avant l'échange de clés) : « [ABSENT] <nick>: client injoignable (ssh : <dernière ligne>) — Bkp reporté, pas un échec »
+            (texte en dur), code 1, bkp_status 'absent' FERMÉE (finished_at), aucun Sentry, aucun [ERREUR], aucun borg après le ssh
+            (ni Index ni borg list — nick sans NOIDX ni -I), aucune mesure de place, index-pending gardé. Échecs : clé d'hôte changée,
+            authentification refusée, borg démarré (ligne --log-json) puis connexion coupée (255) -> code 2, 'error', Sentry bkp_error,
+            jamais [ABSENT] ; Bkp NON tiré dont le borg sort en 255 avec un message réseau -> 'error' (jamais absent). Succès (témoin) :
+            mesure de place faite. Status : bkp_absent {attempted_at = started_at de la ligne} (JSON) et ligne « Client absent au dernier
+            Bkp : tentative à … » (texte) ; nick en échec : None ; une fin succès plus récente l'efface ; code de Status inchangé (0).
+            Report -o : « 🔌 client absent (tentative à …) » dans reste, -j client_absent, code inchangé. CLI Bkp -n abs,ok -> code 1,
+            abs 'absent', ok 'success' ; -n abs,hk -> code 2 (le pire). Revue 1 : relais `cut` = ligne --log-json PUIS ligne réseau, 255 ->
+            échec (row 7) ; absent en SSH_ENV = commande (`-T`, row 16) ; écriture 'absent' refusée -> [WARN], le filet ferme en 'error'
+            (row 12) ; Report : marque aux sites jumeaux (prep_report et prep_report_from_db simulés : ligne ordinaire -o et en ligne, dépôt
+            vide en ligne ; row 5) ; previous_bkp_status saute 'absent' (row 11)."""
+            d=os.path.join(tmp,'absbkp118'); shutil.rmtree(d,ignore_errors=True); os.makedirs(os.path.join(d,'bin'))
+            rc=os.path.join(d,'rc'); ev=os.path.join(d,'events.jsonl'); relay=os.path.join(d,'bin','ssh'); fb=os.path.join(d,'borgfx')
+            P='ssh: connect to host abs port 22: Connection refused'
+            LINES={'abs':[P],'kex':['kex_exchange_identification: read: Connection reset by peer','Connection reset by kex port 22'],
+                   'hk':['@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@','@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @',
+                         'Host key for hk has changed and you have requested strict checking.','Host key verification failed.'],
+                   'au':['root@au: Permission denied (publickey).']}
+            with open(relay+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json,subprocess
+a=sys.argv[1:]; i=0; dest=None
+while i<len(a):
+    x=a[i]
+    if x in ('-o','-R','-i','-p','-L','-l','-F','-J','-E','-S','-W','-b','-c','-m','-D','-e','-w','-B','-Q','-O','-I'): i+=2; continue
+    if x.startswith('-'): i+=1; continue
+    if dest is None: dest=x; i+=1; continue
+    break
+cmd=' '.join(a[i:]); h=(dest or '').split('@')[-1]
+open({ev!r},'a').write(json.dumps(dict(who='ssh',host=h,argv=a))+chr(10))
+L={LINES!r}
+if h in L:
+    sys.stderr.write(chr(10).join(L[h])+chr(10)); sys.exit(255)
+rc=subprocess.run(['sh','-c',cmd],stdin=subprocess.DEVNULL).returncode
+if h=='cut':   # revue 1 row 7 : borg a démarré (ligne --log-json) PUIS une ligne « réseau » : jamais absent
+    sys.stderr.write('ssh: connect to host cut port 22: Connection refused'+chr(10)); sys.exit(255)
+sys.exit(rc)
+''')
+            os.chmod(relay+'.tmp',0o700); os.replace(relay+'.tmp',relay)
+            with open(fb+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json
+a=sys.argv[1:]
+open({ev!r},'a').write(json.dumps(dict(who='borg',argv=a[:1]))+chr(10))
+if a[:1]==['create'] and any('-loc-' in x for x in a):   # Bkp NON tiré : borg local qui sort en 255 sur un message réseau
+    sys.stderr.write('ssh: connect to host r port 22: Connection refused'+chr(10)); sys.exit(255)
+if a[:1]==['create']:
+    sys.stderr.write(json.dumps(dict(type='log_message',levelname='INFO',name='borg.output.show-version',message='borgbackup version 1.2.6'))+chr(10))
+    if any('-cut-' in x for x in a): sys.exit(0)   # borg démarré (ligne --log-json) ; le relais coupe ensuite (255)
+    print(json.dumps(dict(archive=dict(name='a1',start='2026-11-11T10:00:00.000000',duration=1,stats=dict(original_size=1,compressed_size=1,
+  deduplicated_size=1,nfiles=1)),cache=dict(stats=dict()))))
+    sys.exit(0)
+if a[:1]==['list']: print('[]' if '--json' in a else ''); sys.exit(0)
+sys.exit(0)
+''')
+            os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+            base=(f"GLOB_ARCH=*\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nBORG_PASSPHRASE=pw-118\nBORG_EXE={fb}\n"
+                  f"BORG_REPO={os.path.join(d,'repo')}\nSER_LOGIN=root\nSSH_REMFO=2222:localhost:22\n")
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\n\n"
+                        +''.join(f"[{n}]\n{base}SER_NAME={n}\nBORG_ARCHNAME={n}\n"+("NOIDX=1\n" if n in ('ok','cut') else '')+"\n"
+                                 for n in ('abs','kex','hk','au','cut','ok'))
+                    +f"[absc]\n{base}SER_NAME=abs\nBORG_ARCHNAME=absc\nSSH_ENV=commande\n\n"
+                        +f"[loc]\n{base.replace('SSH_REMFO=2222:localhost:22'+chr(10),'')}SER_NAME=loc\nBORG_ARCHNAME=loc\nNOIDX=1\n")
+            os.chmod(rc,0o600)
+            PATHENV={'PATH':os.path.join(d,'bin')+os.pathsep+os.environ.get('PATH',os.defpath)}
+            def evs():
+                try: return [json.loads(x) for x in open(ev).read().splitlines()]
+                except OSError: return []
+            def run(nick,extra_env=None):
+                b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+                with contextlib.suppress(OSError): os.unlink(ev)
+                o=io.StringIO(); code=0; sen=[]; sm=[]
+                def _sm(self_,n,cfg,debug=0): sm.append(n); return None
+                with mock.patch.dict(os.environ,dict(PATHENV,**(extra_env or {}))), \
+                     mock.patch.dict(globals(),{'sentry_alert':lambda kind,n,msg,*a,**k: sen.append((kind,n,msg))}), \
+                     mock.patch.object(BorgHelper,'_storage_measure',_sm),contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup(nick)
+                    except SystemExit as e: code=e.code or 0
+                    except Exception as e: code=f"{type(e).__name__}: {e}"
+                hp=b.db.get_history_db(nick)
+                rows=_q(hp,f"SELECT result,finished_at IS NOT NULL,started_at FROM bkp_status WHERE nick='{nick}' ORDER BY rowid") if os.path.exists(hp) else []
+                return code,o.getvalue(),rows,sen,sm,evs(),b
+            res={}
+            b0=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); b0.db.set_index_pending_lock('abs')
+            for nk in ('abs','kex'):
+                code,out,rows,sen,sm,es,b=run(nk)
+                last=LINES[nk][-1]
+                iss=[i for i,e in enumerate(es) if e['who']=='ssh']
+                after=[e for e in es[iss[0]+1:]] if iss else None
+                res[f'{nk} : absent']=(code==1 and f"[ABSENT] {nk}: client injoignable (ssh : {last}) — Bkp reporté, pas un échec\n" in out
+                    and '[ERREUR]' not in out and 'non enregistrée' not in out   # revue 2 row 29
+                    and len(rows)==1 and rows[0][:2]==('absent',1) and sen==[] and sm==[] and len(iss)==1 and after==[]
+                    and any(e['who']=='borg' and e['argv']==['list'] for e in es[:iss[0]]),code,out[-500:],rows,sen,sm,es)
+            res['abs : index-pending gardé']=(b0.db.check_index_pending_lock('abs'),)
+            code,out,rows,sen,sm,es,b=run('absc')   # revue 1 row 16 : SSH_ENV = commande (ssh -T, passphrase sur l'entrée)
+            sa=[e['argv'] for e in es if e['who']=='ssh']
+            res['absc (SSH_ENV = commande) : absent']=(code==1 and f"[ABSENT] absc: client injoignable (ssh : {P}) — Bkp reporté, pas un échec\n" in out
+                and 'non enregistrée' not in out   # revue 2 row 29
+                and len(rows)==1 and rows[0][:2]==('absent',1) and sen==[] and sm==[] and len(sa)==1 and sa[0][0]=='-T',code,out[-400:],rows,sa[:1])
+            fin0=BorgHelperDB.store_bkp_status_finish   # revue 1 row 12 : écriture « absent » refusée -> [WARN], le filet ferme en échec
+            def _fin_ko(self_,n,rid,result,*a,**k): return False if result=='absent' else fin0(self_,n,rid,result,*a,**k)
+            with mock.patch.object(BorgHelperDB,'store_bkp_status_finish',_fin_ko): code,out,rows,sen,sm,es,b=run('kex')
+            res['écriture absent refusée : [WARN], ligne fermée en échec par le filet']=(code==1 and "[WARN] kex: fin « absent » non enregistrée (run_id=" in out
+                and "— la ligne sera fermée en échec (notification d'échec possible)" in out and [x[0] for x in rows]==['absent','error'],code,out[-400:],rows)
+            ssh_argv=[e['argv'] for e in es if e['who']=='ssh']
+            res['argv du ssh : options du pull avant la destination']=(bool(ssh_argv) and ssh_argv[0][:15]==['-o','SendEnv BORG_*','-R','2222:localhost:22','-A',
+                '-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','-o','BatchMode=yes','-o','ConnectTimeout=30','-o','ServerAliveInterval=30']
+                and ssh_argv[0][15:18]==['-o','ServerAliveCountMax=6','root@kex'],ssh_argv[:1])
+            for nk in ('hk','au','cut'):
+                code,out,rows,sen,sm,es,b=run(nk)
+                res[f'{nk} : échec, jamais absent']=(code==2 and '[ABSENT]' not in out and len(rows)==1 and rows[0][:2]==('error',1)
+                    and [x[0] for x in sen]==['bkp_error'],code,out[-400:],rows,sen)
+            code,out,rows,sen,sm,es,b=run('loc')
+            res['Bkp non tiré, borg en 255 « Connection refused » : échec']=(code==2 and '[ABSENT]' not in out and rows and rows[0][0]=='error'
+                and [x[0] for x in sen]==['bkp_error'],code,out[-300:],rows,sen)
+            code,out,rows,sen,sm,es,b=run('ok')
+            res['ok : succès, mesure de place faite (témoin)']=(code==0 and rows and rows[0][:2]==('success',1) and sm==['ok'] and sen==[],code,out[-300:],rows,sm)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()): cj=b.status('abs,hk,ok',as_json=True)
+            try: js={x['nick']:x for x in json.loads(o.getvalue())}
+            except ValueError: js={}
+            st_abs=_q(b.db.get_history_db('abs'),"SELECT started_at FROM bkp_status WHERE nick='abs'")[0][0]
+            res['Status -j : bkp_absent']=(cj==0 and js.get('abs',{}).get('bkp_absent')=={'attempted_at':st_abs}
+                and 'bkp_absent' in js.get('hk',{}) and js['hk']['bkp_absent'] is None and js.get('ok',{}).get('bkp_absent',1) is None,cj,o.getvalue()[-500:])
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o): ct=b.status('abs,hk')
+            t=o.getvalue()
+            res['Status texte']=(ct==0 and t.count("  Client absent au dernier Bkp : tentative à ")==1
+                and "— client injoignable, Bkp reporté (pas un échec)\n" in t and t.index('Client absent')<t.index('hk:'),ct,t[-500:])
+            def rep(n):
+                o=io.StringIO()
+                with contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()): c_=b.report_offline(n,as_json=True)
+                try: return c_,json.loads(o.getvalue())['summary'].get(n,{})
+                except (ValueError,KeyError): return c_,{'_raw':o.getvalue()[-300:]}
+            ca,ra=rep('abs'); ch,rh=rep('hk')
+            res['Report -o -j : client_absent, code inchangé']=(ra.get('client_absent',{}).get('attempted_at')==st_abs and '🔌 client absent (tentative à ' in str(ra.get('reste'))
+                and 'client_absent' not in rh and ca==ch,ca,ra,ch,rh)
+            def _row(n,vide=False):
+                if vide: return {n:{'nom':n,'duree':-1,'taille':1000,'recuperable':None,'reste':5000}},{}
+                return {n:{'nom':n,'date derniere':'2026-11-10 10:00','depuis':3.0,'duree':1.0,'derniere':100,'taille':1000,
+                           'recuperable':None,'reste':5000,'modifications':'—'}},{}
+            sites={}
+            for lbl,fn,mk in (('report_offline, ligne ordinaire','report_offline','prep_report_from_db'),('report, ligne ordinaire','report','prep_report'),
+                              ('report, dépôt vide','report','prep_report')):
+                outs=[]
+                for js_ in (True,False):
+                    o=io.StringIO()
+                    with mock.patch.object(BorgHelper,mk,lambda self_,n,*a,_v=('vide' in lbl),**k: _row(n,_v)), \
+                         contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
+                        c_=getattr(b,fn)('abs',as_json=js_)
+                    outs.append((c_,o.getvalue()))
+                try: rw=json.loads(outs[0][1])['summary']['abs']
+                except (ValueError,KeyError): rw={'_raw':outs[0][1][-300:]}
+                sites[lbl]=(rw.get('client_absent',{}).get('attempted_at')==st_abs and ' — 🔌 client absent (tentative à ' in str(rw.get('reste',''))
+                            and '🔌 client absent (tentative à ' in outs[1][1] and outs[0][0]==outs[1][0],outs[0][0],rw)
+            # revue 2 row 28 : 5e site — report() pendant un Bkp vivant (_bkp_live simulé), aucune archive (_msg de la base)
+            LIVE={'run_id':'r-vivant','en_attente':False,'depuis':'10:00 (0h01min)','started_iso':'2026-11-11T10:00:00Z','orphelin':False,'sans_suivi':False}
+            o=io.StringIO()
+            with mock.patch.object(BorgHelper,'_bkp_live',lambda self_,n,*a,**k: dict(LIVE)), \
+                 mock.patch.object(BorgHelper,'prep_report_from_db',lambda self_,n,*a,**k: ({n:{'nom':n,'_msg':'Aucune archive indexée'}},{})), \
+                 contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()):
+                c_=b.report('abs',as_json=True)
+            try: rw=json.loads(o.getvalue())['summary']['abs']
+            except (ValueError,KeyError): rw={'_raw':o.getvalue()[-300:]}
+            sites['report, Bkp vivant, aucune archive']=(rw.get('client_absent',{}).get('attempted_at')==st_abs and '🔌 client absent (tentative à ' in str(rw.get('reste',''))
+                                                        and 'bkp_en_cours' in rw,c_,rw)
+            res['Report : marque client absent aux sites jumeaux (ordinaire -o, ordinaire, dépôt vide)']=(all(v[0] for v in sites.values()),sites)
+            hp_=b.db.get_history_db('prv'); b.db.ensure_history_db(hp_)   # revue 1 row 11 : un absent n'est jamais « le précédent »
+            for rid,rs in (('p1','error'),('p2','absent'),('p3',None)):
+                b.db.store_bkp_status_start('prv',rid,hp_)
+                if rs: b.db.store_bkp_status_finish('prv',rid,rs,hp_)
+            pv=b.db.previous_bkp_status('prv','p3'); pv0=b.db.previous_bkp_status('prv',None)
+            res['previous_bkp_status : absent sauté, échec d\'avant vu']=(pv is not None and pv['run_id']=='p1' and pv['failed'] is True
+                                                                        and pv0 is not None and pv0['run_id']=='p3',pv,pv0)
+            hp2=b.db.get_history_db('prv2'); b.db.ensure_history_db(hp2)   # revue 2 row 26 : branche run_id None, « error puis absent »
+            for rid,rs in (('q1','error'),('q2','absent')):
+                b.db.store_bkp_status_start('prv2',rid,hp2); b.db.store_bkp_status_finish('prv2',rid,rs,hp2)
+            pq=b.db.previous_bkp_status('prv2',None)
+            res['previous_bkp_status(None) : error puis absent -> l\'échec']=(pq is not None and pq['run_id']=='q1' and pq['failed'] is True,pq)
+            fb0=b.db.first_bkp_absent('abs')   # revue 3 row 36 : 1re ligne absente tant qu'aucun succès, None après
+            b.db.store_bkp_status_start('abs','r-later'); b.db.store_bkp_status_finish('abs','r-later','success')
+            res['first_bkp_absent : 1re tentative absente, None après un succès']=(fb0==st_abs and b.db.first_bkp_absent('abs') is None,fb0,st_abs)
+            lba=getattr(b.db,'last_bkp_absent',None)   # sans garde : un code sans cette méthode lèverait avant le bilan (témoin)
+            res['succès plus récent : plus « client absent »']=('bkp_absent' in b._status_one('abs') and b._status_one('abs')['bkp_absent'] is None
+                                                             and lba is not None and lba('abs') is None,)
+            b.db.store_bkp_status_start('abs','r-abs2'); b.db.store_bkp_status_finish('abs','r-abs2','absent')
+            b.db.store_bkp_status_start('abs','r-err'); b.db.store_bkp_status_finish('abs','r-err','error')
+            res['échec plus récent : plus « client absent »']=('bkp_absent' in b._status_one('abs') and b._status_one('abs')['bkp_absent'] is None,)
+            open(os.path.join(d,'nodsn'),'w').close()
+            cenv={k:v for k,v in os.environ.items() if k not in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE')}
+            cenv.update(PATHENV,BORGHELPERC_SENTRY_FILE=os.path.join(d,'nodsn'))
+            for lst,want in (('abs,ok',1),('abs,hk',2)):
+                n0={n:len(_q(b.db.get_history_db(n),f"SELECT 1 FROM bkp_status WHERE nick='{n}'")) for n in lst.split(',')}
+                p_=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rc,'-c','Bkp','-n',lst],capture_output=True,text=True,timeout=300,
+                                  env=cenv,stdin=subprocess.DEVNULL)
+                last={n:_q(b.db.get_history_db(n),f"SELECT result FROM bkp_status WHERE nick='{n}' ORDER BY rowid")[n0[n]:] for n in lst.split(',')}
+                exp={'abs':[('absent',)],'ok':[('success',)],'hk':[('error',)]}
+                res[f'CLI Bkp -n {lst} : code {want}']=(p_.returncode==want and all(last[n]==exp[n] for n in last)
+                    and f"[ABSENT] abs: client injoignable (ssh : {P}) — Bkp reporté, pas un échec" in p_.stderr,p_.returncode,last,p_.stderr[-400:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Bkp tiré, client absent par le vrai backup() : [ABSENT] code 1, bkp_status absent, ni Sentry ni Index ni mesure ; clé, authentification, borg coupé = échec ; Status, Report, -n ALL (story 118)",_absent_bkp_118)
         def _dbg_mask_116():
             """1.0.215 (story 116, décision de l'utilisateur du 2026-11-09) : trace -d sans secret, tous modes. _dbg_mask : clés
             BORG_PASSPHRASE, BORG_NEW_PASSPHRASE, BORG_PASSCOMMAND, BORGHELPERC_RUNTIME_PASSPHRASE -> '***' (dict) ; valeurs retenues
@@ -34022,6 +34540,137 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
         _w117=None if list_only or not _selected(_n117) else _ssh_ok_117()
         if _w117: skip(_n117,_w117)
         else: _rbc(_n117,_s117_real)
+        def _s118_real():
+            """1.0.217 (story 118) : client absent sur un VRAI sshd de bac (non root, 127.0.0.1, port libre, config, clés et AuthorizedKeysFile
+            absolus dans le bac, PermitUserRC no ; arrêt par PID vérifié) et un VRAI ssh : `ssh` du pull = relais du PATH qui lance le vrai
+            ssh avec l'argv ENTIER reçu de backup() (options du pull comprises) et la commande `true`, précédé de `-F /dev/null`,
+            UserKnownHostsFile du bac, GlobalKnownHostsFile=/dev/null, IdentitiesOnly, HostName=127.0.0.1 et le port du nick (jamais la
+            config ni les known_hosts de l'utilisateur) ; vrai ssh sorti en 255 : son stderr et 255 rendus tels quels ; sinon la commande
+            distante exécutée ICI (client simulé, comme la 117), vrai borg par BORG_EXE de bac. CLI réelle (Sentry neutralisé) : port fermé
+            -> « [ABSENT] rabs: client injoignable (ssh : ssh: connect to host 127.0.0.1 port <p>: Connection refused) — Bkp reporté, pas
+            un échec », code 1, bkp_status 'absent' ; clé d'hôte changée (known_hosts du bac) -> « Host key verification failed. »,
+            code 2, 'error', jamais [ABSENT] ; clé non autorisée -> « Permission denied (publickey). », code 2, 'error' ; Bkp -n rabs,rok
+            -> code 1, rabs 'absent', rok 'success', archive dans le dépôt, Index de fin fait (sentinelle archive_snapshot_indexed) ;
+            argv du pull : BatchMode, ConnectTimeout=30, ServerAliveInterval=30, ServerAliveCountMax=6 juste avant la destination ;
+            ~/.ssh de l'utilisateur au même listing ; known_hosts écrits dans le bac seulement. Attentes en dur."""
+            import pwd
+            kg=shutil.which('ssh-keygen'); rssh=shutil.which('ssh'); sshd=shutil.which('sshd') or '/usr/sbin/sshd'
+            d=os.path.join(tmp,'s118real'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); os.chmod(d,0o700)
+            me=pwd.getpwuid(os.getuid()).pw_name; borg=shutil.which('borg'); PW='pw-s118-réel'
+            for n in ('hk','other','ck','wrong'):
+                r=subprocess.run([kg,'-q','-t','ed25519','-N','','-C',n,'-f',os.path.join(d,n)],capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL)
+                if r.returncode!=0: print(f"  ssh-keygen {n} : {r.stderr[-200:]}"); return False
+            pub=lambda n: ' '.join(open(os.path.join(d,n+'.pub')).read().split()[:2])
+            bb=os.path.join(d,'bb'); w=os.path.join(d,'borgw'); repo=os.path.join(d,'repo'); src=os.path.join(d,'src'); b1=os.path.join(d,'bin')
+            for x in (bb,src,b1): os.makedirs(x)
+            with open(os.path.join(src,'f'),'w') as f: f.write('contenu 118\n')
+            _rb_wrapper(w,bb)
+            r=_rb_run([borg,'init','-e','repokey',repo],120,env=_rb_env(bb,BORG_PASSPHRASE=PW))
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
+            with open(os.path.join(d,'auth_keys'),'w') as f: f.write(pub('ck')+'\n')
+            def free():
+                s_=socket.socket(); s_.bind(('127.0.0.1',0)); p_=s_.getsockname()[1]; s_.close(); return p_
+            port,closed,remfo=free(),free(),free()
+            kh_ok=os.path.join(d,'kh_ok'); kh_hk=os.path.join(d,'kh_hk')
+            with open(kh_hk,'w') as f: f.write(f"[127.0.0.1]:{port} {pub('other')}\n")
+            rlog=os.path.join(d,'relais.jsonl')
+            PORTS={'rabs':closed,'rhk':port,'rau':port,'rok':port}; KH={'rhk':kh_hk}
+            with open(os.path.join(b1,'ssh.tmp'),'w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json,subprocess
+a=sys.argv[1:]; i=0; dest=None
+while i<len(a):
+    x=a[i]
+    if x in ('-o','-R','-i','-p','-L','-l','-F','-J','-E','-S','-W','-b','-c','-m','-D','-e','-w','-B','-Q','-O','-I'): i+=2; continue
+    if x.startswith('-'): i+=1; continue
+    if dest is None: dest=x; i+=1; continue
+    break
+cmd=' '.join(a[i:]); h=(dest or '').split('@')[-1]
+open({rlog!r},'a').write(json.dumps(a[:i])+chr(10))
+real=[{rssh!r},'-F','/dev/null','-o','UserKnownHostsFile='+{KH!r}.get(h,{kh_ok!r}),'-o','GlobalKnownHostsFile=/dev/null',
+      '-o','IdentitiesOnly=yes','-o','HostName=127.0.0.1','-p',str({PORTS!r}.get(h,1))]+a[:i]+['true']
+p=subprocess.run(real,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=120)
+if p.returncode==255:
+    sys.stderr.buffer.write(p.stderr); sys.exit(255)
+data=sys.stdin.buffer.read()
+sys.exit(subprocess.run(['sh','-c',cmd],input=data).returncode)
+''')
+            os.chmod(os.path.join(b1,'ssh.tmp'),0o700); os.replace(os.path.join(b1,'ssh.tmp'),os.path.join(b1,'ssh'))
+            cfgp=os.path.join(d,'sshd_config'); pidf=os.path.join(d,'sshd.pid'); slog=os.path.join(d,'sshd.log')
+            with open(cfgp,'w') as f:
+                f.write(f"Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/hk\nAuthorizedKeysFile {d}/auth_keys\n"
+                        f"PidFile {pidf}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+                        f"PermitUserRC no\nPermitUserEnvironment no\nX11Forwarding no\n")
+            rc=os.path.join(d,'rc'); cache=os.path.join(d,'cache')
+            com=(f"BORG_REPO={repo}\nBORG_PASSPHRASE={PW}\nBORG_EXE={w}\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\nSSH_REMFO={remfo}:localhost:22\n"
+                 f"SER_LOGIN={me}\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\n")
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={cache}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\n\n"
+                        +''.join(f"[{n}]\n{com}SER_NAME={n}\nSSH_KEY={os.path.join(d,'wrong' if n=='rau' else 'ck')}\nBORG_ARCHNAME=::{n}\nGLOB_ARCH={n}-*\n\n"
+                                 for n in ('rabs','rhk','rau','rok')))
+            os.chmod(rc,0o600)
+            hs=pwd.getpwuid(os.getuid()).pw_dir+'/.ssh'
+            def listing():
+                try: return sorted((n,st.st_size,st.st_mtime_ns) for n in os.listdir(hs) for st in [os.lstat(os.path.join(hs,n))])
+                except OSError as e: return repr(e)
+            before=listing(); res={}; pid=None
+            cenv=_rb_cli_env(None,PATH=b1+os.pathsep+os.environ.get('PATH',os.defpath))
+            for k in [k for k in cenv if k.startswith(('BORG_','SSH_AUTH_SOCK','SSH_AGENT'))]: cenv.pop(k)
+            b=BorgHelper(cfgfile=rc,cache_dir=cache)
+            def rows(n):
+                hp=b.db.get_history_db(n)
+                return [x[0] for x in _q(hp,f"SELECT result FROM bkp_status WHERE nick='{n}' ORDER BY rowid")] if os.path.exists(hp) else []
+            def cli(n):
+                p_=_rb_run([sys.executable,os.path.realpath(__file__),'-C',rc,'-c','Bkp','-n',n],600,env=cenv)
+                return p_.returncode,p_.stdout,p_.stderr
+            r=subprocess.run([sshd,'-f',cfgp,'-E',slog],capture_output=True,text=True,timeout=30,stdin=subprocess.DEVNULL)
+            try:
+                for _ in range(100):
+                    if os.path.exists(pidf): break
+                    time.sleep(0.05)
+                try: pid=int(open(pidf).read())
+                except (OSError,ValueError): print(f"  sshd non démarré : code {r.returncode} {r.stderr[-300:]!r}"); return False
+                c,o,e=cli('rabs')
+                res['port fermé : absent']=(c==1 and f"[ABSENT] rabs: client injoignable (ssh : ssh: connect to host 127.0.0.1 port {closed}: Connection refused) — Bkp reporté, pas un échec\n" in e
+                                            and '[ERREUR]' not in e and rows('rabs')==['absent'],c,e[-500:],rows('rabs'))
+                c,o,e=cli('rhk')
+                res['clé d\'hôte changée : échec']=(c==2 and 'Host key verification failed.' in e and '[ABSENT]' not in e and rows('rhk')==['error'],c,e[-500:],rows('rhk'))
+                c,o,e=cli('rau')
+                res['authentification refusée : échec']=(c==2 and f"{me}@127.0.0.1: Permission denied (publickey)." in e and '[ABSENT]' not in e
+                                                          and rows('rau')==['error'],c,e[-500:],rows('rau'))
+                c,o,e=cli('rabs,rok')
+                ix=_q(b.db.get_diff_db('rok'),"SELECT archive FROM archive_snapshot_indexed WHERE nick='rok'") if os.path.exists(b.db.get_diff_db('rok')) else []
+                lst=_rb_run([borg,'list','--short',repo],120,env=_rb_env(bb,BORG_PASSPHRASE=PW))
+                names=lst.stdout.split()
+                res['Bkp -n rabs,rok : code 1, rok sauvegardé et indexé']=(c==1 and rows('rabs')==['absent','absent'] and rows('rok')==['success']
+                    and lst.returncode==0 and len(names)==1 and names[0].startswith('rok-') and [x[0] for x in ix]==names,c,e[-600:],rows('rabs'),rows('rok'),names,ix)
+                rl=[json.loads(x) for x in open(rlog).read().splitlines()] if os.path.exists(rlog) else []
+                OPT=['-o','BatchMode=yes','-o','ConnectTimeout=30','-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6']
+                res['argv du pull : options avant la destination']=(len(rl)==5 and all(x[-len(OPT)-1-2:-3]==OPT and x[-3].startswith(me+'@') for x in rl),rl[:1])
+            finally:
+                if pid:
+                    try:
+                        with open(f'/proc/{pid}/cmdline','rb') as f: cl=f.read()
+                    except OSError: cl=b''
+                    if cfgp.encode() in cl:
+                        with contextlib.suppress(OSError): os.kill(pid,signal.SIGTERM)
+                        for _ in range(100):
+                            if not os.path.exists(f'/proc/{pid}'): break
+                            time.sleep(0.05)
+                        else:
+                            with contextlib.suppress(OSError): os.kill(pid,signal.SIGKILL)
+                    res['sshd arrêté']=(not os.path.exists(f'/proc/{pid}'),pid)
+            res['known_hosts : bac seulement']=(os.path.exists(kh_ok) and f"[127.0.0.1]:{port}" in open(kh_ok).read(),)
+            res['~/.ssh : même listing']=(listing()==before,)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _n118="Bkp tiré, client absent sur vrai sshd de bac et vrai ssh : port fermé absent code 1, clé d'hôte et authentification = échec, -n ALL avec un nick sauvegardé et indexé (story 118)"
+        _w118=None
+        if not list_only and _selected(_n118) and not (shutil.which('ssh') and shutil.which('ssh-keygen') and (shutil.which('sshd') or os.path.exists('/usr/sbin/sshd'))):
+            _w118="ssh, ssh-keygen ou sshd absent"
+        if _w118: skip(_n118,_w118)
+        else: _rbc(_n118,_s118_real)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE

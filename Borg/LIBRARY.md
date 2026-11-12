@@ -181,7 +181,11 @@ bh.backup('mon-serveur')
 bh.backup('mon-serveur', no_index=True)
 # backup() se termine par sys.exit(code) — SystemExit à attraper. 1.0.163 : SystemExit(2) avant tout borg si
 # BORG_ROOTBKP est illisible ou si aucun de ses chemins n'existe (bkp_status 'error', alerte bkp_error) ; 1.0.213 : de même,
-# Bkp tiré (SSH_REMFO), si SSH_ENV n'est ni sendenv ni commande, ou en commande avec une passphrase à saut de ligne
+# Bkp tiré (SSH_REMFO), si SSH_ENV n'est ni sendenv ni commande, ou en commande avec une passphrase à saut de ligne.
+# 1.0.217 : Bkp tiré dont le client est injoignable (ssh sorti en 255 sur une erreur réseau, avant borg) -> SystemExit(1),
+# bkp_status 'absent', « [ABSENT] … » sur stderr, ni Sentry ni Index ; fonctions de module _pull_absent(résultat boex) et
+# _ssh_absent_line(lignes) -> dernière ligne de ssh ou None, _pull_probe(section_rc) -> {state: joignable|absent|inconnu, message, code}
+# (sonde ssh rapide, celle de GET /bkp/probe de borgHelperWWW)
 # backup() ne prend qu'UN nick : la boucle multi-nicks (`-n ALL`, 1.0.167 : un nick après l'autre, pire code, Ctrl-C
 # = sys.exit(130) relancé) est dans la CLI — un appelant Python boucle lui-même en attrapant SystemExit par nick.
 
@@ -448,7 +452,8 @@ from borgHelper import BorgHelper
 bh = BorgHelper()
 
 # bh.backup(nick) écrit une ligne bkp_status (history.db depuis 1.0.139, exclusif à backup()) à son
-# début et à sa fin — 'success'/'error' dérivé du même code retour que sys.exit(). Lecture/réclamation
+# début et à sa fin — 'success'/'error' dérivé du même code retour que sys.exit() ; 1.0.217 : 'absent' (Bkp tiré, client
+# injoignable : ni échec ni succès — ne jamais le traiter comme 'error' par défaut). Lecture/réclamation
 # directes via bh.db, sans passer par sqlite3 : mêmes méthodes que le watcher borgHelperWWW.
 # db_path facultatif : par défaut, la history.db du nick (une lecture ne la crée jamais).
 db_path = bh.db.get_history_db('mon-serveur')
@@ -473,6 +478,11 @@ for row in pending:
 # effacée que par un Bkp plus récent réussi (tué puis réussi -> False ; vivant puis échec -> True) ; timeout_s < 1 s ou
 # invalide : 21600, plafond 10 ans.
 state = bh.db.bkp_running_state('mon-serveur', timeout_s=bh.bkp_status_timeout('mon-serveur'))
+# 1.0.217 : client absent au dernier Bkp fini (dernière fin parmi success/error/absent = absent) -> {run_id, started_at,
+# finished_at}, sinon None (aussi : base absente ou illisible)
+absent = bh.db.last_bkp_absent('mon-serveur')
+# started_at (UTC) de la PREMIÈRE ligne 'absent' du nick, ou None (retard d'un nick sans archive, borgHelperWWW)
+first = bh.db.first_bkp_absent('mon-serveur')
 # Commande Status entière : imprime l'état de chaque nick (texte sur stderr, as_json=True : liste JSON sur stdout). 1.0.193 :
 # rend 1 si un nick finit en erreur (champ `error`, ou `last_backup.error`) ou si un lecteur a dit une erreur SQLite réelle
 # (`[ERREUR]`) pendant l'appel, sinon 0 (avant : None) — la CLI en fait son code de sortie.

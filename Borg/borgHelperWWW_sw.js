@@ -1,4 +1,4 @@
-// SW_VERSION: 1.4.0
+// SW_VERSION: 1.5.0
 // borgHelperWWW — Service Worker des notifications push (spec-push-ui-prefs-json).
 // Servi par borgHelperWWW sur /sw.js (portée : toute l'origine). Ne fait qu'afficher les notifications
 // envoyées par le serveur (watcher bkp_status ou POST /push/test) et, au clic, amener l'onglet
@@ -42,6 +42,9 @@ function describe(d) {
   if (d.event === 'overdue') {
     // Aucune sauvegarde depuis plus de MAX_AGE_BKP heures (SW >= 1.2.0) : alerte, puis rappels.
     const age = hours(d.age_hours), max = hours(d.max_age_hours);
+    // SW >= 1.5.0 (borgHelperWWW >= 1.35.0, story 118) : no_backup — aucun Bkp réussi, client d'un Bkp tiré absent depuis la 1re tentative
+    if (d.no_backup) return {title: `⏰ ${d.reminder ? 'Toujours aucune sauvegarde' : 'Sauvegarde en retard'} — ${nick}`,
+                             body: `Aucune sauvegarde — client absent depuis ${age} (seuil : ${max}). Vérifier que le client est joignable.`};
     return {title: `⏰ ${d.reminder ? 'Toujours aucune sauvegarde' : 'Sauvegarde en retard'} — ${nick}`,
             body: `Dernière sauvegarde il y a ${age} (seuil : ${max}). Vérifier la planification des sauvegardes.`};
   }

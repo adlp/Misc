@@ -531,7 +531,7 @@ avertissement « base non chiffrée »). `DbStatus` l'affiche `plain (aucun chem
 | Table | Contenu | Écrivains | Rétention |
 |---|---|---|---|
 | `repo_stats` | historique des tailles du dépôt (`op` bkp/prune/index) | Bkp, Prune, refresh d'Index | `STATS_RETENTION_MONTHS` |
-| `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
+| `bkp_status` | cycle de vie des Bkp (watcher push, `Status`) ; `result` : `success`, `error`, `absent` (1.0.217 : Bkp tiré, client injoignable — ni échec ni succès) ou `NULL` (en cours) | Bkp seul ; réclamations CAS du watcher | `STATS_RETENTION_MONTHS` |
 | `archive_measure` | par `(nick, archive, archive_date)` : taille dédupliquée à la création, C/E ; `borg_version`, `borg_server_version` (1.0.165 : colonnes ajoutées par introspection dans `ensure_history_db`, ajout pur ; un lecteur d'une base pas encore rouverte en écriture lit `NULL`) ; `reconciled` INTEGER (1.0.187, même ajout : 1 = archive d'un Bkp tué rapprochée, ligne SANS mesure — ni taille ni C/E —, `archive_date=''`) | Bkp ; `reconciled` : rapprochement d'un Bkp tué (`_reconcile_killed_bkp`, Index ou début du Bkp suivant) | tant que l'archive existe dans le dépôt (retirée par le rapprochement, après figeage ; jamais pour une archive seulement hors `GLOB_ARCH`, 1.0.146) |
 | `archive_chart` (1.0.140) | par `(nick, archive, archive_date)` : ligne de graphique figée (`_CHART_FIELDS` + `gone`) | rapprochement de la base servie, `DIFF_KEEP` | `STATS_RETENTION_MONTHS`, que l'archive existe ou non |
 | `storage_space` (1.0.209) | place du DÉPÔT du nick à la fin d'un Bkp : `storage_id` (sha256 de l'étiquette fusionnée, 24 car.), `label` (cette étiquette : `user@hôte`, nom `STORAGE`, `local <montage>` — jamais un chemin d'archive), `repo_key` (sha256 du repo_id : chemin résolu, sinon écrit), `repo_wkey` (sha256 du chemin ÉCRIT, `~` non développé : Storage et Report retrouvent la mesure sans résoudre), `source` (`df_local`, `df_ssh`, `declared`, `unknown`), `free`, `size`, `used` (système de fichiers ou `STORAGE_SIZE`, bornés par le quota), `used_repos` (taille des dépôts du stockage), `growth_per_month` (jamais exposée), `quota` (dépôt de cette machine), `reason` (sources écartées, sans chemin), `measured_at` UTC | Bkp (`_storage_measure`) | `STATS_RETENTION_MONTHS` (la plus récente gardée) |
@@ -3064,6 +3064,74 @@ refus : bkp_status inchangé). Valeur à `%` mal formée : `_RcValueError` (comm
   forcée, BORG_BASE_DIR de bac, sans BORG_RELOCATED_REPO_ACCESS_IS_OK ; dépôt joint par l'URL construite vérifié par
   l'emplacement de la sécurité du borg client et les connexions acceptées du sshd ; clé étrangère et alias sans clé : 255 ; Bkp
   à clé étrangère : échec, aucune archive). Témoin : les trois échouent sur le code 1.0.215 (`work/s117/temoin-run2.log`).
+
+**Bkp tiré : client absent (1.0.217, story 118, décisions de l'utilisateur des 2026-11-09 et 2026-11-11)** : `_pull_ssh_tail(cfg,
+opts)` — seule construction de la fin de l'argv du ssh du pull (`-A -o VisualHostKey=no -o StrictHostKeyChecking=accept-new <opts>
+<SER_LOGIN>@<SER_NAME> [-i SSH_KEY]`, découpage sur les espaces de 1.0.216 gardé) ; `backup()` passe `_PULL_SSH_OPTS` (`BatchMode=yes`,
+`ConnectTimeout=30`, `ServerAliveInterval=30`, `ServerAliveCountMax=6`), la sonde de borgHelperWWW `BatchMode=yes`,
+`ConnectTimeout=_PULL_PROBE_CONNECT` (3). Valeurs et messages : `work/s118/messages.md` (OpenSSH 8.9, sshd de bac, espaces de noms
+réseau jetables pour les routes, relais TCP pour les coupures).
+- Classement : `_ssh_absent_line(lines)` -> dernière ligne si TOUTES les lignes non vides (`strip`) sont « réseau » : dernière =
+  `_SSH_ABSENT_LAST` (`ssh: connect to host \S+ port N: <ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH>` en anglais, ou `ssh: Could
+  not resolve hostname \S+: <EAI_NONAME|EAI_AGAIN>`) ou paire finale `_SSH_ABSENT_PAIRS` (`kex_exchange_identification: …` + `Connection
+  closed|reset by …` ; `Connection timed out during banner exchange` + `Connection to … timed out`) ; lignes d'avant : `_SSH_ABSENT_BEFORE`
+  (lignes « réseau », `channel N: open failed: connect failed: …`, `stdio forwarding failed`, `Warning: Permanently added …`) ; tout
+  ancré (`re.match` + `\Z`). Sinon None. Message inconnu, clé d'hôte, authentification (aussi d'un saut : sa ligne précède la paire),
+  option, `prohibit` (« Permission denied »), « Timeout, server … not responding » : None = échec. Revue 1 row 1 (mesuré R1) :
+  paire `closed`/`reset` dont la 2e ligne vise `UNKNOWN port 65535` (`_SSH_ABSENT_PROXY`) -> absent seulement si une ligne de `body`
+  est une preuve réseau (`_SSH_ABSENT_EVIDENCE` : ligne `ssh: connect …`/`Could not resolve …` du saut, `channel N: open failed:
+  connect failed: …`) ; paire nue (saut silencieux) : None. Revue 2 row 22 (mesuré R22) : paire `… UNKNOWN port 65535 timed out`
+  (délai derrière un saut) : absent, sans preuve exigée. `-o LogLevel=ERROR` non posé (mesuré : perd F4, F8 et la dernière ligne
+  derrière un saut).
+- `_pull_absent(rb)` (résultat boex) : `exitcode == 255`, pas `killed`, aucun élément non texte sur stderr (un enregistrement
+  `--log-json` = borg a démarré), sortie vide (lignes blanches tolérées), puis `_ssh_absent_line`. `backup()` l'appelle seulement si
+  `preBorg` n'est pas `None` (Bkp tiré), juste après le `boex` du create, AVANT tout calcul de `newretC` : `[ABSENT] <nick>: client
+  injoignable (ssh : <ligne>) — Bkp reporté, pas un échec` (printer, stderr ; sous `-d`, les lignes de ssh d'abord),
+  `store_bkp_status_finish(…,'absent')` (False -> `[WARN] … fin « absent » non enregistrée …`, revue 1 row 12), `sys.exit(1)` — donc ni `create_mute_fail`, ni Sentry `bkp_error`, ni archive/mesures, ni
+  Index (pris seulement si `newretC == 0` et une sortie), ni `_space()` (mesure de place), ni JSON ; `index-pending` jamais touché ;
+  le `finally` rend `priority.lock`, le filet `store_bkp_status_safety_net` ne voit plus la ligne (fermée) et le marqueur est retiré.
+  Limite : si l'écriture de `absent` échoue (SQLite), le filet ferme la ligne en `error` (push d'échec du watcher) — comme une fin
+  normale dont l'écriture échoue. `Bkp -n ALL` : inchangé (le pire des codes ; absent = 1).
+- `BorgHelperDB.last_bkp_absent(nick)` : dernière ligne FINIE parmi `success|error|absent` (`finished_at` puis `rowid`), rendue
+  seulement si `absent` ; jamais de création, lecture impossible -> None. `_bkp_absent_view` -> `{attempted_at: started_at}` ;
+  `_status_one` -> `bkp_absent` (aussi `null` dans la ligne d'erreur de `status()`) ; `_status_print_one` ; Report :
+  `_bkp_absent_mark` (jumelles report/report_offline : lignes ordinaires, « aucune archive », dépôt vide de `report`) — `reste`
+  suffixé, `-j` `client_absent`, jamais d'alerte ni de code.
+- Sonde (borgHelperWWW) : `_is_pull(cfg)` (SSH_REMFO non vide, règle de `backup()`), `_pull_probe_argv(cfg)` (`ssh` + tail +
+  `true`), `_pull_probe(cfg, wait=_PULL_PROBE_WAIT)` : `Popen` en session propre, entrée fermée, environnement `PATH` + `LC_ALL`,
+  délai -> `killpg(SIGKILL)` + `inconnu` ; code ≠ 255 -> `joignable` ; 255 -> `absent` si `_ssh_absent_line`, sinon `inconnu` (revue 3
+  row 34, décision de l'utilisateur : dernière ligne `Connection to UNKNOWN port 65535 timed out` (_SSH_PROBE_PROXY_TIMEOUT) -> `inconnu`
+  pour la sonde seulement) ;
+  `KeyError` (SER_LOGIN/SER_NAME) ou rc illisible -> `inconnu`, ssh jamais lancé. borgHelperWWW : `_pull_probe_cached` (dict
+  `_PULL_PROBES` nick -> (monotonic, résultat), `_PULL_PROBE_TTL` 30 s, un verrou par nick : la 2e requête attend la 1re puis lit
+  son résultat) ; route `GET /bkp/probe` (`_ROUTE_LEVELS` 2, `_ROUTE_OPS` `bkp`) ; `/access` `bkp_pull`. Revue 1 : `_pull_probe_ttl`
+  (« inconnu » sur 255 : `_PULL_PROBE_TTL_AUTH` = 600 s — anti-bannissement), verrou attendu `_PULL_PROBE_WAIT`+6 s au plus (sinon
+  « inconnu » sans sonde), `message` rendu pour `absent` seulement, `DEFAULT` et toute section `_…` (revue 2 row 31) -> 404, tag
+  `mutation`. Cache et verrous par processus (`--workers N` : jusqu'à N sondes). `_check_overdue` : sans archive,
+  `BorgHelperDB.first_bkp_absent` (MIN `started_at` des lignes 'absent', UTC ; None dès qu'un `success` existe — revue 2 row 23) sert
+  de « dernière » date (clé de réservation « (aucune archive : client absent) »), charge `no_backup` et Sentry « Aucune sauvegarde —
+  <nick> : client absent depuis X h » (revue 2 row 25 ; service worker SW 1.5.0).
+
+Lecteurs de `bkp_status.result` (inventaire de la story 118 ; « absent » jamais lu comme `error` par défaut ni comme succès) :
+
+| Lecteur | Lecture | Avant 1.0.217 | Avec `absent` |
+|---|---|---|---|
+| `_BKP_OPEN_WHERE` (Status, `/access`, BkpReconcile, `open_bkp_runs`, `get_running_bkp_status`, `bkp_running_state`) | ligne ouverte = `finished_at IS NULL` sans Bkp plus récent en `success` | — | ligne absente fermée : jamais ouverte ; un absent n'efface pas une ligne tuée plus ancienne (comme `error`) |
+| `store_bkp_status_safety_net` | `finished_at IS NULL` seulement | — | ligne déjà fermée : intacte |
+| `previous_bkp_status` (Report pendant un Bkp) | `failed = result=='error'` ou jamais fini et marqueur mort | — | revue 1 row 11 : lignes 'absent' SAUTÉES (`result IS NOT 'absent'`) — jamais « le précédent », un échec d'avant reste vu |
+| `bkp_status_open` (`_bkp_live`, orphelin de Report) | `finished_at IS NULL` | — | ligne absente jamais ouverte |
+| `first_bkp_absent` (nouveau, `_check_overdue` de WWW) | MIN `started_at` des 'absent', None dès qu'un `success` existe (revue 2 row 23) | — | retard d'un nick sans aucun Bkp réussi (`no_backup`) |
+| Versions mélangées : borgHelperWWW < 1.35.0 | `kind='error'` pour tout non-succès | — | push « échec » pour un absent : mettre à jour WWW avec borgHelper |
+| `list_pending_bkp_status` + watcher `_bkp_status_watcher_pass_1` (WWW) | `result` de la ligne finie, `_send_bkp_push(end, result)` (`kind='error'` pour tout non-succès) | push « échec » pour tout non-succès | `absent` : réclamée (CAS), journal « result=absent (client absent) — aucune notification », AUCUN push ni Sentry |
+| `_send_bkp_push` (WWW) | `kind` = success si `result=='success'`, sinon error | — | `end` + `absent` : retour immédiat (défense : jamais un push « échec ») |
+| `_reconcile_interrupted` / `_reconcile_claim_error` (WWW, BkpReconcile) | lignes ouvertes seulement | — | jamais une ligne absente |
+| `_check_overdue` (WWW) | dernière archive (`archive_stats`), pas `result` | — | seule alerte d'un client longtemps absent ; sans archive : 1re tentative absente (revue 1 row 4) |
+| `last_bkp_status` -> `/access bkp_last` -> UI `pollAccess` | `run_id`, `finished_at` (le `result` n'est pas lu par l'UI) | — | fin comme une autre : suivi du ▶ Backup terminé, carte rechargée |
+| `last_bkp_absent` (nouveau : Status, Report) | dernière fin parmi `success|error|absent` | — | « client absent » tant qu'aucune fin succès/échec plus récente |
+| Rétention (`store_bkp_status_start` : `DELETE … started_at <`) | aucune | — | inchangée |
+| Copie vers `history.db` (`INSERT OR IGNORE` de la migration 1.0.139/1.0.201) | colonnes copiées telles quelles | — | `absent` copié tel quel |
+| `close_bkp_status_reconciled` | `finished_at IS NULL` seulement | — | jamais une ligne absente |
+| `bkp_status_notified`, `claim_bkp_status(_start)`, `list_pending_bkp_status_start` | `notified_at`, `start_notified_at` | — | inchangés (le début d'un Bkp absent est notifié comme tout début) |
 
 **Trace -d sans secret (1.0.215, story 116, décision de l'utilisateur du 2026-11-09)** : seul masquage de la trace, `_dbg_mask(obj)`
 (copie : `dict`, `list`, `tuple` récursifs, texte ; autre type tel quel). Clés `_DBG_SECRET_KEYS` (`BORG_PASSPHRASE`,

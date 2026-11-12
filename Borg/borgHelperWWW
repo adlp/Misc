@@ -80,12 +80,13 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
                          _MIGR_PENDING_TXT,   # 1.31.16 : mesures d'avant 1.0.139 pas encore migrées (_never_cache), borgHelper 1.0.201
                          _rc_err_text,   # 1.34.1 (story 96) : erreur de lecture du rc sans le contenu de la ligne
                          _storage_merge,   # 1.33.0 (story 87a) : /storage multi-rc (mode dossier) — dépôts réunis, compté une fois
-                         _state_load, _storage_alert_path)   # 1.34.0 (story 87b) : état d'alerte des stockages (CACHE_DIR de chaque rc)
+                         _state_load, _storage_alert_path,   # 1.34.0 (story 87b) : état d'alerte des stockages (CACHE_DIR de chaque rc)
+                         _is_pull, _pull_probe, _PULL_PROBE_WAIT)   # 1.35.0 (story 118) : sonde du client d'un Bkp tiré
 
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.34.2"
+WWW_VERSION="1.35.0"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -899,6 +900,12 @@ def _bkp_status_watcher_pass_1():
                 if not bh.db.claim_bkp_status(b,row['run_id'],hist):
                     continue  # déjà réclamée par un autre worker (CAS perdu) — jamais de double traitement
                 result=row['result'] if row['finished_at'] else 'error'  # AD-7 : jamais fini = échec
+                if result=='absent':
+                    # 1.35.0 (story 118, décision de l'utilisateur) : Bkp tiré, client injoignable (borgHelper 1.0.217) — ni échec ni
+                    # succès : ligne réclamée (jamais retraitée), journal seul, AUCUN push ni Sentry ; seul le retard (MAX_AGE_BKP) alerte
+                    print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={row['run_id']} result=absent (client absent) — aucune notification",
+                          file=sys.stderr,flush=True)
+                    continue
                 # borgHelper >= 1.0.118 : statuts C/E de borg create (absents = inconnus).
                 warnings={k:row.get(k) for k in ('changed_during_backup','read_errors')}
                 print(f"[watcher] bkp_status (fin) réclamé : nick={nick} run_id={row['run_id']} result={result}"
@@ -1072,7 +1079,8 @@ def _check_overdue(nick,db_path):
     Sauvegarde en retard (1.24.0) : dernière archive connue plus vieille que MAX_AGE_BKP heures
     (même règle que Report, qui marque déjà ce nick en erreur) -> notification push de type ÉCHEC.
     Une alerte au franchissement du seuil, puis un rappel à chaque période MAX_AGE_BKP supplémentaire
-    (2x, 3x...), jusqu'à la prochaine archive. Rien si aucune archive connue, si un Bkp est en cours
+    (2x, 3x...), jusqu'à la prochaine archive. Rien si aucune archive connue (1.35.0, story 118 : sauf nick SANS AUCUN Bkp réussi
+    dont les Bkp trouvent le client absent — retard compté depuis la 1re tentative absente, charge `no_backup`), si un Bkp est en cours
     (il peut simplement être long ; bloqué au-delà de BKP_STATUS_TIMEOUT, il est déjà traité en
     échec ; 1.31.5 : au sens de Status, _bkp_state — vivant, en attente de l'Index, borg create orphelin ; un Bkp tué sans
     rien de vivant ne suspend plus l'alerte), si l'envoi push est indisponible, ou si personne n'est abonné aux échecs de ce host —
@@ -1080,8 +1088,14 @@ def _check_overdue(nick,db_path):
     reçoit l'alerte au passage suivant, pas seulement au rappel d'après."""
     if DIR_MODE and nick.partition(':')[0] in _RC['suspended']: return   # décision 10 : préfixe réattribué, alertes suspendues
     bh,b=_bhn(nick)   # 1.32.0 : rc du nick ; réservation et notification sous le nick exposé
-    last=bh.db.last_archive_stat(b,db_path)
-    if last is None: return
+    last=bh.db.last_archive_stat(b,db_path); nob=False
+    if last is None:
+        # 1.35.0 (story 118, revue 1 row 4 ; revue 2 row 23) : nick sans archive et SANS AUCUN Bkp réussi, dont les Bkp trouvent le
+        # client absent (nom ou port faux d'un nouveau client tiré) -> retard compté depuis la PREMIÈRE tentative absente (started_at,
+        # UTC) : seul MAX_AGE_BKP alerte. Un Bkp réussi (diff.db absente, illisible ou vide) : rien, comme avant
+        fa=bh.db.first_bkp_absent(b)
+        if fa is None: return
+        last=("(aucune archive : client absent)",fa.replace(' ','T')+'+00:00'); nob=True
     archive,archive_date=last
     age=_archive_age_hours(archive_date)
     cfg=bh.borg.cfgread(b)
@@ -1093,18 +1107,20 @@ def _check_overdue(nick,db_path):
     # Alerte Sentry (1.26.8, SENTRY_ALERTS=overdue) : canal indépendant du push — réservation propre
     # ('<nick>#sentry' dans overdue_alerts), mêmes rappels à chaque période MAX_AGE_BKP.
     if 'overdue' in _sentry_alert_kinds(cfg) and _overdue_claim(f"{nick}#sentry",archive,level):
-        sentry_alert('overdue',nick,f"Sauvegarde en retard — {nick} : dernière il y a {age:.0f} h "
-                     f"(seuil MAX_AGE_BKP {max_age:g} h{', rappel' if level>1 else ''})",cfg,
+        sentry_alert('overdue',nick,(f"Aucune sauvegarde — {nick} : client absent depuis {age:.0f} h " if nob else   # revue 2 row 25
+                                     f"Sauvegarde en retard — {nick} : dernière il y a {age:.0f} h ")
+                     +f"(seuil MAX_AGE_BKP {max_age:g} h{', rappel' if level>1 else ''})",cfg,
                      extra={'age_hours':round(age,1),'max_age_hours':max_age,'level':level},
                      release=f"borgHelperWWW@{WWW_VERSION}")
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None: return
     if _push_muted(nick): return  # pause : alerte NON consommée, envoyée à la reprise si le retard persiste
     if not _push_subscriptions_for(nick,'error'): return
     if not _overdue_claim(nick,archive,level): return
-    print(f"[watcher] sauvegarde en retard : nick={nick} dernière archive il y a {age:.1f} h "
-          f"(MAX_AGE_BKP={max_age:g} h, alerte n°{level})",file=sys.stderr,flush=True)
+    print(f"[watcher] sauvegarde en retard : nick={nick} "+(f"aucune sauvegarde, client absent depuis {age:.1f} h " if nob else
+          f"dernière archive il y a {age:.1f} h ")+f"(MAX_AGE_BKP={max_age:g} h, alerte n°{level})",file=sys.stderr,flush=True)
     _send_bkp_push(nick,'overdue','error',{'age_hours':round(age,1),'max_age_hours':max_age,
-                                           'last_backup':str(archive_date),'reminder':level>1})
+                                           'last_backup':str(archive_date),'reminder':level>1,
+                                           'no_backup':True if nob else None})   # revue 2 row 25 : None omis (charge inchangée sinon)
 
 _STORAGE_PUSH_TRIES=5          # revue 87b (row 71) : envois d'un franchissement à un abonné au plus (échecs transitoires)
 _STORAGE_PUSH_BACKOFF=60       # s : attente avant le 3e essai, doublée ensuite (le 2e : passage suivant du watcher)
@@ -1725,6 +1741,7 @@ _ROUTE_LEVELS={
     '/storage':1,   # 1.33.0 (story 87a) : sans `nick` — la route ne compte que les nicks que l'appelant peut lire (_storage_nicks)
     '/restore/perms':1,'/download/file':1,'/download/tar':1,
     '/bkp':2,'/index':2,'/restore':2,'/cacheclean':2,
+    '/bkp/probe':2,   # 1.35.0 (story 118) : sonde du client d'un Bkp tiré (bouton ▶ Backup) — même niveau que /bkp
     '/prune':3,'/delbkp':3,'/idxpurge':3,'/init':3,'/key':3,
     # Story 2a (spec-notifications-push) : ces routes n'ont PAS de paramètre de requête `nick` (un
     # abonnement porte plusieurs nicks, figés dans scope_nicks à la création — jamais un nick unique
@@ -2042,7 +2059,7 @@ def _check_group_access(request: Request):
 # ── Dépôts externes : opérations permises (1.28.0, story 7, AD-12) ──────────────────────────────────
 # Seule la table route -> nature d'opération vit ici ; ce qui est permis sur un nick vient toujours de op_allowed
 # (borgHelper), jamais d'une liste recopiée. Active même sans GROUPS_HEADER : EXTERNAL_OPS n'est pas du RBAC.
-_ROUTE_OPS={'/bkp':'bkp','/init':'bkp','/login':'bkp','/restore':'restore','/download/file':'restore',
+_ROUTE_OPS={'/bkp':'bkp','/bkp/probe':'bkp','/init':'bkp','/login':'bkp','/restore':'restore','/download/file':'restore',
             '/download/tar':'restore','/prune':'prune','/delbkp':'delete'}
 
 def _check_external_ops(request: Request):
@@ -2910,10 +2927,12 @@ def _push_subscriptions_for(nick,kind):
 
 def _send_bkp_push(nick,event,result,warnings=None):
     """Envoie un push réel à chaque abonnement matché pour cet événement (`event`: 'start'|'end'|
-    'overdue', `result`: None pour un début, 'success'/'error' pour une fin, 'error' pour un retard). Erreur définitive (404/410,
+    'overdue', `result`: None pour un début, 'success'/'error' pour une fin ('absent' : rien envoyé, story 118), 'error' pour un
+    retard). Erreur définitive (404/410,
     abonnement mort côté navigateur) -> désabonnement automatique ; toute autre erreur (réseau,
     autre code HTTP, exception non-WebPushException) -> journalisée seule, abonnement conservé,
     jamais de retry (voir Design Notes du spec — la ligne bkp_status est déjà réclamée par CAS)."""
+    if event=='end' and result=='absent': return   # 1.35.0 (story 118) : client absent — jamais un push (ni « échec » ni « succès »)
     if not _PYWEBPUSH_AVAILABLE or PUSH_VAPID_PRIVATE_KEY is None:
         return  # dépendance optionnelle (pywebpush/py_vapid) absente — voir avertissement au démarrage
     muted=_push_muted(nick)
@@ -4614,12 +4633,17 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
         """1.28.0 (story 7, AD-10/AD-12) : dépôt externe, opérations permises (allowed_ops de borgHelper), état de
         construction et Bkp en cours — lectures locales comme Status (jamais borg, rien créé)."""
         out={'external':False,'ops':None,'build':None,'rebuild':None,'bkp_running':None,'bkp_detail':None,'bkp_interrupted':None,
-         'index_last':None,'bkp_last':None}
+         'index_last':None,'bkp_last':None,'bkp_pull':None}
         try:
             cfg=_cfgread(n)
             if cfg is not None: out.update(external=is_external(cfg),ops=allowed_ops(cfg,n))
         except SystemExit: out.update(external=None,ops=['read'])   # EXTERNAL invalide : les routes d'action refusent
         except Exception: pass
+        # 1.35.0 (story 118) : Bkp tiré (SSH_REMFO non vide) — l'UI ne sonde (GET /bkp/probe) que ces nicks ; None : rc illisible
+        try:
+            cfg=_cfgread(n)
+            out['bkp_pull']=bool(_is_pull(cfg)) if cfg is not None else None
+        except (Exception,SystemExit): out['bkp_pull']=None
         try:
             bh,b=_bhn(n); st=bh._status_one(b)
             out.update(build=st.get('build'),rebuild=st.get('rebuild'))
@@ -4861,6 +4885,61 @@ def bkp(nick: str, no_index: bool=False, x_api_key: Optional[str]=Header(default
     return CommandResult(exitcode=0,
         stdout=f"Sauvegarde démarrée pour {nick} (pid {pid}) — asynchrone, résultat via bkp_status/watcher",
         stderr="")
+
+# 1.35.0 (story 118, décisions de l'utilisateur des 2026-11-09 et 2026-11-11, Q4) : sonde du client d'un Bkp tiré pour le bouton
+# ▶ Backup — ssh rapide (même destination, clé et options que le Bkp, BatchMode, ConnectTimeout 3 s, commande `true` : _pull_probe de
+# borgHelper), résultat gardé _PULL_PROBE_TTL s par nick (« inconnu » sur 255 : _PULL_PROBE_TTL_AUTH), UNE sonde à la fois par nick (les
+# appels simultanés attendent la sienne, _PULL_PROBE_WAIT+6 s au plus — sonde bornée + arrêt du groupe —, puis lisent son résultat).
+# Nick non tiré : aucune sonde. Par processus (chaque worker garde les siennes).
+_PULL_PROBE_TTL=30
+# revue 1 row 3 : « inconnu » sur un 255 NON réseau (authentification refusée, clé d'hôte…) gardé 10 min — une sonde en échec
+# d'authentification toutes les 30 s ferait bannir le serveur par le client (fail2ban, PerSourcePenalties), et les Bkp suivants
+# verraient ce bannissement comme un client absent
+_PULL_PROBE_TTL_AUTH=600
+_PULL_PROBES={}   # nick exposé -> (monotonic de la fin de la sonde, résultat)
+_PULL_PROBE_LOCKS={}; _PULL_PROBE_LOCKS_LOCK=threading.Lock()
+
+def _pull_probe_ttl(r):
+    return _PULL_PROBE_TTL_AUTH if r.get('state')=='inconnu' and r.get('code')==255 else _PULL_PROBE_TTL
+
+def _pull_probe_cached(nick,cfg):
+    """Résultat de _pull_probe du nick, gardé _pull_probe_ttl s (30 s ; 10 min pour un « inconnu » sur 255) : {state, message, code,
+    checked_at, cached, age_s}. Revue 1 row 14 : verrou du nick attendu _PULL_PROBE_WAIT + 6 s au plus (sonde bornée + arrêt) — au-delà,
+    « inconnu » sans sonde (jamais un fil du serveur bloqué sans fin)."""
+    with _PULL_PROBE_LOCKS_LOCK: lk=_PULL_PROBE_LOCKS.setdefault(nick,threading.Lock())
+    if not lk.acquire(timeout=_PULL_PROBE_WAIT+6):
+        return {'state':'inconnu','message':None,'code':None,'checked_at':None,'cached':False,'age_s':None}
+    try:
+        e=_PULL_PROBES.get(nick); now=time.monotonic()
+        if e and now-e[0]<_pull_probe_ttl(e[1]): return dict(e[1],cached=True,age_s=round(now-e[0],1))
+        r=_pull_probe(cfg)
+        r['checked_at']=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+        _PULL_PROBES[nick]=(time.monotonic(),r)
+        return dict(r,cached=False,age_s=0.0)
+    finally: lk.release()
+
+@router.get("/bkp/probe",tags=["mutation"],   # revue 1 row 17 : niveau écriture (comme POST /bkp), lance un ssh sortant
+    summary="Bkp tiré : client joignable ? Sonde ssh rapide (ConnectTimeout 3 s), résultat gardé 30 s (« inconnu » sur 255 : 10 min) — nick non tiré : aucune sonde",
+    description="Réponse : `{nick, pull, state, message, code, checked_at, cached, age_s}` ; `pull` false (pas de SSH_REMFO) : "
+        "aucune sonde, `state` null. `state` : `joignable` (ssh sorti autrement qu'en 255), `absent` (255 sur une erreur réseau : "
+        "refus, délai, hôte ou réseau injoignable, nom non résolu, coupure avant l'échange de clés), `inconnu` (autre 255 — "
+        "authentification, clé d'hôte — gardé 10 min, sonde sans réponse en 8 s). `message` : dernière ligne de ssh, pour `absent` "
+        "seulement. Voir README.md.")
+def bkp_probe(nick: str, x_api_key: Optional[str]=Header(default=None)):
+    require_api_key(x_api_key)
+    bare=str(nick).rpartition(':')[2]
+    # revue 1 row 6, revue 2 row 31 : [DEFAULT] et toute section `_…` (règle de cfgreadnicks) ne sont pas des nicks (cfgread les rend)
+    cfg=None if bare.upper()=='DEFAULT' or bare.startswith('_') else _cfgread(nick)
+    if cfg is None: raise HTTPException(404,detail=f"Nick inconnu : {nick}")
+    try: pull=_is_pull(cfg)
+    except configparser.Error as e:
+        raise HTTPException(500,detail=f"{nick} : configuration illisible ({_rc_err_text(e)}) — sonde refusée")
+    out={'nick':nick,'pull':bool(pull),'state':None,'message':None,'code':None,'checked_at':None,'cached':False,'age_s':None}
+    if not pull: return out
+    r=_pull_probe_cached(nick,cfg)
+    out.update({k:r.get(k) for k in ('state','code','checked_at','cached','age_s')})
+    if r.get('state')=='absent': out['message']=r.get('message')   # revue 1 row 13 : jamais le texte d'un « inconnu » (chemins, hôtes)
+    return out
 
 @router.get("/key",response_model=CommandResult,tags=["lecture"],summary="Exporte la clef du dépôt (format papier)")
 def key(nick: str, x_api_key: Optional[str]=Header(default=None), x_borg_passphrase: Optional[str]=Header(default=None)):
@@ -5902,6 +5981,65 @@ def push_selftest():
                         and again==[] and len(reminder)==1 and reminder[0]['reminder'] is True
                         and fresh==[] and running==[] and len(after)==1)
             check("retard : alerte (type échec), pas de doublon, rappel, silence si nouvelle archive ou Bkp en cours",_overdue_flow)
+            _insert_sub('push-ep-ovn','ovn')
+            def _overdue_absent_118():
+                """1.35.0 (story 118, revue 1 row 4) : nick SANS archive dont les Bkp trouvent le client absent -> alerte de retard comptée
+                depuis le started_at de la PREMIÈRE ligne 'absent' (vraie history.db jetable, borgHelper first_bkp_absent) : 30 h > 25 h ->
+                une alerte (overdue, type échec, last_backup = cette date en UTC) ; même niveau : rien ; absent récent (2 h) seulement,
+                ou aucune ligne : rien. Revue 2 : charge `no_backup` et Sentry « Aucune sauvegarde — <nick> : client absent depuis 30 h »
+                (row 25) ; un Bkp réussi après l'absent -> rien, push ET Sentry (réservations remises à zéro) ; diff.db absente (vrai
+                last_archive_stat) + succès connu -> rien (row 23) ; diff.db illisible : isolement (exception de last_archive_stat), aucun
+                envoi — témoin d'isolement, pas une preuve de la row 23 (revue 3 row 37)."""
+                d=tempfile.mkdtemp(prefix='bhwww-ovn-'); dp=os.path.join(d,'rc-ovn-diff.db')
+                try:
+                    with mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp),contextlib.redirect_stderr(io.StringIO()):
+                        _bh_paths.db.ensure_diff_db(dp,nick='ovn'); hp=_bh_paths.db.get_history_db('ovn'); _bh_paths.db.ensure_history_db(hp)
+                    sen=[]
+                    def _run(real_last=False):
+                        sent_to.clear(); del sen[:]
+                        las=_bh_paths.db.last_archive_stat if real_last else (lambda n,p=None: None)
+                        with mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp), \
+                             mock.patch.object(_bh_paths.db,'last_archive_stat',las), \
+                             mock.patch(f"{__name__}._bkp_state",lambda n:{'bkp_running':False,'bkp_detail':None,'bkp_interrupted':None}), \
+                             mock.patch.object(_bh_paths.borg,'cfgread',lambda n:{'MAX_AGE_BKP':'25','SENTRY_ALERTS':'overdue'}), \
+                             mock.patch(f"{__name__}.sentry_alert",lambda kind,n,msg,*a,**k: sen.append((kind,msg))), \
+                             mock.patch(f"{__name__}.webpush",side_effect=_fake_webpush), \
+                             mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True), \
+                             mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",PUSH_VAPID_PRIVATE_KEY or 'k'), contextlib.redirect_stderr(io.StringIO()):
+                            _check_overdue('ovn',None)
+                        return [json.loads(x) for e,x in sent_to if e=='push-ep-ovn']
+                    none=_run()
+                    h=sqlite3.connect(hp)
+                    h.execute("INSERT INTO bkp_status (nick,run_id,started_at,finished_at,result) VALUES ('ovn','a2',datetime('now','-2 hours'),datetime('now','-2 hours'),'absent')")
+                    h.commit(); recent=_run()
+                    h.execute("INSERT INTO bkp_status (nick,run_id,started_at,finished_at,result) VALUES ('ovn','a1',datetime('now','-30 hours'),datetime('now','-30 hours'),'absent')")
+                    h.execute("INSERT INTO bkp_status (nick,run_id,started_at,finished_at,result) VALUES ('ovn','e1',datetime('now','-40 hours'),datetime('now','-40 hours'),'error')")
+                    h.commit(); first0=h.execute("SELECT started_at FROM bkp_status WHERE run_id='a1'").fetchone()[0]; h.close()
+                    first=_run(); sen1=list(sen); again=_run()
+                    # revue 2 row 23 : un Bkp réussi (ici APRÈS l'absent) -> plus jamais d'alerte « sans archive » ; diff.db illisible (vrai
+                    # last_archive_stat) + succès connu -> rien
+                    with sqlite3.connect(hp) as h:
+                        h.execute("INSERT INTO bkp_status (nick,run_id,started_at,finished_at,result) VALUES ('ovn','s1',datetime('now','-1 hours'),datetime('now','-1 hours'),'success')")
+                    h.close(); _overdue_claim('ovn','raz',0); _overdue_claim('ovn#sentry','raz',0)   # réservations (push ET Sentry, revue 3 row 37)
+                    # remises à zéro : seule la règle du succès peut taire l'alerte
+                    succ=_run()
+                    os.unlink(dp); gone=_run(real_last=True)   # diff.db absente : vrai last_archive_stat -> None
+                    with open(dp,'wb') as f: f.write(b'pas une base sqlite'*64)
+                    # revue 3 row 37 : témoin d'ISOLEMENT (l'exception de last_archive_stat arrête _check_overdue avant first_bkp_absent) —
+                    # pas une preuve de la row 23 (celle-ci : succ et gone)
+                    try: corrupt=_run(real_last=True)
+                    except Exception as e: corrupt=[]; ce=type(e).__name__   # base illisible : le watcher isole le nick (exception), rien envoyé
+                    else: ce=None
+                    corrupt=corrupt+[x for e_,x in sent_to if e_=='push-ep-ovn']
+                    ok=(none==[] and recent==[] and len(first)==1 and first[0]['event']=='overdue' and first[0]['result']=='error'
+                        and 29.9<first[0]['age_hours']<30.1 and first[0]['last_backup']==first0.replace(' ','T')+'+00:00' and again==[]
+                        and first[0].get('no_backup') is True   # revue 2 row 25 : drapeau, textes « Aucune sauvegarde — client absent depuis »
+                        and len(sen1)==1 and sen1[0][0]=='overdue' and sen1[0][1].startswith('Aucune sauvegarde — ovn : client absent depuis 30 h (seuil MAX_AGE_BKP 25 h')
+                        and succ==[] and gone==[] and corrupt==[] and sen==[])
+                    if not ok: print(f"  {none} {recent} {first} {sen1} {again} {succ} {gone} {corrupt} {ce}")
+                    return ok
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("retard : nick sans archive, client absent depuis plus de MAX_AGE_BKP -> alerte comptée depuis le 1er absent (story 118)",_overdue_absent_118)
             # ── Stockage presque plein (1.34.0, story 87b) ──
             def _storage_push():
                 """Décisions 4 et 6 : état d'alerte écrit par borgHelper (CACHE_DIR du rc) -> UN push par franchissement et par stockage ;
@@ -6391,6 +6529,42 @@ def push_selftest():
                             and 'bkp_status' not in left and claimed is not None)
                 finally: shutil.rmtree(d,ignore_errors=True)
             check("watcher : diff.db d'avant history.db -> migrée au passage, fin de Bkp notifiée une fois (C/E compris)",_watcher_migrates_legacy)
+            def _watcher_absent_118():
+                """1.35.0 (story 118, décision de l'utilisateur) : fin 'absent' (Bkp tiré, client injoignable, borgHelper 1.0.217) -> réclamée
+                (notified_at posé, jamais retraitée), journal « result=absent (client absent) — aucune notification », AUCUN push de fin ni
+                Sentry ; 'error' et 'success' du même nick notifiés comme avant (témoins). _send_bkp_push(…,'end','absent') : rien envoyé
+                (abonnements jamais lus) ; 'error' : abonnements lus (témoin)."""
+                d=tempfile.mkdtemp(prefix='bhwww-abs-'); dp=os.path.join(d,'rc-wa-diff.db'); sent=[]; sen=[]; err=io.StringIO()
+                try:
+                    with mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp),contextlib.redirect_stderr(io.StringIO()):
+                        _bh_paths.db.ensure_diff_db(dp,nick='wa'); hp=_bh_paths.db.get_history_db('wa'); _bh_paths.db.ensure_history_db(hp)
+                        for r_,v_ in (('r1','absent'),('r2','error'),('r3','success')):
+                            _bh_paths.db.store_bkp_status_start('wa',r_,hp); _bh_paths.db.store_bkp_status_finish('wa',r_,v_,hp)
+                    with mock.patch(f"{__name__}._nick_list",lambda x:['wa']), \
+                         mock.patch.object(_bh_paths.db,'get_diff_db',lambda n: dp), \
+                         mock.patch(f"{__name__}._send_bkp_push",lambda n,ev,res,w=None: sent.append((n,ev,res))), \
+                         mock.patch(f"{__name__}.sentry_alert",lambda *a,**k: sen.append(a)), \
+                         mock.patch(f"{__name__}._check_overdue",lambda n,p: None), \
+                         mock.patch(f"{__name__}._reconcile_interrupted",lambda n: None), \
+                         contextlib.redirect_stderr(err):
+                        _bkp_status_watcher_pass(); _bkp_status_watcher_pass()
+                    h=sqlite3.connect(hp)
+                    rows=h.execute("SELECT run_id,result,notified_at IS NOT NULL FROM bkp_status WHERE nick='wa' ORDER BY run_id").fetchall(); h.close()
+                    ends=sorted(x for x in sent if x[1]=='end')
+                    j=err.getvalue()
+                    subs=[]
+                    with mock.patch(f"{__name__}._PYWEBPUSH_AVAILABLE",True),mock.patch(f"{__name__}.PUSH_VAPID_PRIVATE_KEY",'k'), \
+                         mock.patch(f"{__name__}._push_muted",lambda n: None), \
+                         mock.patch(f"{__name__}._push_subscriptions_for",lambda n,k: subs.append((n,k)) or []):
+                        _send_bkp_push('wa','end','absent',{}); n_abs=len(subs)
+                        _send_bkp_push('wa','end','error',{})
+                    ok=(ends==[('wa','end','error'),('wa','end','success')] and sen==[]
+                        and rows==[('r1','absent',1),('r2','error',1),('r3','success',1)]
+                        and j.count("result=absent (client absent) — aucune notification")==1 and n_abs==0 and subs==[('wa','error')])
+                    if not ok: print(f"  {ends} {sen} {rows} {subs} {j[-600:]!r}")
+                    return ok
+                finally: shutil.rmtree(d,ignore_errors=True)
+            check("watcher : fin « absent » (client absent, story 118) réclamée sans push ni Sentry ; échec et succès notifiés ; _send_bkp_push n'envoie rien pour absent",_watcher_absent_118)
             def _overdue_real_bkp_running():
                 """borgHelper 1.0.139 : « Bkp en cours » lu pour de vrai dans history.db (bkp_running non simulé) — un Bkp
                 en cours suspend l'alerte de retard ; fini, l'alerte part (Sentry simulé, rien n'est envoyé). 1.31.5 (story 59) : état
@@ -8505,6 +8679,103 @@ def push_selftest():
                     if not ok: print(f"  /access : {r.status_code} {json.dumps(nk,ensure_ascii=False)[:400]}")
                     return bool(ok)
                 check("/access : external, ops, build, rebuild, bkp_running par nick lisible ; rien pour un nick sans droit",_access_state)
+                def _probe_118():
+                    """1.35.0 (story 118, décisions de l'utilisateur) : GET /bkp/probe — nick non tiré : aucune sonde (pull false, state null) ;
+                    nick tiré : _pull_probe (borgHelper) appelée, réponse {nick,pull,state,message,code,checked_at,cached,age_s} ; même
+                    nick dans les 30 s : résultat gardé, aucune nouvelle sonde ; au-delà : nouvelle sonde ; deux appels simultanés : UNE
+                    sonde ; nick inconnu : 404 ; sans clé : 401. /access : bkp_pull par nick lisible (False pour le nick interne). Revue 1 :
+                    ALL, liste, DEFAULT, _borgHelperWWW -> 404 (detail en dur), externe -> 403, groupe lecture -> 403, écriture -> 200, aucun
+                    refus ne sonde (row 6) ; « inconnu » sur 255 gardé 10 min et sans message (rows 3, 13) ; verrou du nick tenu au-delà de
+                    _PULL_PROBE_WAIT+6 -> « inconnu » sans sonde (row 14)."""
+                    import configparser as _cp, threading as _th
+                    cp=_cp.ConfigParser(); cp.optionxform=str
+                    cp.read_dict({'pt':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid','EXCLUDE':'-e x',
+                                        'GROUPS_READ':'g-lect','GROUPS_WRITE':'g-ecr'},
+                                  'pv':{'SSH_REMFO':'','SER_LOGIN':'root','SER_NAME':'c.invalid'},'pn':{'SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  'pa':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  'pe':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid','EXTERNAL':'true'},
+                                  'pz':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  '_borgHelperWWW':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  '_autre':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'}})
+                    calls=[]; slow=[0]
+                    def fake(cfg,wait=None):
+                        calls.append(cfg.name); time.sleep(slow[0])
+                        if cfg.name=='pa': return {'state':'inconnu','message':'root@c.invalid: Permission denied (publickey).','code':255}
+                        if cfg.name=='pz': return {'state':'inconnu','message':'sonde sans réponse en 8 s','code':None}
+                        return {'state':'absent','message':'ssh: connect to host c.invalid port 22: Connection refused','code':255}
+                    res={}
+                    with mock.patch(f"{__name__}._cfgread",lambda n: cp[n] if n in cp else None), mock.patch(f"{__name__}._pull_probe",fake), \
+                         mock.patch.dict(_PULL_PROBES,clear=True):
+                        for n in ('pn','pv'):
+                            r=client.get(f"{P}/bkp/probe",params={'nick':n},headers=H)
+                            res[f'{n} non tiré : aucune sonde']=(r.status_code==200 and r.json()=={'nick':n,'pull':False,'state':None,'message':None,'code':None,
+                                'checked_at':None,'cached':False,'age_s':None} and calls==[],r.status_code,r.text[:200],calls)
+                        r1=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json()
+                        r2=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json()
+                        res['tiré : sonde, puis gardée']=(r1.get('pull') is True and r1.get('state')=='absent' and r1.get('code')==255
+                            and r1.get('message')=='ssh: connect to host c.invalid port 22: Connection refused' and r1.get('cached') is False
+                            and bool(r1.get('checked_at')) and r2.get('cached') is True and r2.get('state')=='absent' and calls==['pt'],r1,r2,calls)
+                        if 'pt' in _PULL_PROBES: t0,v=_PULL_PROBES['pt']; _PULL_PROBES['pt']=(t0-31,v)   # absente (témoin) : bilan quand même
+                        r3=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json()
+                        res['au-delà de 30 s : nouvelle sonde']=(r3.get('cached') is False and calls==['pt','pt'],r3,calls)
+                        _PULL_PROBES.clear(); del calls[:]; slow[0]=0.6; out=[]
+                        ts=[_th.Thread(target=lambda: out.append(client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json())) for _ in range(3)]
+                        for t in ts: t.start()
+                        for t in ts: t.join(30)
+                        res['appels simultanés : une seule sonde']=(calls==['pt'] and len(out)==3 and all(x.get('state')=='absent' for x in out)
+                                                                   and sorted(x.get('cached') for x in out)==[False,True,True],calls,out)
+                        slow[0]=0
+                        r=client.get(f"{P}/bkp/probe",params={'nick':'inconnu'},headers=H)
+                        res['nick inconnu : 404']=(r.status_code==404 and r.json().get('detail')=='Nick inconnu : inconnu',r.status_code,r.text[:200])
+                        # revue 1 row 6 : ALL, liste, [DEFAULT] et section propre à borgHelperWWW -> 404 sans sonde ; externe -> 403 ;
+                        # groupes : lecture seule -> 403, écriture -> 200
+                        n0=len(calls)
+                        for nn in ('ALL','pt,pn','DEFAULT','_borgHelperWWW','_autre'):   # _autre : revue 2 row 31
+                            r=client.get(f"{P}/bkp/probe",params={'nick':nn},headers=H)
+                            res[f'{nn} : 404']=(r.status_code==404 and r.json().get('detail')==f'Nick inconnu : {nn}',r.status_code,r.text[:200])
+                        r=client.get(f"{P}/bkp/probe",params={'nick':'pe'},headers=H)
+                        res['externe : 403']=(r.status_code==403 and 'dépôt externe' in str(r.json().get('detail')),r.status_code,r.text[:200])
+                        with mock.patch(f"{__name__}.GROUPS_HEADER",'X-Groups'):
+                            rl=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers={**H,'X-Groups':'g-lect'})
+                            rw_=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers={**H,'X-Groups':'g-ecr'})
+                        res['groupes : lecture 403, écriture 200']=(rl.status_code==403 and 'Groupe insuffisant' in str(rl.json().get('detail'))
+                                                                    and rw_.status_code==200,rl.status_code,rl.text[:200],rw_.status_code)
+                        res['refus : aucune sonde']=(len(calls)==n0,calls[n0:])
+                        # revue 1 rows 3, 13 : « inconnu » sur 255 gardé 10 min, sans message ; au-delà : nouvelle sonde
+                        _PULL_PROBES.clear(); del calls[:]
+                        a1=client.get(f"{P}/bkp/probe",params={'nick':'pa'},headers=H).json()
+                        def age(n,s):   # revue 2 row 27 : bornes figées — 599 s gardé, 601 s relancé
+                            if n in _PULL_PROBES: t0,v=_PULL_PROBES[n]; _PULL_PROBES[n]=(t0-s,v)
+                        age('pa',599); a2=client.get(f"{P}/bkp/probe",params={'nick':'pa'},headers=H).json()
+                        age('pa',2); a3=client.get(f"{P}/bkp/probe",params={'nick':'pa'},headers=H).json()
+                        res['inconnu (255) : gardé 10 min, jamais de message']=(a1.get('state')=='inconnu' and a1.get('message') is None and a1.get('code')==255
+                            and a2.get('cached') is True and a3.get('cached') is False and calls==['pa','pa'],a1,a2,a3,calls)
+                        del calls[:]; z1=client.get(f"{P}/bkp/probe",params={'nick':'pz'},headers=H).json()
+                        age('pz',31); z2=client.get(f"{P}/bkp/probe",params={'nick':'pz'},headers=H).json()
+                        res['inconnu sans code (délai de la sonde) : relancé après 31 s']=(z1.get('state')=='inconnu' and z1.get('code') is None
+                            and z2.get('cached') is False and calls==['pz','pz'],z1,z2,calls)
+                        # revue 1 row 14 : verrou du nick tenu au-delà du délai -> « inconnu » sans sonde, sans attente sans fin
+                        # revue 2 row 24 : requête dans un fil, attendue 5 s — un code qui attendrait le verrou sans fin donne un FAIL, jamais un
+                        # selftest bloqué ; verrou rendu sans condition, fil attendu ensuite
+                        lk=_PULL_PROBE_LOCKS.setdefault('pt',threading.Lock()); lk.acquire(); del calls[:]; _PULL_PROBES.clear(); rk={}; dt=[None]
+                        def _req():
+                            t=time.monotonic(); rk.update(client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json()); dt[0]=time.monotonic()-t
+                        with mock.patch(f"{__name__}._PULL_PROBE_WAIT",-5.5):
+                            th=threading.Thread(target=_req,daemon=True); th.start()
+                            try: th.join(5); alive=th.is_alive(); calls0=list(calls)
+                            finally: lk.release()
+                            th.join(30)
+                        res['verrou tenu : inconnu sans sonde, délai borné']=(not alive and rk.get('state')=='inconnu' and rk.get('cached') is False
+                                                                              and calls0==[] and dt[0] is not None and dt[0]<5,alive,rk,dt,calls0)
+                        r=client.get(f"{P}/bkp/probe",params={'nick':'pt'})
+                        res['sans clé : 401']=(r.status_code==401,r.status_code)
+                    nk=client.get(f"{P}/access",headers=H).json()['nicks']
+                    res['/access : bkp_pull']=(all('bkp_pull' in v for v in nk.values() if v.get('level')!='none')
+                                               and (not _internal or nk[_internal]['bkp_pull'] is False),{k:v.get('bkp_pull') for k,v in nk.items()})
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("GET /bkp/probe : sonde du client d'un Bkp tiré, gardée 30 s, une à la fois par nick, aucune pour un nick non tiré ; /access bkp_pull (story 118)",_probe_118)
                 def _access_cleanup():
                     """1.28.5 (story 23, A30) : /access borg_cleanup — une entrée de dépôt disparu ajoutée au dossier de bac à sable
                     -> +1 entrée borg (nombres et tailles, jamais de chemin), invisible tant que le calcul est gardé (5 min) ;

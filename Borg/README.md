@@ -115,6 +115,8 @@ SSH_KEY          = /root/.ssh/id_borg
 # SSH_REPO_USER  = borg
 # SSH_REPO_KEY   = /root/.ssh/id_borg_repo
 # SSH_REPO_HOSTKEY = ssh-ed25519 AAAA…   (cible du tunnel autre que cette machine seulement)
+# Client injoignable au Bkp tiré (borgHelper >= 1.0.217) : « client absent », code 1, ni push ni Sentry — voir
+# « Bkp tiré : client absent » ci-dessous
 
 # Nom de l'hôte de stockage (borgHelper >= 1.0.208, commande Storage) : remplace celui tiré de BORG_REPO
 # (user@hôte[:port], cible du tunnel SSH_REMFO, point de montage d'un dépôt local)
@@ -418,6 +420,93 @@ SSH_REPO_KEY     = /root/.ssh/id_borg_repo
   l'emportent ; un `ProxyJump` ou `ProxyCommand` d'un `Host *` s'appliquerait aussi (règle d'OpenSSH, non mesuré ici :
   à éviter pour `127.0.0.1`).
 
+### Bkp tiré : client absent (1.0.217)
+
+Un client de Bkp tiré (portable, client derrière NAT dont le tunnel n'est pas monté) peut être injoignable au moment du Bkp.
+Décision de l'utilisateur : c'est un état « **client absent** », ni échec ni succès — seul le retard (`MAX_AGE_BKP` : Report en
+alerte, notification « sauvegarde en retard », Sentry `overdue`) alerte s'il dure.
+
+- **Options du ssh du pull** (toujours, Bkp tiré seulement) : `-o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30
+  -o ServerAliveCountMax=6`, juste avant `<SER_LOGIN>@<SER_NAME>` (après `-A -o VisualHostKey=no -o
+  StrictHostKeyChecking=accept-new`). Elles l'emportent sur `~/.ssh/config` (la ligne de commande passe avant). `BatchMode` : jamais
+  d'invite (mot de passe, phrase de clé : un Bkp de cron ou de borgHelperWWW ne peut pas répondre — une clé à phrase de passe sans
+  agent échoue, comme avant sans terminal). `ConnectTimeout=30` : client injoignable par délai -> sortie en 30 s (mesuré, connexion
+  TCP et bannière). `ServerAlive*` : client mis en veille ou coupé PENDANT le Bkp -> ssh sort en ~3 min 30 (mesuré : 6 × 30 s sans
+  réponse, « Timeout, server … not responding. ») au lieu d'attendre le keepalive TCP (heures) ; c'est un **échec** (borg avait
+  démarré). Une coupure de moins de ~3 min ne tue pas le Bkp.
+- **Critère** (mesuré, OpenSSH 8.9, `work/s118/messages.md`) : ssh sorti en **255**, **aucune** ligne `--log-json` de borg reçue
+  (borg n'a jamais démarré) ni sortie, et **toutes** les lignes de stderr de ssh reconnues « réseau » :
+  - `ssh: connect to host <h> port <n>: Connection refused | Connection timed out | No route to host | Network is unreachable` ;
+  - `ssh: Could not resolve hostname <h>: Name or service not known | Temporary failure in name resolution` ;
+  - coupure avant l'échange de clés, deux lignes finales : `kex_exchange_identification: Connection closed by remote host` (ou
+    `read: Connection reset by peer`) puis `Connection closed|reset by <h> port <n>` ; `Connection timed out during banner
+    exchange` puis `Connection to <h> port <n> timed out` ;
+  - avant elles seulement (saut `ProxyJump`/`ProxyCommand -W` vers un client absent) : `channel <n>: open failed: connect failed:
+    <erreur réseau ou de nom>`, `stdio forwarding failed`, `Warning: Permanently added '…' (…) to the list of known hosts.`.
+  - **Saut** (revues 1 et 2, mesuré) : une paire finale `closed`/`reset` qui vise `UNKNOWN port 65535` (ssh à travers
+    `ProxyJump`/`ProxyCommand`) n'est « absent » que si une ligne réseau reconnue la précède (`ssh: connect to host <saut> …`,
+    `channel N: open failed: connect failed: …`). Un saut SILENCIEUX (`ProxyCommand ssh -q …`, `LogLevel QUIET` pour le bastion)
+    donne cette paire nue pour une authentification refusée, une clé d'hôte changée au saut, une cible fermée et un saut fermé :
+    **échec** (jamais un échec masqué ; un client fermé derrière un saut silencieux est alors signalé en échec). Délai derrière un
+    saut — cible qui ne répond pas derrière un saut joignable, tunnel mort sur le bastion (son sshd écoute encore le port de
+    rendez-vous, le client est en veille), bastion muet : le `ConnectTimeout` du pull borne l'échange de bannière (sortie en 30 s),
+    `Connection timed out during banner exchange` + `Connection to UNKNOWN port 65535 timed out` -> **absent** (« délai dépassé » ;
+    les échecs silencieux d'un saut, mesurés, ne donnent jamais `timed out` ; seule autre voie connue : une invite interactive au
+    saut — `BatchMode` n'atteint pas le ssh du saut d'un `ProxyJump` (mesuré) ; ce qui protège est l'absence de terminal (cron ;
+    borgHelperWWW lance le Bkp en `setsid`) ; un Bkp lancé à la main dans un terminal avec une invite au saut (clé d'hôte, mot de
+    passe, phrase de clé) sans réponse en 30 s, ou un saut qui attend une touche FIDO, finit « absent »). **Sonde** (décision de
+    l'utilisateur, revue 3) : cette paire `timed out` donne `inconnu` (bouton actif, aucun message) — les 3 s de la sonde couvrent
+    aussi la connexion au saut, un bastion lent n'est pas un client absent ; le Bkp (30 s) garde « absent ».
+  - **`ProxyJump`** (mesuré, OpenSSH 8.9) : le ssh du saut ne reçoit que `-l -p -F -W` — ni `BatchMode`, ni `ConnectTimeout`, ni
+    `-i` de la ligne de commande : les poser dans le `ssh_config` du compte, `Host <bastion>` (`BatchMode yes`, `ConnectTimeout`,
+    `IdentityFile`, `UserKnownHostsFile`).
+  - **Non reconnus, donc échec** (côté sûr, non mesurés ou mesurés autrement) : bannière (`Banner`) d'un bastion, `LogLevel
+    DEBUG`/`VERBOSE` dans `~/.ssh/config`, « Warning: Permanently added the … host key for IP address … » (`CheckHostIP`),
+    `No address associated with hostname` (EAI_NODATA, nom DynDNS retiré), OpenSSH 7.x (`ssh_exchange_identification: …`),
+    messages musl/BSD, `nc` en ProxyCommand. Limite (revue 2, déduit) : une `ProxyCommand` de repli (`ssh -W … b1 || ssh -q -W …
+    b2`) dont b1 est injoignable (ligne réseau) et b2 refuse silencieusement l'authentification donne « absent » — la preuve réseau
+    de b1 couvre l'échec muet de b2 ; à éviter, ou sans `-q` sur b2. `-o LogLevel=ERROR` n'est pas posé : mesuré, il retire des lignes d'échec
+    (« Unable to negotiate … », « Timeout, server … not responding. ») et la dernière ligne derrière un saut.
+
+  Tout le reste est un **échec** (push « échec », Sentry `bkp_error`, comme en 1.0.216) : clé d'hôte changée (« Host key
+  verification failed. »), authentification refusée (« Permission denied (publickey). », aussi celle d'un saut), option invalide,
+  algorithme refusé (« Unable to negotiate … »), route interdite (« … port 22: Permission denied »), fichier `SSH_KEY` absent
+  (« Warning: Identity file … »), coupure après l'échange de clés, client en veille pendant le Bkp, borg démarré puis coupé, et
+  tout message inconnu (autre version d'OpenSSH, autre langue). Bkp non tiré (sans `SSH_REMFO`) : jamais absent. Les messages
+  d'erreur système de ssh restent en anglais même sous `LC_ALL=fr_FR.UTF-8` (mesuré).
+- **Effets** : `[ABSENT] <nick>: client injoignable (ssh : <dernière ligne de ssh>) — Bkp reporté, pas un échec` (stderr), code
+  **1**, `bkp_status.result = 'absent'` (ligne fermée) ; ni notification push de fin (ni « échec » ni « succès » : le watcher de
+  borgHelperWWW ≥ 1.35.0 réclame la ligne sans rien envoyer), ni Sentry `bkp_error`, ni Index de fin, ni mesure de place (aucune
+  archive) ; `index-pending` inchangé (le prochain Bkp réussi relancera l'Index). Pas de JSON sur stdout. `-n ALL` : un nick absent
+  vaut 1, le total reste le pire des codes. Un Bkp absent ne compte pas comme « Bkp précédent en erreur » (Report) et n'est
+  jamais « le Bkp précédent » : un échec d'avant reste vu (revue 1). Écriture de `absent` refusée (SQLite) : `[WARN] <nick>: fin
+  « absent » non enregistrée …` — le filet ferme alors la ligne en échec (notification d'échec possible).
+- **Push de DÉBUT** (décision de l'utilisateur) : gardé tel quel — envoyé si l'abonnement le demande (`notify_start`), avant la
+  connexion ssh ; un Bkp absent n'a aucun push de FIN.
+- **Versions** : borgHelper ≥ 1.0.217 avec un borgHelperWWW < 1.35.0 -> le watcher d'avant envoie un push « échec » pour une fin
+  `absent` (tout non-succès) : mettre les deux à jour ensemble.
+- **Retard d'un nick sans aucun Bkp réussi** (borgHelperWWW ≥ 1.35.0) : nouveau nick tiré dont chaque Bkp trouve le client absent
+  (nom ou port faux) et qui n'a AUCUN Bkp réussi dans `bkp_status` — l'alerte de retard (push « en retard », Sentry `overdue`) part
+  quand la PREMIÈRE tentative absente a plus de `MAX_AGE_BKP` heures, puis les rappels habituels ; texte « Aucune sauvegarde —
+  client absent depuis X » (notification, SW ≥ 1.5.0 : charge `no_backup` ; Sentry). Un nick qui a un Bkp réussi n'est jamais
+  concerné (diff.db absente, illisible ou vide : rien, comme avant).
+- **Status / Report** : tant que le dernier Bkp fini du nick est un absent (plus récent que la dernière fin succès ou échec) —
+  Status « `Client absent au dernier Bkp : tentative à HH:MM (XhYYmin) — client injoignable, Bkp reporté (pas un échec)` », JSON
+  `bkp_absent: {attempted_at}` (début de la tentative, UTC, forme de `started_at`), sinon `null` ; Report (et `-o`) : colonne
+  « reste » suffixée « 🔌 client absent (tentative à …) », JSON `client_absent: {attempted_at, depuis}` — sans alerte ni code
+  changé : la dernière archive et `MAX_AGE_BKP` restent l'alerte.
+- **borgHelperWWW / interface** (WWW ≥ 1.35.0, UI ≥ 1.28.0) : `/access` dit `bkp_pull` par nick ; pour un nick tiré dont
+  l'appelant peut lancer un Bkp, l'interface demande `GET /bkp/probe` (sonde ssh : même destination, clé et options que le Bkp,
+  `ConnectTimeout=3`, commande `true`, ni `SendEnv` ni `-R` ; résultat gardé 30 s par nick, une sonde à la fois par nick, 8 s au
+  plus). Client absent : badge gris « 🔌 client absent » et bouton « ▶ Backup » grisé (info-bulle : dernière ligne de ssh) ;
+  joignable (tout code ≠ 255 : une commande forcée qui refuse `true` répond quand même) ou inconnu (autre 255 :
+  authentification, clé d'hôte ; sonde sans réponse) : bouton actif. Page détail d'un serveur (décision de l'utilisateur) :
+  l'action « Lancer un backup » et son bouton Exécuter sont grisés de même (sonde du seul nick ouvert, à l'ouverture de la page). Un « inconnu »
+  sur 255 (authentification refusée…) est gardé 10 min, pas 30 s : une sonde en échec d'authentification toutes les 30 s ferait
+  bannir le serveur par le client (fail2ban, `PerSourcePenalties`), et les Bkp suivants verraient ce bannissement comme un client
+  absent. Avec `--workers N`, sondes et résultats gardés sont propres à chaque processus (jusqu'à N sondes par nick et par période,
+  badge qui peut différer d'une relecture à l'autre). Voir [Endpoints](#endpoints).
+
 ### Dépôts borg externes (1.0.142)
 
 Un dépôt dont les archives sont créées **hors borgHelper** (autre outil, `borg create` à la main) se déclare avec
@@ -672,11 +761,13 @@ borgHelper -c Bkp -n mon-serveur -I     # backup seul, sans indexation
 ```
 
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
-Code retour 0 si succès ou warnings, 2 si erreur borg.
+Code retour 0 si succès ou warnings, 2 si erreur borg, 1 si le client d'un Bkp tiré est absent (`[ABSENT]`, 1.0.217 — voir
+[Bkp tiré : client absent](#bkp-tiré--client-absent-10217)).
 
 Plusieurs nicks (`-n ALL`, `-n a,b` ; 1.0.167) : un Bkp après l'autre, dans l'ordre du fichier de conf pour `-n ALL`,
 dans l'ordre donné pour une liste (dépôts externes écartés) ; un nick en échec n'arrête pas les suivants ; Ctrl-C arrête tout. Code retour : le pire des
-nicks. Sortie : l'objet JSON de chaque nick, à la suite (même forme qu'un nick seul). Avant 1.0.167, plusieurs
+nicks (un client absent vaut 1 : `-n ALL` avec un client absent et des Bkp réussis rend 1, jamais 2). Sortie : l'objet JSON
+de chaque nick, à la suite (même forme qu'un nick seul). Avant 1.0.167, plusieurs
 nicks internes donnaient « Ce serveur est inconnu » (code 3) sans aucune sauvegarde.
 
 > `-I` désactive toute écriture de changements/snapshot et l'appel automatique à `Index` — utile si l'indexation est gérée séparément (les statistiques de l'archive et la taille du dépôt restent enregistrées).
@@ -771,6 +862,13 @@ Code retour 1 si un dépôt dépasse `MAX_AGE_BKP` heures depuis la dernière sa
 le seuil d'alerte de son stockage (« ⚠ stockage presque plein » dans `reste`, nick en alerte `***`, ligne rouge en HTML — voir
 [Place libre et alertes](#place-libre-et-alertes-10209)) ; un cron qui alerte sur le code de Report le voit donc aussi.  
 Code retour 2 si un dépôt est inaccessible.
+
+Client absent (1.0.217, Bkp tiré — voir « Bkp tiré : client absent ») : tant que le dernier Bkp fini du nick a trouvé son client
+injoignable (plus récent que la dernière fin succès ou échec), la colonne `reste` est suffixée `— 🔌 client absent (tentative à
+HH:MM (XhYYmin))` (ou seule si vide) et, en JSON, la ligne porte `"client_absent": {"attempted_at": "2026-11-11 10:00:00",
+"depuis": "…"}` (début de la tentative, UTC). Ni alerte ni code changé : la dernière archive et `MAX_AGE_BKP` restent la règle.
+Un Bkp absent n'est jamais un « Bkp précédent en erreur » ni « le précédent » (revue 1 : sauté, un échec d'avant reste vu).
+Mêmes règles avec `-o`.
 
 Report pendant un Bkp (1.0.183) : un nick dont le Bkp tourne — marqueur du Bkp vivant dans `CACHE_DIR`
 (`<prefix>-<nick>-bkp.lock.<run_id>`, posé par le Bkp dès son début, retiré à sa fin, Index de fin compris) et sa ligne
@@ -1795,7 +1893,7 @@ borgHelper -c Status -n ALL -j               # tous les nicks configurés, JSON
 | Option | Description |
 |--------|-------------|
 | `-n <nick1,nick2>` / `-n ALL` | Un ou plusieurs nicks nativement (contrairement à `RepoHistory`/`ArchiveHistory`, qui rejettent le multi-nick avec `-j`) — c'est le cas d'usage principal de `Status` |
-| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction ; `bkp_pull` (1.0.216, nick à Bkp tiré construit seulement) : `{BORG_REPO,BORG_RSH}` construits pour le borg du client, ou `{error}` (refus du Bkp) |
+| `-j` | Sortie JSON — toujours une **liste**, même à un seul nick : `[{nick,last_backup,bkp_running,bkp_interrupted,bkp_stale,bkp_absent,priority_op_running,build,rebuild}, ...]` — `rebuild` (1.0.143) : état du fichier fantôme (`build_state`), `null` sans reconstruction ; `bkp_pull` (1.0.216, nick à Bkp tiré construit seulement) : `{BORG_REPO,BORG_RSH}` construits pour le borg du client, ou `{error}` (refus du Bkp) ; `bkp_absent` (1.0.217) : `{attempted_at}` si le dernier Bkp fini a trouvé le client absent, sinon `null` |
 
 En texte, en ligne de commande, une ligne finale signale les restes à nettoyer sur la machine, comme `Report`
 (1.0.160 ; JSON inchangé ; jamais via borgHelperWWW) — voir [`BorgCleanup`](#borgcleanup).
@@ -1845,6 +1943,9 @@ Par nick :
 - **Bkp tiré construit** (1.0.216, `SSH_REPO_USER` — voir « Bkp tiré : `BORG_REPO` et `BORG_RSH` du client construits ») :
   `Bkp tiré, borg du client : BORG_REPO=…` puis `BORG_RSH=…`, tels que borg les recevra ; refus du Bkp : `Bkp tiré : <motif> —
   Bkp refusé` (code de sortie inchangé). Autres nicks : rien (JSON : pas de clé `bkp_pull`).
+- **Client absent** (1.0.217, Bkp tiré — voir « Bkp tiré : client absent ») : dernier Bkp fini du nick en `absent`, plus récent
+  que la dernière fin succès ou échec -> « Client absent au dernier Bkp : tentative à HH:MM (XhYYmin) — client injoignable, Bkp
+  reporté (pas un échec) » (JSON `bkp_absent: {attempted_at}`) ; code de sortie inchangé. Lecture impossible : rien (`null`).
 
 En JSON : `last_backup` est `{archive,date}` ou `null` ; `bkp_running` est `{started_at,en_attente,orphelin,sans_suivi}`
 (1.0.186 :
@@ -3347,6 +3448,7 @@ elle serait resservie sans nouvel essai de migration.
 | DELETE | `/delbkp` | DelBkp ⚡ | |
 | POST | `/init` | Init | |
 | POST | `/bkp` | Bkp *(asynchrone — voir ci-dessous)* | |
+| GET | `/bkp/probe` | *(aucune — sonde ssh du client d'un Bkp tiré, 1.35.0 — voir ci-dessous)* | |
 | GET | `/key` | Key | |
 | POST | `/prune` | Prune ⚡ | |
 | POST | `/index` | Index *(asynchrone depuis 1.28.0 — voir ci-dessous)* | |
@@ -3468,7 +3570,40 @@ Depuis 1.28.0, chaque nick lisible par l'appelant porte aussi (lectures locales 
   le fichier est illisible. L'Index de fin de Bkp n'en écrit pas.
 - `bkp_last` (1.28.3, borgHelper ≥ 1.0.152) : dernier Bkp du nick dans `history.db` — `{"run_id","started_at",
   "finished_at","result"}` (`finished_at`/`result` `null` tant qu'il tourne ; heures UTC de SQLite) ; `null` si aucun
-  Bkp enregistré ou lecture impossible. L'UI s'en sert pour suivre un ▶ Backup.
+  Bkp enregistré ou lecture impossible. L'UI s'en sert pour suivre un ▶ Backup. `result` : `success`, `error` ou (borgHelper
+  ≥ 1.0.217) `absent` (Bkp tiré, client injoignable — voir « Bkp tiré : client absent ») ; l'UI ne lit que `run_id` et
+  `finished_at` (un absent termine le suivi comme une autre fin).
+- `bkp_pull` (1.35.0, borgHelper ≥ 1.0.217) : `true` pour un nick à Bkp tiré (`SSH_REMFO` non vide), `false` sinon, `null` si
+  le rc est illisible. L'UI ne sonde (`GET /bkp/probe`) que ces nicks.
+
+`GET /bkp/probe?nick=<nick>` (1.35.0, borgHelper ≥ 1.0.217 — décision de l'utilisateur : bouton ▶ Backup grisé quand le client
+est absent) : protégée par `X-API-Key`, niveau écriture (comme `POST /bkp`), refusée (`403`) pour un dépôt externe ; nick
+inconnu, `ALL`, liste, `DEFAULT` ou toute section `_…` (jamais un nick, règle du rc) : `404` (« Nick inconnu : … ») ;
+groupes actifs, niveau lecture : `403`. Nick non tiré : **aucune sonde**. Nick tiré : `ssh <-A -o VisualHostKey=no -o
+StrictHostKeyChecking=accept-new> -o BatchMode=yes -o ConnectTimeout=3 <SER_LOGIN>@<SER_NAME> [-i <SSH_KEY>] true` (même
+destination, clé et options que le ssh du Bkp, ni `SendEnv` ni tunnel `-R` ; environnement `PATH`, `LC_ALL` seulement ; session
+propre, 8 s au plus, tout le groupe tué au-delà). Résultat gardé **30 s** par nick et par processus (**10 min** pour un `inconnu` sur
+255) ; une seule sonde à la fois par nick (les appels simultanés attendent la sienne, 14 s au plus — au-delà : `inconnu` sans
+sonde — et lisent son résultat). Réponse :
+
+```json
+{"nick": "portable1", "pull": true, "state": "absent", "message": "ssh: connect to host portable1 port 22: Connection refused",
+ "code": 255, "checked_at": "2026-11-11T18:00:00+00:00", "cached": false, "age_s": 0.0}
+```
+
+- `pull` : `false` (nick non tiré) -> `state`, `message`, `code`, `checked_at`, `age_s` à `null`, `cached` `false` ;
+- `state` : `joignable` (ssh sorti avec un code ≠ 255 — une commande forcée qui refuse `true` répond quand même), `absent`
+  (255 et lignes de ssh toutes « réseau », mêmes motifs que le Bkp : refus, délai, hôte ou réseau injoignable, nom non résolu,
+  coupure avant l'échange de clés), `inconnu` (autre 255 — authentification, clé d'hôte… —, délai derrière un saut `… UNKNOWN port
+  65535 timed out` (revue 3, décision de l'utilisateur : bastion lent), sonde sans réponse en 8 s, ssh
+  introuvable, `SER_LOGIN`/`SER_NAME` absentes) ;
+- `message` : dernière ligne de ssh pour `absent` SEULEMENT (`null` sinon : jamais un chemin de clé ni un hôte interne au
+  navigateur) ; `code` : code de sortie de ssh (`null` sans) ;
+- `checked_at` : fin de la sonde (UTC, ISO) ; `cached` : résultat gardé d'une sonde précédente ; `age_s` : son âge (s).
+
+L'interface (UI ≥ 1.28.0) sonde à chaque affichage de la liste et à chaque relecture de `/access` (30 s) les nicks tirés dont
+l'appelant peut lancer un Bkp, et à l'ouverture d'une page détail : `absent` -> badge gris « 🔌 client absent », ▶ Backup grisé
+(info-bulle : dernière ligne de ssh) et, page détail, « Lancer un backup » et Exécuter grisés ; autre état ou erreur : actifs.
 
 Un nick sans droit n'en porte aucun. L'interface web (UI ≥ 1.19.0) s'en sert pour ses badges
 (🔗 externe, ⏳ Bkp en cours, 🏗 construction partielle, ♻ reconstruction ; UI ≥ 1.19.2 : ⚠ Index en échec,
@@ -3871,7 +4006,7 @@ commande `borg` tourne sur un **leurre** garanti inexistant (jamais sur le fichi
 | Code | Signification |
 |------|---------------|
 | 0 | Succès |
-| 1 | Avertissement (rapport : sauvegarde trop ancienne) |
+| 1 | Avertissement (rapport : sauvegarde trop ancienne ; Bkp tiré : client absent, 1.0.217) |
 | 2 | Erreur borg ; erreur d'arguments (1.0.206) ; fichier de conf illisible (1.0.212) |
 | 3 | État incohérent (déjà monté, serveur inconnu, `MOUNTPOINT`/`GLOB_ARCH` absent…) |
 | 4 | Opération non permise sur ce nick (dépôt externe, `EXTERNAL_OPS`) — aucun borg lancé |

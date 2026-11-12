@@ -113,18 +113,19 @@ eq('titre explorateur archive',pageTitle({view:'view-browse',nick:'srv',path:'et
   const calls={reload:[],actions:0,badges:0}; let next=null, hidden=false;
   const env={document:{get hidden(){ return hidden; }},getApiKey:()=>'k',escapeAttr:s=>String(s),
     refreshStateBadges:()=>{ calls.badges++; },reloadMachineCard:n=>{ calls.reload.push(n); },
-    renderActionList:()=>{ calls.actions++; }};
+    renderActionList:()=>{ calls.actions++; },probePullNicks:()=>{ calls.probes=(calls.probes||0)+1; }};
   let now=1e6;
-  const ui=new Function('env',`let {document,getApiKey,escapeAttr,refreshStateBadges,reloadMachineCard,renderActionList}=env;
+  const ui=new Function('env',`let {document,getApiKey,escapeAttr,refreshStateBadges,reloadMachineCard,renderActionList,probePullNicks}=env;
     let myAccess=null, currentViewId='view-machines', currentNick=null, pollBusy=false;
-    const pendingBkp={}, Date={now:()=>env.now(),parse:x=>env.parse(x)};
+    const pendingBkp={}, bkpProbe={}, Date={now:()=>env.now(),parse:x=>env.parse(x)};
     const loadMyAccess=async()=>{ myAccess=env.next(); return myAccess; };
     ${grab('opAllowed')}
+${grab('bkpAbsentTitle')}
 ${grab('stateBadges')}
 ${grab('bkpRef')}
 ${grab('notePendingBkp')}
 async ${grab('pollAccess')}
-    return {opAllowed,stateBadges,pollAccess,notePendingBkp,pending:pendingBkp,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
+    return {opAllowed,stateBadges,pollAccess,notePendingBkp,pending:pendingBkp,probe:bkpProbe,set:(a,v,n)=>{ myAccess=a; if(v) currentViewId=v; if(n!==undefined) currentNick=n; }};`)(
     Object.assign(env,{next:()=>next,now:()=>now,parse:x=>globalThis.Date.parse(x)}));
   const acc=(o)=>({groups_auth_enabled:false,nicks:o});
   ui.set(null); eq('opAllowed sans /access : tout proposé',ui.opAllowed('x','bkp'),true);
@@ -139,6 +140,17 @@ async ${grab('pollAccess')}
      ['🔗 externe','⏳ Bkp en cours','construction partielle 1/5','prête à basculer'].every(t=>be.includes(t)),true);
   eq('badge reconstruction démarrée (sans build_state)',ui.stateBadges('f').includes('reconstruction démarrée'),true);
   eq('base complète interne : aucun badge',ui.stateBadges('g'),'');
+  // UI 1.28.0 (story 118) : sonde du client d'un Bkp tiré — absent : badge gris, info-bulle = dernière ligne de ssh ; joignable,
+  // inconnu, jamais sondé : aucun badge
+  ui.probe.g={state:'absent',message:'ssh: connect to host c port 22: Connection refused'};
+  const bab=ui.stateBadges('g');
+  eq('client absent : badge gris « 🔌 client absent », info-bulle avec la ligne de ssh',
+     [bab.includes('<span class="badge absent"'),bab.includes('🔌 client absent'),bab.includes('(ssh : ssh: connect to host c port 22: Connection refused)')],[true,true,true]);
+  ui.probe.g={state:'inconnu',message:'x@c: Permission denied (publickey).'};
+  eq('client inconnu (authentification) : aucun badge',ui.stateBadges('g'),'');
+  ui.probe.g={state:'joignable',message:null};
+  eq('client joignable : aucun badge',ui.stateBadges('g'),'');
+  delete ui.probe.g;
   // UI 1.23.1 (story 59, décisions de l'utilisateur) : état de Status relayé par /access (WWW 1.31.5)
   ui.set(acc({o:{bkp_running:true,bkp_detail:'orphelin'},w:{bkp_running:true,bkp_detail:'en_attente'},
               i:{bkp_running:false,bkp_interrupted:{started_at:'2026-10-06 10:00:00',verifie:true}},
@@ -185,6 +197,7 @@ async ${grab('pollAccess')}
   await ui.pollAccess();
   eq('fin de Bkp (liste) : carte rechargée pour a seulement',calls.reload,['a']);
   eq('relecture : badges rafraîchis',calls.badges,1);
+  eq('relecture : sonde des nicks tirés relancée (UI 1.28.0, story 118)',calls.probes,1);
   // page serveur affichée : actions et badges rafraîchis, aucune carte
   ui.set(acc({a:{bkp_running:true}}),'view-detail','a'); next=acc({a:{bkp_running:false}});
   await ui.pollAccess();
@@ -272,27 +285,100 @@ async ${grab('pollAccess')}
   eq('second fini : rechargé, suivi terminé',[R()-n0,'d' in ui.pending],[2,false]);
   // ▶ Backup (vraie runBackupNow) : /access relu puis dernier Bkp relevé AVANT le lancement ; réussi -> suivi ; échec -> rien
   const rb=new Function('env',`const pendingBkp={}; let myAccess=env.acc;
-    const confirm=()=>true, getPassphrase=()=>'pw', alert=()=>{}, loadMachines=()=>{ env.loads++; };
+    const confirm=()=>true, getPassphrase=()=>'pw', alert=()=>{}, loadMachines=()=>{ env.loads++; }, refreshBkpButtons=()=>{ env.refresh++; };
     const loadMyAccess=async()=>{ env.fetched++; myAccess=env.fresh; return myAccess; };
     const apiCall=async()=>{ myAccess=env.after; return env.resp; };
     ${grab('bkpRef')}
     ${grab('notePendingBkp')}
 async ${grab('runBackupNow')}
     return {runBackupNow,pendingBkp};`);
-  const rbEnv={loads:0,fetched:0,resp:{exitcode:0,httpStatus:200},acc:acc({ok:B('périmé','x')}),
+  const rbEnv={loads:0,fetched:0,refresh:0,resp:{exitcode:0,httpStatus:200},acc:acc({ok:B('périmé','x')}),
                fresh:acc({ok:B('frais','x'),ko:B('frais','x')}),after:acc({ok:B('pendant',null,true)})};
   const rbUi=rb(rbEnv), btn={textContent:'▶',disabled:false};
   await rbUi.runBackupNow('ok',btn);
   rbEnv.resp={exitcode:1,httpStatus:403,detail:'refusé'}; await rbUi.runBackupNow('ko',btn);
   eq('runBackupNow : /access relu, prev relevé avant le lancement, réussi suivi, échec non suivi, bouton rendu',
-     [rbEnv.fetched,rbUi.pendingBkp.ok&&rbUi.pendingBkp.ok.prev,'ko' in rbUi.pendingBkp,btn.disabled,btn.textContent,rbEnv.loads],
-     [2,'frais',false,false,'▶',2]);
+     [rbEnv.fetched,rbUi.pendingBkp.ok&&rbUi.pendingBkp.ok.prev,'ko' in rbUi.pendingBkp,btn.disabled,btn.textContent,rbEnv.loads,rbEnv.refresh],
+     [2,'frais',false,false,'▶',2,2]);
+  // UI 1.28.0 (story 118) : probePullNicks — GET /bkp/probe pour les nicks tirés (bkp_pull true) dont l'appelant peut lancer un Bkp,
+  // jamais les autres ; résultat gardé par nick, refus/erreur -> oublié ; badges et boutons rafraîchis ; refreshBkpButtons : boutons
+  // de la page grisés/rendus (un bouton en cours de lancement laissé tel quel)
+  const pp=new Function('env',`let myAccess=env.acc; const bkpProbe={};
+    const apiCall=async(m,p,params)=>{ env.sent.push([m,p,params.nick]); return env.resp[params.nick]; };
+    const refreshStateBadges=()=>{ env.badges++; }, renderActionList=()=>{ env.actions++; };
+    const document={querySelectorAll:()=>env.btns,getElementById:id=>id==='runActionBtn'?env.run:null};
+    let bkpProbeBusy=false, currentViewId='view-machines', currentNick=null, currentActionId=null;
+    ${grab('opAllowed')}
+${grab('bkpAbsentTitle')}
+${grab('refreshBkpButtons')}
+${grab('refreshBkpViews')}
+async ${grab('probePullNicks')}
+    return {probePullNicks,refreshBkpButtons,bkpProbe,set:(acc,v,n,a)=>{ myAccess=acc; currentViewId=v; currentNick=n; currentActionId=a; }};`);
+  const mkBtn=(n,t)=>({dataset:{nick:n},textContent:t||'▶ Backup',disabled:false,title:'',removeAttribute(a){ if(a==='title') this.title=''; }});
+  const ppEnv={sent:[],badges:0,actions:0,run:mkBtn('d','Exécuter'),btns:[mkBtn('a'),mkBtn('b'),mkBtn('c','Lancement…')],
+    acc:acc({a:{ops:['read','bkp'],bkp_pull:true},b:{ops:['read','bkp'],bkp_pull:true},c:{ops:['read','bkp'],bkp_pull:true},
+             n:{ops:['read','bkp'],bkp_pull:false},r:{ops:['read'],bkp_pull:true},o:{ops:['read','bkp']}}),
+    resp:{a:{httpStatus:200,pull:true,state:'absent',message:'ssh: connect to host a port 22: Connection timed out'},
+          b:{httpStatus:200,pull:true,state:'joignable',message:null},c:{httpStatus:403,detail:'refusé'}}};
+  const ppUi=pp(ppEnv);
+  await ppUi.probePullNicks();
+  eq('probePullNicks : sondés = nicks tirés avec op bkp seulement (ni non tiré, ni lecture seule, ni ancien serveur)',
+     ppEnv.sent.map(x=>x.join(' ')).sort(),['GET /bkp/probe a','GET /bkp/probe b','GET /bkp/probe c']);
+  eq('probePullNicks : absent et joignable gardés, refus oublié ; badges rafraîchis',
+     [ppUi.bkpProbe.a&&ppUi.bkpProbe.a.state,ppUi.bkpProbe.b&&ppUi.bkpProbe.b.state,'c' in ppUi.bkpProbe,ppEnv.badges],['absent','joignable',false,1]);
+  eq('refreshBkpButtons : a grisé (info-bulle), b actif, c en lancement laissé tel quel',
+     [ppEnv.btns[0].disabled,ppEnv.btns[0].title.includes('Connection timed out'),ppEnv.btns[1].disabled,ppEnv.btns[2].textContent],[true,true,false,'Lancement…']);
+  ppEnv.resp.a={httpStatus:200,pull:true,state:'joignable',message:null}; await ppUi.probePullNicks();
+  eq('client revenu : bouton rendu, info-bulle retirée',[ppEnv.btns[0].disabled,ppEnv.btns[0].title],[false,'']);
+  // revue 1 row 10 : plus aucun nick tiré -> boutons rafraîchis quand même (un grisé d'un nick oublié est rendu)
+  ppEnv.resp.a={httpStatus:200,pull:true,state:'absent',message:'x'}; await ppUi.probePullNicks();
+  const acc0=ppEnv.acc; ppUi.set(acc({a:{ops:['read','bkp'],bkp_pull:false}}),'view-machines',null,null); const nSent=ppEnv.sent.length;
+  await ppUi.probePullNicks();
+  eq('plus aucun nick tiré : aucune sonde, sonde oubliée, bouton rendu',[ppEnv.sent.length-nSent,'a' in ppUi.bkpProbe,ppEnv.btns[0].disabled],[0,false,false]);
+  // revue 1 row 2 (décision de l'utilisateur) : page détail — liste d'actions redessinée et Exécuter de « Lancer un backup » grisé
+  ppEnv.resp.d={httpStatus:200,pull:true,state:'absent',message:'ssh: connect to host d port 22: Connection refused'};
+  ppUi.set(acc({d:{ops:['read','bkp'],bkp_pull:true}}),'view-detail','d','bkp'); const act0=ppEnv.actions;
+  await ppUi.probePullNicks();
+  eq('page détail, client absent : actions redessinées, Exécuter grisé (info-bulle)',
+     [ppEnv.actions-act0,ppEnv.run.disabled,ppEnv.run.title.includes('Connection refused')],[1,true,true]);
+  ppEnv.resp.d={httpStatus:200,pull:true,state:'inconnu',message:null}; await ppUi.probePullNicks();
+  eq('page détail, client inconnu : Exécuter actif',[ppEnv.run.disabled,ppEnv.run.title],[false,'']);
+  // revue 2 row 30 : probePullNicks(nick) — ce nick seul sondé, résultats des autres gardés
+  ppUi.set(acc({d:{ops:['read','bkp'],bkp_pull:true},e:{ops:['read','bkp'],bkp_pull:true}}),'view-machines',null,null);
+  ppEnv.resp.e={httpStatus:200,pull:true,state:'absent',message:'m'}; await ppUi.probePullNicks();
+  const nS=ppEnv.sent.length; ppEnv.resp.d={httpStatus:200,pull:true,state:'joignable',message:null};
+  await ppUi.probePullNicks('d');
+  eq('probePullNicks(nick) : ce nick seul sondé, résultat des autres gardé',
+     [ppEnv.sent.slice(nS).map(x=>x[2]),ppUi.bkpProbe.d&&ppUi.bkpProbe.d.state,ppUi.bkpProbe.e&&ppUi.bkpProbe.e.state],[['d'],'joignable','absent']);
+  // openMachine (vraie fonction) : une sonde, du nick ouvert seulement
+  const om=new Function('env',`let currentNick=null, currentActionId='x';
+    const document={getElementById:id=>env.els[id]||(env.els[id]={textContent:'',innerHTML:'',value:''})};
+    const plainDbBadge=()=>'', stateBadges=()=>'', getPassphrase=()=>'', updateDetailPassStatus=()=>{}, renderActionList=()=>{},
+          showView=v=>{ env.view=v; }, probePullNicks=(...a)=>{ env.probes.push(a); };
+    ${grab('openMachine')}
+    return openMachine;`);
+  const omEnv={els:{},probes:[]}; om(omEnv)('srv-x');
+  eq('openMachine : une sonde, du nick ouvert seulement',[omEnv.probes,omEnv.view],[[['srv-x']],'view-detail']);
+  ppUi.set(acc0,'view-machines',null,null);
+  // Service worker (SW 1.5.0, revue 2 row 25) : alerte de retard d'un nick sans Bkp réussi (no_backup) -> « Aucune sauvegarde — client
+  // absent depuis X » ; sans le drapeau : texte d'avant
+  {
+    const swSrc=fs.readFileSync(path.join(path.dirname(htmlPath),'borgHelperWWW_sw.js'),'utf8');
+    const sgrab=n=>{ const i=swSrc.indexOf('function '+n+'('); if(i<0) throw new Error('sw: '+n); let d=0,j=swSrc.indexOf('{',i);
+      for(;;j++){ if(swSrc[j]==='{') d++; else if(swSrc[j]==='}' && --d===0) break; } return swSrc.slice(i,j+1); };
+    const describe=new Function(['warningsText','hours','bytes','describe'].map(sgrab).join('\n')+'\nreturn describe;')();
+    const nb=describe({event:'overdue',nick:'n1',age_hours:30,max_age_hours:25,no_backup:true,reminder:false});
+    const ob=describe({event:'overdue',nick:'n1',age_hours:30,max_age_hours:25,reminder:false});
+    eq('service worker : retard sans Bkp réussi -> « Aucune sauvegarde — client absent depuis 30 h » ; sinon texte d\'avant',
+       [nb.title,nb.body,ob.body],['⏰ Sauvegarde en retard — n1','Aucune sauvegarde — client absent depuis 30 h (seuil : 25 h). Vérifier que le client est joignable.',
+        'Dernière sauvegarde il y a 30 h (seuil : 25 h). Vérifier la planification des sauvegardes.']);
+  }
   // Actions, historique et carte (UI 1.19.0) : vraies fonctions de la page, DOM minimal simulé.
   const grabConst=name=>{ const i=src.indexOf('const '+name+'=[');
     if(i<0) throw new Error('const '+name+'=[ introuvable dans '+htmlPath); let d=0,j=src.indexOf('[',i);
     for(;;j++){ if(src[j]==='[') d++; else if(src[j]===']' && --d===0) break; } return src.slice(i,j+1)+';'; };
   const dom={els:{},byId(id){ return this.els[id]||(this.els[id]={innerHTML:'',textContent:'',classList:{toggle(){},add(){},remove(){}}}); }};
-  let reportStdout='', histLoads=[], versionJson={};
+  let reportStdout='', histLoads=[], versionJson={}; const pageProbe={};
   const page=new Function('dom','hooks',`
     const document={getElementById:id=>dom.byId(id),querySelectorAll:()=>[],
       createElement:()=>{ const el={set innerHTML(h){ this._h=h; this.firstElementChild={html:h,querySelector:()=>'panel',closest:()=>null}; }}; return el; }};
@@ -301,9 +387,12 @@ async ${grab('runBackupNow')}
     const fetch=async()=>({ok:true,json:async()=>hooks.version}), applyBadges=()=>{}, updateNotifBtn=()=>{};
     const SPINNER='…';
     const getPassphrase=()=>'', loadHistoryInline=(n,p)=>hooks.hist.push(n), apiCall=async()=>({stdout:hooks.report()});
+    const bkpProbe=hooks.probe;
     ${grab('escapeHtml')}
 ${grab('escapeAttr')}
 ${grab('opAllowed')}
+${grab('bkpAbsentTitle')}
+${grab('bkpButtonAttrs')}
 ${grab('stateBadges')}
 ${grab('badgeFor')}
 ${grab('plainDbBadge')}
@@ -316,7 +405,32 @@ ${grab('machineCardHtml')}
 ${grab('rcGroupRefresh')}
 async ${grab('reloadMachineCard')}
     return {renderActionList,selectAction,loadFooterVersions,_renderHistoryRows,reloadMachineCard,
-      set:(a,n)=>{ myAccess=a; currentNick=n; }, actions:()=>ACTIONS, cards:()=>machineCardsByNick};`)(dom,{hist:histLoads,report:()=>reportStdout,get version(){ return versionJson; }});
+      set:(a,n)=>{ myAccess=a; currentNick=n; }, actions:()=>ACTIONS, cards:()=>machineCardsByNick, machineCardHtml};`)(dom,{hist:histLoads,report:()=>reportStdout,get version(){ return versionJson; },probe:pageProbe});
+  // UI 1.28.0 (story 118) : carte d'un nick tiré dont la sonde dit le client absent -> ▶ Backup grisé (disabled, info-bulle)
+  page.set(acc({tp:{ops:['read','bkp'],bkp_pull:true}}),null);
+  const cOk=page.machineCardHtml('tp',{},false,false);
+  pageProbe.tp={state:'absent',message:'kex_exchange_identification: read: Connection reset by peer'};
+  const cAbs=page.machineCardHtml('tp',{},false,false);
+  pageProbe.tp={state:'inconnu',message:'Host key verification failed.'};
+  const cInc=page.machineCardHtml('tp',{},false,false); delete pageProbe.tp;
+  const bkpTag=h=>(h.match(/<button class="secondary bkp-now-btn"[^>]*>/)||[''])[0];
+  eq('carte : ▶ Backup actif sans sonde, grisé si client absent (info-bulle), actif si inconnu ; badge gris',
+     [bkpTag(cOk).includes('disabled'),bkpTag(cAbs).includes(' disabled title="Client absent — injoignable par ssh (ssh : kex_exchange_identification: read: Connection reset by peer)'),
+      bkpTag(cInc).includes('disabled'),cAbs.includes('🔌 client absent'),cOk.includes('client absent')],[false,true,false,true,false]);
+  // revue 1 row 2 : page détail — « Lancer un backup » grisé (et son Exécuter) quand la sonde dit absent ; inconnu/joignable : actifs
+  const bkpBtnOf=h=>(h.match(/<button[^>]*id="abtn_bkp"[^>]*>/)||[''])[0], runBtnOf=h=>(h.match(/<button[^>]*id="runActionBtn"[^>]*>/)||[''])[0];
+  const detail={};
+  for(const st of ['absent','inconnu','joignable']){
+    pageProbe.int={state:st,message:'ssh: connect to host int port 22: No route to host'};
+    page.set(acc({int:{ops:['read','restore','prune','delete','bkp'],bkp_pull:true}}),'int');
+    page.renderActionList(); const l=bkpBtnOf(dom.byId('actionList').innerHTML);
+    page.selectAction('bkp'); const r=runBtnOf(dom.byId('actionPanel').innerHTML);
+    detail[st]=[l.includes(' disabled title="Client absent — injoignable par ssh (ssh : ssh: connect to host int port 22: No route to host)'),
+                r.includes(' disabled title="Client absent'),!!l,!!r];
+  }
+  delete pageProbe.int;
+  eq('page détail : « Lancer un backup » et Exécuter grisés si absent (info-bulle), actifs si inconnu ou joignable',
+     [detail.absent,detail.inconnu,detail.joignable],[[true,true,true,true],[false,false,true,true],[false,false,true,true]]);
   page.set(acc({ext:{external:true,ops:['read','restore']},int:{ops:['read','restore','prune','delete','bkp']}}),'ext');
   page.renderActionList();
   const listExt=dom.byId('actionList').innerHTML;
@@ -1034,6 +1148,8 @@ async ${grab('downloadViaFetch')}
     const apiCall=async(m,p,params)=>{ h.sent.push(params.nick); return h.report(params); };
     const getPassphrases=()=>h.passes, getPassphrase=()=>'', loadHistoryInline=n=>h.hist.push(n), updateNotifAll=()=>{};
     const loadStorage=()=>{ h.storage=(h.storage||0)+1; };   // UI 1.26.0 (story 87a) : bloc Stockages, testé à part
+    const bkpProbe={}, probePullNicks=()=>{ h.probes=(h.probes||0)+1; };   // UI 1.28.0 (story 118) : sonde, testée à part
+    ${['bkpAbsentTitle','bkpButtonAttrs'].filter(n=>s.includes('function '+n+'(')).map(n=>grabIn(s,n)).join('\n')}
     const openMachine=n=>h.opened.push(n), openHistory=n=>h.opened.push('hist '+n), openBrowse=()=>{}, runBackupNow=n=>h.opened.push('bkp '+n);
     ${['escapeHtml','escapeAttr','respError','opAllowed','stateBadges','badgeFor','dbEncryptCmd','plainDbBadge','machineCardHtml',
        'rcOrder','nickGroups','rcGroupLabel','rcCollapsed','rcCollapsedSave','setRcCollapsed','rcGroupHtml','showRcGroup','setRcGroupCollapsed',
@@ -1073,6 +1189,7 @@ async ${grab('downloadViaFetch')}
        ['f2e34317c8bb866c','7a19973977a458f2','f8f5e7fd718be40c','7295f89b8623f2d2',["o'k&<x>",'srv-a','srv-b'],['ALL'],["o'k&<x>",'srv-a','srv-b'],false]);
     eq('mode -C : chaque carte rangée sous le nom de ses boutons ; aucun groupe dans le faux DOM',
        [c.cards.every(n=>c.ui.cards()[n].nick===n),c.h.dom.byId('machinesList').groups.length],[true,0]);
+    eq('liste dessinée : sonde des nicks tirés lancée une fois (UI 1.28.0, story 118), jamais attendue',c.h.probes,1);
   }catch(e){ eq('mode -C (story 86b) : rendu sans exception',String(e&&e.stack||e),''); }
   try{
     // Mode dossier : ordre du maître web puis mail (jamais alphabétique), préfixe hors de l'ordre (zz) en dernier, nicks nus triés.
