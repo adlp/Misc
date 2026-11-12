@@ -11,8 +11,9 @@ from .fsutil import write_private
 MAX_SECONDS = 86400.0
 
 
-def seconds(env: Mapping[str, str], name: str, default: float) -> float:
-    """Durée en secondes dans `env[name]` : 0 < v <= 86400, sinon ValueError (message d'une ligne)."""
+def seconds(env: Mapping[str, str], name: str, default: float, maximum: float = MAX_SECONDS) -> float:
+    """Durée en secondes dans `env[name]` : 0 < v <= `maximum` (86400), sinon ValueError (message
+    d'une ligne)."""
     raw = env.get(name)
     if raw is None or raw == "":
         return default
@@ -20,8 +21,8 @@ def seconds(env: Mapping[str, str], name: str, default: float) -> float:
         v = float(raw)
     except ValueError:
         v = float("nan")
-    if not 0 < v <= MAX_SECONDS:
-        raise ValueError("%s invalide : %r (secondes, entre 0 exclu et %d)" % (name, raw, MAX_SECONDS))
+    if not 0 < v <= maximum:
+        raise ValueError("%s invalide : %r (secondes, entre 0 exclu et %d)" % (name, raw, maximum))
     return v
 
 

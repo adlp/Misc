@@ -4,19 +4,37 @@ Une session par compte (CAP-10, alias `<a>`) :
 1. Keyring noyau (`keyctl`, anneau `@u` par défaut) : clé `user` nommée
    `sshvault:session:<a>`, jeton passé par stdin (jamais en argument), expiration
    posée par le noyau (`keyctl timeout`).
-2. Si `keyctl` échoue (absent, session keyring non liée à `@u` ou révoquée…) :
-   fichier 0600 `$XDG_RUNTIME_DIR/sshvault/sessions/<a>` (dossiers 0700), qui porte sa
+2. Repli : fichier 0600 `$XDG_RUNTIME_DIR/sshvault/sessions/<a>` (dossiers 0700), qui porte sa
    date d'expiration ; il est expiré à la lecture et purgé au `lock`. XDG_RUNTIME_DIR
-   doit être à l'utilisateur, sans droits groupe/autres, sur tmpfs ou ramfs.
+   doit être à l'utilisateur, sans droits groupe/autres, sur tmpfs ou ramfs. Il sert quand le
+   keyring est refusé ou illisible (voir ci-dessous), et à l'écriture quand `padd` échoue.
 
 Sans alias : magasin de la 0.8.0 (`sshvault:session`, `$XDG_RUNTIME_DIR/sshvault/session`),
 seulement vidé à l'adoption d'une installation existante.
+
+Erreurs de `keyctl` en lecture (`search` ou `pipe`) :
+- pas de session : « Required key not available », « Key has expired » ou « Key has been
+  revoked » (mesuré : `search` dit « revoked » ou « expired » comme `pipe`) ;
+- keyring refusé, repli fichier silencieux : « Operation not permitted », « Function not
+  implemented », `keyctl` absent ou inexécutable (ENOENT, EACCES, ENOEXEC, ENOTDIR, ELOOP,
+  ENAMETOOLONG seulement) ;
+- toute autre erreur (délai dépassé, « Permission denied », erreur transitoire du système :
+  EAGAIN, ENOMEM…) : keyring illisible. Sans session dans le fichier de repli,
+  `SessionStoreError` « session illisible : keyctl <raison> » ; la session rangée n'est ni
+  effacée ni réécrite. Le résultat est retenu par instance du magasin (un compte : la même
+  commande n'attend pas le délai à chaque lecture) ; une fois le keyring vu illisible, `put`
+  n'écrit que le fichier et n'efface pas celui qui existe.
+`get()` lit le fichier d'abord : il n'existe que si le dernier `put` a évité le keyring ; une
+vieille clé du keyring ne doit pas lui passer devant (bw la refuserait et la session neuve serait
+purgée). Délai d'un appel : `SSHVAULT_KEYCTL_TIMEOUT` (secondes, 0 exclu à 600, défaut 10 ; invalide :
+`ValueError`, code 2 à la CLI).
 
 Rien n'est écrit sur un stockage persistant. Sans keyring utilisable ni
 `XDG_RUNTIME_DIR`, la session n'est pas rangée (`SessionStoreError`).
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import subprocess
@@ -24,6 +42,7 @@ import time
 from typing import Callable, Optional
 
 from .fsutil import NotPrivateTmpfs, check_private_tmpfs, read_private, write_private
+from .settings import seconds
 
 KEY_DESC = "sshvault:session"
 SESSIONS_DIR = "sessions"
@@ -34,6 +53,27 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_.:-]{8,4096}")
 
 class SessionStoreError(Exception):
     pass
+
+
+class _Unusable(str):
+    """Raison d'échec d'un `keyctl` impossible à lancer (absent, inexécutable) : keyring inutilisable."""
+
+
+#: Sorties de `keyctl` (minuscules) qui disent « pas de session » (clé absente ou expirée entre
+#: deux appels) et celles qui disent « keyring refusé » (conteneur, seccomp, noyau sans keyring).
+_NO_KEY = ("required key not available", "key has expired", "key has been revoked")
+_REFUSED = ("operation not permitted", "function not implemented")
+#: Seuls échecs de lancement qui disent « keyctl inutilisable » (absent, inexécutable) ; les autres
+#: (EAGAIN, ENOMEM…) sont transitoires : keyring illisible.
+_UNUSABLE_ERRNO = (errno.ENOENT, errno.EACCES, errno.ENOEXEC, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG)
+TIMEOUT_VAR = "SSHVAULT_KEYCTL_TIMEOUT"
+MAX_KEYCTL_TIMEOUT = 600.0
+
+
+def keyctl_timeout(env=None) -> float:
+    """Délai d'un appel à `keyctl` : `SSHVAULT_KEYCTL_TIMEOUT` (0 < s <= 600), sinon KEYCTL_TIMEOUT ;
+    invalide (nan, inf, 0, 601, texte) : ValueError, message d'une ligne (code 2 à la CLI)."""
+    return seconds(os.environ if env is None else env, TIMEOUT_VAR, float(KEYCTL_TIMEOUT), MAX_KEYCTL_TIMEOUT)
 
 
 def valid_token(token: Optional[str]) -> bool:
@@ -73,22 +113,51 @@ class SessionStore:
         self.clock = clock
         self.mounts = mounts
         self.last_backend: Optional[str] = None  # "keyring" | "file" : où get() a trouvé la session
+        self.timeout = keyctl_timeout(env)
+        #: keyring vu illisible par cette instance : même erreur sans nouvel appel (ni nouvelle attente)
+        self._unreadable: Optional[SessionStoreError] = None
+
+    @property
+    def keyring_unreadable(self) -> bool:
+        """Le keyring a été vu illisible par cette instance (`keyctl` en panne, pas « refusé »)."""
+        return self._unreadable is not None
 
     # --- keyring -------------------------------------------------------------
 
     def _keyctl(self, *args: str, data: Optional[str] = None):
         try:
             r = subprocess.run([self.keyctl, *args], input=data, capture_output=True, text=True,
-                               timeout=KEYCTL_TIMEOUT, stdin=None if data is not None else subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError) as e:
+                               timeout=self.timeout, stdin=None if data is not None else subprocess.DEVNULL)
+        except OSError as e:
+            if e.errno in _UNUSABLE_ERRNO:
+                return None, _Unusable(str(e))
+            return None, str(e.strerror or e)
+        except subprocess.TimeoutExpired:
+            return None, "délai dépassé (%g s)" % self.timeout
+        except subprocess.SubprocessError as e:
             return None, str(e)
         if r.returncode != 0:
             return None, (r.stderr or r.stdout).strip() or "code %d" % r.returncode
         return r.stdout, None
 
+    def _keyring_error(self, err: str) -> None:
+        """Échec d'un `keyctl` de lecture : rien si c'est « pas de session » (absente, expirée,
+        révoquée) ou « keyring refusé » (repli fichier) ; sinon SessionStoreError « session
+        illisible : keyctl <raison> », retenue."""
+        low = err.lower()
+        if isinstance(err, _Unusable) or any(m in low for m in _NO_KEY + _REFUSED):
+            return
+        self._unreadable = SessionStoreError("session illisible : keyctl %s" % err)
+        raise self._unreadable
+
     def _key_id(self) -> Optional[str]:
-        out, _ = self._keyctl("search", self.keyring, "user", self.key_desc)
-        return out.strip() if out else None
+        if self._unreadable is not None:
+            raise self._unreadable
+        out, err = self._keyctl("search", self.keyring, "user", self.key_desc)
+        if out is None:
+            self._keyring_error(err)
+            return None
+        return out.strip() or None
 
     def _keyring_put(self, token: str, ttl: int) -> Optional[str]:
         """Renvoie None si la session est rangée avec son délai, sinon la raison de l'échec."""
@@ -107,12 +176,18 @@ class SessionStore:
         kid = self._key_id()
         if not kid:
             return None
-        out, _ = self._keyctl("pipe", kid)
+        out, err = self._keyctl("pipe", kid)
+        if out is None:
+            self._keyring_error(err)
+            return None
         return out if out and valid_token(out) else None
 
     def _keyring_clear(self) -> None:
         for _ in range(8):
-            kid = self._key_id()
+            try:
+                kid = self._key_id()
+            except SessionStoreError as e:
+                raise SessionStoreError("%s ; la session peut rester dans le keyring" % e) from None
             if not kid:
                 return
             _, err = self._keyctl("unlink", kid, self.keyring)
@@ -160,12 +235,19 @@ class SessionStore:
     # --- API ------------------------------------------------------------------
 
     def get(self) -> Optional[str]:
-        token = self._keyring_get()
+        """Session rangée, ou None. Le fichier d'abord (il n'existe que si le dernier `put` a évité
+        le keyring : la session neuve ne doit pas être masquée par une vieille clé du keyring),
+        puis le keyring. Keyring illisible (délai, droits…) et rien dans le fichier :
+        SessionStoreError « session illisible » (jamais None : « pas de session » n'est dit que
+        si keyctl l'a dit)."""
+        token = self._file_get()
+        if token:
+            self.last_backend = "file"
+            return token
+        self.last_backend = None
+        token = self._keyring_get()  # SessionStoreError : keyring illisible, rien dans le fichier
         if token:
             self.last_backend = "keyring"
-            return token
-        token = self._file_get()
-        self.last_backend = "file" if token else None
         return token
 
     def put(self, token: str, ttl: int = DEFAULT_TTL) -> str:
@@ -174,7 +256,11 @@ class SessionStore:
             raise SessionStoreError("jeton de session invalide")
         if not isinstance(ttl, int) or ttl < 1:
             raise SessionStoreError("durée de vie invalide : %r" % (ttl,))
-        why = self._keyring_put(token, ttl)
+        if self._unreadable is not None:
+            # keyring vu illisible : fichier seulement, celui qui existe n'est pas effacé
+            why = "keyring illisible (%s)" % self._unreadable
+        else:
+            why = self._keyring_put(token, ttl)
         if why is None:
             self.last_backend = "keyring"
             try:
@@ -225,7 +311,11 @@ class SessionStore:
         """Session déplacée vers le magasin `other` (compte renommé), même jeton, durée restante
         gardée ; renvoie "keyring", "file" ou None (aucune session). Échec : SessionStoreError
         (l'appelant oublie alors la session)."""
-        token = self._keyring_get()
+        unreadable = None
+        try:
+            token = self._keyring_get()
+        except SessionStoreError as e:
+            token, unreadable = None, e
         if token:
             ttl = self._keyring_ttl()
             if not ttl or ttl < 1:
@@ -242,6 +332,8 @@ class SessionStore:
             except OSError as e:
                 raise SessionStoreError("déplacement de %s : %s" % (self.file, e.strerror or e)) from None
             return "file"
+        if unreadable is not None:
+            raise unreadable
         return None
 
     def describe(self) -> str:

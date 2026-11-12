@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.16.2) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.17.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -989,10 +989,31 @@ avertissements) ; une ligne absolue déjà en tête n'est pas réécrite :
   une ligne hors bloc, au-dessus du bloc (toute ligne après une ligne `Host`/`Match` est dans
   un bloc) mais pas en tête, désigne aussi le fichier généré : sshvault
   s'applique alors partout, l'avertissement est celui d'un `Include` qui n'est pas en tête ;
+- un `Include` sous un bloc qui prend **tous les hôtes** s'applique à tous (mesuré, OpenSSH
+  8.9) : jamais « conditionnel ». Sont de ceux-là `Match all`, `Match host *` et `Match
+  originalhost *` (liste à virgules sans négation), et `Host` avec au moins un motif positif
+  `*` ou `?*` et aucun motif nié : `Host *`, `Host web *`, `Host * *.example.com`. Il est « en
+  tête » si rien d'effectif ne précède cette ligne (seulement des commentaires, ou d'autres
+  blocs de ce genre sans rien dedans) ; sinon la valeur précédente l'emporte : « pas en
+  tête », et `install` déplace la ligne exacte comme une ligne hors bloc. Tout autre bloc
+  (`Host web`, `Host * !web`, `Host ?`, `Host *.*`, `Host ??*`, `Match host x`, `Match
+  canonical all`) reste conditionnel ;
 - sauvegarde avant toute écriture, jamais écrasée : `~/.ssh/config.sshvault.bak`, sinon
   `.bak.1`, `.bak.2`… (0600) ; écriture atomique, mode et propriétaire conservés ; fichier
   absent : créé en 0600 (et `~/.ssh` en 0700 s'il manque), sans écraser un fichier créé
-  entre-temps ;
+  entre-temps. **`~/.ssh` lui-même lien symbolique** (souvent vers un dépôt versionné) : la
+  sauvegarde est écrite sous `$XDG_STATE_HOME/sshvault/` (défaut `$HOME/.local/state/sshvault/`, ou
+  le répertoire personnel de sshvault si `HOME` est relatif ou « / » ; dossier 0700 créé au besoin :
+  `~/.local` et `~/.local/state` aussi, s'ils manquent), jamais dans
+  l'arbre du lien ; son chemin est dit dans le message et un avertissement rappelle que
+  `~/.ssh/sshvault/` (config générée, `pub/`) est dans l'arbre du lien. Dossier d'état dans
+  l'arbre de `~/.ssh` (`XDG_STATE_HOME` y mène, lien compris) ou impossible à créer : code 4, rien
+  modifié, une ligne qui dit le chemin ;
+- fichier écrit (`~/.ssh/config`, ou la cible de son lien) à **plusieurs liens physiques**
+  (`st_nlink > 1`) : `install` et `uninstall` refusent (code 4, rien modifié, une ligne avec
+  l'action à faire à la main : « ajouter en première ligne de <fichier> : Include … » ou « retirer
+  de <fichier> la ligne N : … »), car le remplacement atomique le détacherait de ses autres noms ;
+  rien à y écrire (Include déjà en tête, rien à retirer) : code 0 et un avertissement ;
 - `~/.ssh/config` **lien symbolique** (config versionnée par git, `~/.ssh/config →
   ~/dotfiles/ssh/config`) : le lien est suivi maillon par maillon (liens relatifs résolus
   depuis le chemin réel de leur dossier, comme le noyau) et la ligne est écrite dans sa
@@ -1017,7 +1038,19 @@ avertissements) ; une ligne absolue déjà en tête n'est pas réécrite :
   lève à lui seul toutes les raisons (ssh refuse de toute façon une cible ouverte). Contrôle
   échoué mais `Include` de sshvault déjà en tête de la cible : rien à écrire, code 0, « déjà
   en tête, rien changé » et un avertissement qui nomme le lien, la cible et la raison (aucun
-  pour un dossier de la cible seulement non modifiable). Aucune option pour passer outre ;
+  pour un dossier de la cible seulement non modifiable). Aucune option pour passer outre.
+  `ssh-config --check` et les avertissements qui suivent une régénération appliquent les mêmes
+  contrôles d'ssh (hors « dossier de la cible non modifiable », qui n'en est pas un) : cible
+  refusée, une ligne d'avertissement (lien, cible, raison, `chmod` proposé s'il suffit) et
+  jamais « à jour » (`--check` : code 1). Trois cas, dits à part : la cible est refusée par ssh
+  lui-même (propriétaire ni vous ni root, ou modifiable par le groupe ou les autres : « Bad owner
+  or permissions », toute la configuration est perdue, chaque ssh s'arrête : seul cas qui dit « ssh
+  refuse ») ; ssh ne lit rien (lien cassé, boucle, cible non ordinaire) ; seule une règle de
+  sshvault plus stricte que celle d'ssh échoue (cible à root, dossiers ouverts) : ssh lit la
+  cible, sshvault n'y écrit pas. Même contrôle pour un `~/.ssh/config` ordinaire (0664…), dans
+  `--check`, les régénérations, et `install`/`uninstall` (« déjà en tête » et « rien à retirer »
+  compris). Le remplacement atomique vérifie aussi que le nombre de liens physiques n'a pas changé
+  entre la lecture et l'écriture ; refusé, la sauvegarde qu'on vient d'écrire est retirée ;
 - `~/.ssh/config` non ordinaire (FIFO, dossier) : code 4, rien modifié ; chemin personnel
   avec `%`, `$` ou un joker de glob : code 4, quelle que soit la forme écrite (`Include`
   développe les tokens dans les versions récentes d'OpenSSH, pas en 8.9 ; le glob lit
@@ -1355,6 +1388,22 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
   `XDG_RUNTIME_DIR` appartient à l'utilisateur, sans droits groupe/autres, sur tmpfs
   ou ramfs ; sinon la session n'est pas rangée (`unlock` : code 4 ; `list` marche
   avec un avertissement). `lock` vide les deux. Une session refusée par `bw` est purgée.
+  Erreurs de `keyctl` (`search` comme `pipe`) : « Required key not available », « Key has
+  expired » et « Key has been revoked » = pas de session ; keyring refusé (« Operation not
+  permitted », « Function not implemented ») ou `keyctl` impossible à lancer (ENOENT, EACCES,
+  ENOEXEC, ENOTDIR, ELOOP, ENAMETOOLONG) = repli fichier, sans bruit ; toute autre erreur (délai
+  dépassé, « Permission denied », erreur transitoire EAGAIN/ENOMEM…) n'est pas « pas de
+  session » : sans session dans le fichier de repli, la commande s'arrête en code 4 avec
+  « session illisible : keyctl <raison> » (jamais « coffre verrouillé » : `list`, `ensure`… ; la
+  session rangée n'est ni effacée ni réécrite). Le fichier de repli est lu avant le keyring (il
+  n'existe que si le dernier rangement a évité le keyring : une vieille clé du keyring ne masque
+  pas la session neuve). Un keyring vu illisible le reste pour le magasin de ce compte (un seul
+  délai par compte et par commande ; l'adoption 0.8.0 et `account rename` ouvrent leurs propres
+  magasins). `unlock` le traite comme « pas de session » : il déverrouille et range la session dans
+  le fichier seulement, sans toucher au keyring ni effacer le fichier (« session 900s, file,
+  keyring illisible »). `lock`, `logout` et `account set` qui ne peuvent pas oublier la session
+  (toute erreur du magasin ; keyctl : « la session peut rester dans le keyring ») le disent et
+  rendent le code 4.
 - **Invite** : `/dev/tty` (pas stdin) si le processus est au premier plan du terminal,
   ou le programme `SSH_ASKPASS`, selon les règles de `man ssh` pour
   `SSH_ASKPASS_REQUIRE` (`never`, `prefer`, `force`) et `DISPLAY`/`WAYLAND_DISPLAY`.
@@ -1370,6 +1419,7 @@ le code 2. Toute erreur est une ligne sur stderr, sans traceback.
 | `SSHVAULT_PROMPT_TIMEOUT` | délai d'une invite, en secondes, 0 < v ≤ 86400 (défaut 60) |
 | `SSHVAULT_ENSURE_TIMEOUT` | délai global d'un `ensure` depuis son démarrage, attente du verrou comprise, en secondes, 0 < v ≤ 86400 (défaut 240) ; borne aussi l'attente d'`ensure.lock` par `load --nointeraction` (interactif : sans limite) |
 | `SSHVAULT_KEYRING`, `SSHVAULT_KEYCTL` | anneau et exécutable `keyctl` (tests ; défaut `@u`, `keyctl`) |
+| `SSHVAULT_KEYCTL_TIMEOUT` | délai d'un appel à `keyctl` en secondes (0 exclu à 600 ; défaut 10 ; invalide : code 2, comme les autres délais) |
 | `XDG_DATA_HOME` | base des dossiers de données de `bw`, un par compte (défaut `~/.local/share`) |
 | `XDG_RUNTIME_DIR` | repli fichier de la session ; socket et état de l'agent dédié (tmpfs privé exigé) |
 | `XDG_CONFIG_HOME` | base de `sshvault/config.json` (défaut `~/.config`) |
@@ -1436,7 +1486,14 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   code 0 et avertissement ; `ssh -G -F` réel qui lit `Include "~/…"` avec le HOME du banc (et
   rien avec un autre HOME) ; HOME différent : forme absolue. `install` : joker ou ligne mixte
   plus bas, dans un bloc ou en tête (gardé, avertissement), exact dans un bloc (refus), puis
-  `uninstall`.
+  `uninstall`. Story 22 : `Host *`/`Match all` (en tête, plus bas, autres blocs conditionnels,
+  `ssh -G` réel sur les deux), `--check` et régénération sur une cible de lien refusée par ssh
+  (0664, cassé, boucle, FIFO, dossier ouvert ; « dossier non modifiable » non dit), fichier à
+  liens physiques (refus, déjà en tête, rien à retirer, cible de lien), `~/.ssh` lien
+  (sauvegarde sous `XDG_STATE_HOME` ou `~/.local/state`, jamais dans l'arbre du lien), faux
+  `keyctl` (délai dépassé, « Permission denied », clé révoquée, pas de session, keyring
+  refusé, `keyctl` absent ; session du keyring intacte ; `list` puis `ensure` sans
+  « verrouillé »).
   Jokers : chaque forme mesurée (`~/.ssh/*`, `~/*/sshvault/config`, `~/.ssh/*/config`,
   `~/.*/sshvault/config`, `?`, `[s]`, `[!x]`, `[.]`…) comparée à la réponse d'`ssh -G` du
   poste ; formes relatives à `~/.ssh`, jokers sous un lien symbolique ; `install`,

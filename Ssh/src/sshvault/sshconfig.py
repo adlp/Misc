@@ -31,7 +31,12 @@ puis, sur demande seulement, la ligne `Include` en tête de `~/.ssh/config`.
   `~/.ssh/sshvault/config` et les `*.pub` de `pub/`, rien d'autre. `~/.ssh/config` lien
   symbolique : suivi, écrit dans sa cible (lien et maillons jamais modifiés) si elle passe les
   contrôles d'ssh (`_follow`) ; sinon, s'il faudrait y écrire, refus qui donne l'action à
-  faire à la main, et sans rien à y écrire, avertissement seulement.
+  faire à la main, et sans rien à y écrire, avertissement seulement. `--check` et les
+  avertissements d'après régénération appliquent ces contrôles (une ligne, jamais « à jour »).
+  Fichier écrit à plusieurs liens physiques : même règle (refus, ou avertissement sans écriture) ;
+  `~/.ssh` lui-même lien symbolique : sauvegarde sous `$XDG_STATE_HOME/sshvault/`.
+- `Include` sous `Host *` ou `Match all` : s'applique à tous les hôtes, jamais conditionnel ;
+  en tête si rien d'effectif ne précède (`scan`).
 - `~/.ssh` = répertoire de passwd (celui où ssh lit `~/.ssh/config`), pas `$HOME`. Le `~`
   d'une ligne `Include` est développé par ssh avec `$HOME` (glob, mesuré 8.9p1) : la ligne
   écrite n'a la forme `~` que si `$HOME` est ce répertoire (`include_line`).
@@ -1452,25 +1457,52 @@ class Scan:
         return "below" if self.ours else "missing"
 
 
+def _all_hosts(pattern: str) -> bool:
+    """Motif qui prend tout nom d'hôte (règle stricte : `*`, `?*`…) : attrape-tout (`is_catch_all`)
+    sans `.`, avec au moins un `*` et au plus un `?` (`*.*`, `.`, `??*`, `?` y échappent)."""
+    return is_catch_all(pattern) and "." not in pattern and "*" in pattern and pattern.count("?") <= 1
+
+
+def _catch_all_block(kw: str, rest: str) -> bool:
+    """Ligne `Host`/`Match` qui s'applique à tous les hôtes (mesuré, OpenSSH 8.9) : `Match all` ;
+    `Match host P` ou `Match originalhost P` (P : liste à virgules) ; `Host P…` : au moins un motif
+    positif qui prend tout nom d'hôte (`_all_hosts`) et aucun motif nié (`!`) ; `Host web *` et
+    `Host * *.example.com` en sont, `Host ?` et `Host * !web` non."""
+    args = [a for a, _ in _include_args(rest)]
+    if kw == "match":
+        if [a.lower() for a in args] == ["all"]:
+            return True
+        if len(args) != 2 or args[0].lower() not in ("host", "originalhost"):
+            return False
+        args = args[1].split(",")
+    return bool(args) and not any(a.startswith("!") for a in args) and any(_all_hosts(a) for a in args)
+
+
 def scan(text: str, paths: Paths) -> Scan:
     """Lignes coupées sur « \n » seulement (comme ssh). En tête = l'`Include` est la première
-    ligne qui n'est ni vide ni un commentaire ; après une ligne Host/Match, il est conditionnel."""
+    ligne effective : ni vide ni commentaire, et seulement précédée de lignes de blocs « tous les
+    hôtes » (`_catch_all_block` : `Host *`, `Host web *`, `Match all`, `Match host *`…) sans rien
+    dedans (mesuré, OpenSSH 8.9 : un `Include` sous un tel bloc s'applique à tous les hôtes ; un
+    bloc ou une directive qui le précède l'emporte). Après une ligne Host/Match qui ne prend pas
+    tous les hôtes, il est conditionnel ; sous un bloc « tous les hôtes », jamais."""
     sc = Scan(text.split("\n"), read=_Read(paths))
-    first, in_block = None, False
+    lead, in_block = True, False
     for i, line in enumerate(sc.lines):
         kw, rest = _keyword(line)
         if kw is None:
             continue
-        if first is None:
-            first = i
         if kw in ("host", "match"):
-            in_block = True
-        elif kw == "include":
+            catch = _catch_all_block(kw, rest)
+            in_block = not catch
+            lead = lead and catch
+            continue
+        if kw == "include":
             refs = _refs(rest, paths, sc.read)
             if any(refs):
                 sc.ours.append((i, in_block, all(refs)))
-                if i == first:
+                if lead:
                     sc.head = True
+        lead = False
     return sc
 
 
@@ -1534,10 +1566,44 @@ def _include_warning(st: str, sc: Optional[Scan], paths: Paths) -> Optional[str]
     return "%s n'inclut pas %s : ssh ne s'en sert pas ; lancer « sshvault ssh-config install »" % (p, paths.config)
 
 
+def _file_unread(path: str) -> Optional[str]:
+    """`~/.ssh/config` fichier ordinaire que ssh refuserait (« Bad owner or permissions », mesuré :
+    propriétaire ni l'utilisateur ni root, ou modifiable par le groupe ou les autres) : une ligne
+    d'avertissement avec le `chmod` s'il suffit (fichier à l'utilisateur) ; None sinon. ssh refuse
+    toute la configuration : chaque ssh s'arrête, pas seulement la ligne Include de sshvault."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    why = []
+    if st.st_uid not in (0, os.getuid()):
+        why.append("fichier à un autre utilisateur (uid %d)" % st.st_uid)
+    if st.st_mode & 0o022:
+        why.append("fichier modifiable par le groupe ou les autres (%04o)" % stat.S_IMODE(st.st_mode))
+    if not why:
+        return None
+    fix = " ; corriger par « chmod g-w,o-w %s »" % shlex.quote(clean(path)) if st.st_uid == os.getuid() else ""
+    return ("%s non conforme (%s) : ssh refuse de lire toute la configuration (chaque ssh s'arrête sur « Bad owner "
+            "or permissions »), la ligne Include de sshvault comprise%s" % (clean(path), " ; ".join(why), fix))
+
+
 def include_warnings(paths: Paths) -> list:
     """Avertissements sur la ligne `Include` de ~/.ssh/config (une ligne chacun ; [] : en tête) :
+    ~/.ssh/config lien symbolique dont la cible échoue aux contrôles d'ssh (`_follow`, hors
+    « dossier non modifiable », qui n'est pas un contrôle d'ssh) : cette seule ligne ; sinon
     l'état, puis, dès que l'Include de sshvault n'est pas en tête (absent, plus bas,
     conditionnel), une ligne par joker voisin (`neighbours`, dans un bloc compris)."""
+    if _kind(paths.user_config) == "link":
+        try:
+            lk = _follow(paths.user_config)
+        except OSError:
+            lk = None  # contrôle impossible : lecture à travers le lien, comme avant
+        if lk is not None and lk.problem:  # ssh refuse de lire la cible : l'Include n'y est pas vu
+            return [lk.unread()]
+    elif _kind(paths.user_config) == "file":
+        w = _file_unread(paths.user_config)
+        if w:
+            return [w]
     st, sc = include_state(paths)
     w = _include_warning(st, sc, paths)
     if w is None:
@@ -1576,13 +1642,14 @@ def _unlink_quiet(path: str) -> None:
 
 def _replace(path: str, data: bytes, mode: int, uid: int, gid: int, expect=None) -> None:
     """Remplacement atomique (temporaire dans le même dossier puis rename) avec mode et
-    propriétaire donnés. `expect` : (st_ino, st_size, st_mtime_ns) que `path` doit encore
-    avoir juste avant le rename (sinon rien n'est remplacé)."""
+    propriétaire donnés. `expect` : (st_ino, st_size, st_mtime_ns, st_nlink) que `path` doit
+    encore avoir juste avant le rename (sinon rien n'est remplacé : un lien physique ajouté
+    entre-temps serait détaché)."""
     tmp = _tmp_write(path, data, mode, uid, gid)
     try:
         if expect is not None:
             st = os.lstat(path)
-            if (st.st_ino, st.st_size, st.st_mtime_ns) != expect:
+            if (st.st_ino, st.st_size, st.st_mtime_ns, st.st_nlink) != expect:
                 raise SshConfigError("%s modifié pendant l'écriture : rien changé, relancer" % path)
         os.replace(tmp, path)
     except BaseException:
@@ -1599,16 +1666,77 @@ def _create(path: str, data: bytes, mode: int) -> None:
         _unlink_quiet(tmp)
 
 
-def _backup(paths: Paths, data: bytes) -> str:
-    """Sauvegarde jamais écrasée : `config.sshvault.bak`, sinon `.bak.1`, `.bak.2`…"""
+def _backup_place(paths: Paths):
+    """(chemin de base de la sauvegarde, dossier d'état ou None). `~/.ssh` dossier ordinaire :
+    `~/.ssh/config.sshvault.bak`. `~/.ssh` lien symbolique (souvent vers un dépôt versionné) :
+    sous `$XDG_STATE_HOME/sshvault/` (relatif ignoré ; défaut `$HOME/.local/state` comme
+    `settings.data_root`, `HOME` relatif ou « / » : le répertoire personnel de sshvault), jamais dans l'arbre du lien : dossier d'état dans `realpath(~/.ssh)`
+    = SshConfigError (code 4, rien modifié)."""
+    if _kind(paths.ssh_dir) != "link":
+        return paths.backup, None
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        home = os.environ.get("HOME") or ""
+        if not os.path.isabs(home) or os.path.normpath(home) == "/":
+            home = paths.home  # HOME absent, relatif ou « / » : le répertoire personnel de sshvault
+        base = os.path.join(home, ".local", "state")
+    d = os.path.join(os.path.normpath(base), "sshvault")
+    real_ssh, real_d = os.path.realpath(paths.ssh_dir), os.path.realpath(d)
+    if real_d == real_ssh or real_d.startswith(real_ssh.rstrip(os.sep) + os.sep):
+        raise SshConfigError("%s est un lien symbolique et le dossier de sauvegarde %s est dans son arbre (%s) : rien "
+                             "modifié ; définir XDG_STATE_HOME hors de ce dossier" % (clean(paths.ssh_dir), clean(d),
+                                                                                       clean(real_ssh)))
+    return os.path.join(d, "config.sshvault.bak"), d
+
+
+def _backup(paths: Paths, data: bytes):
+    """(chemin, avertissement ou None) d'une sauvegarde jamais écrasée : `config.sshvault.bak`,
+    sinon `.bak.1`, `.bak.2`… Voir `_backup_place` pour l'emplacement ; sous un `~/.ssh` lien,
+    le dossier d'état est créé en 0700 au besoin (`~/.local` et `~/.local/state` compris, s'ils
+    manquent) ; impossible à créer : SshConfigError (code 4). L'avertissement dit que
+    `~/.ssh/sshvault/` (config générée, `pub/`) est dans l'arbre du lien."""
+    base, state = _backup_place(paths)
+    if state is not None:
+        try:
+            ensure_dir(state)
+        except OSError as e:
+            raise SshConfigError("%s : dossier de sauvegarde impossible à créer (%s) : rien modifié ; définir "
+                                 "XDG_STATE_HOME ailleurs" % (clean(state), e.strerror or e)) from None
     for n in range(1000):
-        p = paths.backup + ("" if n == 0 else ".%d" % n)
+        p = base + ("" if n == 0 else ".%d" % n)
         try:
             _create(p, data, 0o600)
-            return p
         except FileExistsError:
             continue
-    raise SshConfigError("trop de sauvegardes %s.N : en supprimer avant de relancer" % paths.backup)
+        note = None
+        if state is not None:
+            note = ("%s est un lien symbolique : sauvegarde écrite hors de son arbre (%s) ; %s (config générée, pub/) "
+                    "est dans l'arbre du lien : à exclure du dépôt s'il est versionné"
+                    % (clean(paths.ssh_dir), clean(p), clean(paths.dir)))
+        return p, note
+    raise SshConfigError("trop de sauvegardes %s.N : en supprimer avant de relancer" % clean(base))
+
+
+def _nlink_refusal(p: str, target: str, nlink: int, action: str) -> str:
+    """Refus d'une écriture dans un fichier à plusieurs liens physiques (le remplacement atomique le
+    détacherait de ses autres noms) : même forme que le refus d'un lien, avec l'action à faire à la main."""
+    what = ("lien symbolique vers %s : cible" % clean(target)) if target != p else "fichier"
+    return ("%s : %s à %d liens physiques refusé (le réécrire le détacherait de ses autres noms) : rien modifié ; %s"
+            % (clean(p), what, nlink, action))
+
+
+def _nlink_of(path: str) -> int:
+    """st_nlink d'un fichier ordinaire (1 si illisible : pas d'avertissement)."""
+    try:
+        return os.stat(path).st_nlink
+    except OSError:
+        return 1
+
+
+def _nlink_warning(target: str, nlink: int) -> str:
+    """Avertissement : fichier à plusieurs liens physiques, mais rien à y écrire."""
+    return ("%s a %d liens physiques : sshvault ne le réécrit pas (il le détacherait de ses autres noms) ; "
+            "rien à y écrire" % (clean(target), nlink))
 
 
 @dataclass
@@ -1622,6 +1750,7 @@ class _Link:
     loop: bool = False
     nonregular: bool = False
     nowrite: Optional[str] = None  # dossier de la cible non modifiable : seulement s'il faut écrire
+    ssh_refuses: bool = False  # la cible, ouverte par ssh : propriétaire ni vous ni root, ou g/o-w (« Bad owner »)
 
     def reasons(self, write: bool) -> str:
         return " ; ".join(r for r in (self.problem, self.nowrite if write else None) if r)
@@ -1646,6 +1775,23 @@ class _Link:
                                                                                                     cmd)
         return ("%s : lien symbolique vers %s refusé (%s) : rien modifié ; %s%s"
                 % (clean(self.link), clean(self.target), self.reasons(True), self.action(action), fix))
+
+    def unread(self) -> str:
+        """Avertissement d'une ligne de `--check` et des régénérations. Trois cas, dits à part : la
+        cible est refusée par ssh lui-même (propriétaire, droits du fichier : ssh s'arrête, toute la
+        configuration est perdue) ; ssh ne lit rien (lien cassé, boucle, cible non ordinaire) ; ou
+        seule une règle de sshvault, plus stricte que celle d'ssh (cible à root, dossiers ouverts),
+        échoue : ssh lit la cible, sshvault n'y écrit pas."""
+        fix = " ; corriger par « chmod g-w,o-w %s »" % self._paths() if self.chmod else ""
+        if self.ssh_refuses:
+            verdict = ("ssh refuse de lire toute la configuration (chaque ssh s'arrête sur « Bad owner or "
+                       "permissions »), la ligne Include de sshvault comprise")
+        elif not self.ident:
+            verdict = "ssh n'y lit rien : la ligne Include de sshvault n'y est pas vue"
+        else:
+            verdict = "règle de sshvault plus stricte que celle d'ssh : ssh lit la cible, sshvault n'y écrit pas"
+        return ("%s : lien symbolique vers %s non conforme (%s) : %s%s"
+                % (clean(self.link), clean(self.target), self.reasons(False), verdict, fix))
 
     def warning(self) -> str:
         """Avertissement d'une ligne : contrôles d'ssh échoués, mais rien à écrire dans la cible."""
@@ -1724,7 +1870,8 @@ def _follow(link: str) -> _Link:
     d = os.path.dirname(real)
     nowrite = None if os.access(d, os.W_OK | os.X_OK) else "dossier de la cible non modifiable : %s" % clean(d)
     return _Link(link, real, " ; ".join(clean(r) for r in reasons) or None, (st.st_dev, st.st_ino),
-                 tuple(to_chmod) if reasons and not move else (), nowrite=nowrite)
+                 tuple(to_chmod) if reasons and not move else (), nowrite=nowrite,
+                 ssh_refuses=st.st_uid not in (0, os.getuid()) or bool(st.st_mode & 0o022))
 
 
 @dataclass
@@ -1744,7 +1891,12 @@ def install(paths: Paths) -> Installed:
     fois à chaque lecture de la config : `ensure` lancé deux fois, le second trouve la clé déjà
     chargée quand le premier l'a chargée). Joker voisin (`neighbours`) : un avertissement
     chacun, numéroté dans le fichier réécrit. Ligne de sshvault déjà en tête (même à joker) :
-    rien changé. ~/.ssh/config lien symbolique : écrit dans sa cible si elle passe les contrôles
+    rien changé (sous un bloc « tous les hôtes » aussi : `scan`, `_catch_all_block`). Fichier écrit à plusieurs liens
+    physiques : refus (code 4, rien modifié, action à la main) s'il faut écrire, avertissement
+    sinon. `~/.ssh` lien symbolique : sauvegarde sous `$XDG_STATE_HOME/sshvault/` (`_backup`) ;
+    remplacement refusé (fichier changé, lien physique ajouté) : la sauvegarde écrite est retirée.
+    `~/.ssh/config` ordinaire que ssh refuserait (autre propriétaire, g/o-w) : écrit ou non, un
+    avertissement (`_file_unread`). ~/.ssh/config lien symbolique : écrit dans sa cible si elle passe les contrôles
     (`_follow`), lien intact, sauvegarde du contenu de la cible ; sinon, s'il faudrait y écrire,
     refus (code 4, rien modifié) qui donne la ligne à ajouter à la main en tête de la cible ;
     Include de sshvault déjà en tête de la cible refusée : rien changé, avertissement."""
@@ -1758,8 +1910,10 @@ def install(paths: Paths) -> Installed:
                 if lk.problem:
                     seen = lk.peek(paths)
                     if seen and scan("\n".join(seen[0]), paths).head:  # rien à écrire
+                        n = _nlink_of(lk.target)
                         return Installed("%s : ligne Include déjà en tête, rien changé (lien suivi : %s)"
-                                         % (p, clean(lk.target)), [lk.warning()])
+                                         % (p, clean(lk.target)),
+                                         [lk.warning()] + ([_nlink_warning(lk.target, n)] if n > 1 else []))
                     raise SshConfigError(lk.refusal("ajouter en première ligne de %s : %s" % (clean(lk.target), line),
                                                     "install"))
                 k = "file"
@@ -1781,9 +1935,12 @@ def install(paths: Paths) -> Installed:
             if lk:
                 lk.check(st)
             sc = scan(data.decode(errors="surrogateescape"), paths)
+            unread = None if lk else _file_unread(p)  # ssh refuserait ce fichier : dit aussi
             if sc.head:
                 return Installed("%s : ligne Include déjà en tête, rien changé%s"
-                                 % (p, " (lien suivi : %s)" % clean(target) if lk else ""))
+                                 % (p, " (lien suivi : %s)" % clean(target) if lk else ""),
+                                 ([_nlink_warning(target, st.st_nlink)] if st.st_nlink > 1 else [])
+                                 + ([unread] if unread else []))
             exact, kept = _own_includes(sc.lines, paths, sc.read)
             blocked = [i for i in exact if i in set(sc.conditional)]
             if blocked:
@@ -1806,9 +1963,20 @@ def install(paths: Paths) -> Installed:
             if lk and lk.nowrite:  # il faut écrire dans la cible : avant toute sauvegarde
                 raise SshConfigError(lk.refusal("ajouter en première ligne de %s : %s" % (clean(target), line),
                                                 "install"))
-            bak = _backup(paths, data)
-            _replace(target, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
-                     expect=(st.st_ino, st.st_size, st.st_mtime_ns))
+            if st.st_nlink > 1:  # avant toute sauvegarde
+                raise SshConfigError(_nlink_refusal(p, target, st.st_nlink,
+                                                    "ajouter en première ligne de %s : %s" % (clean(target), line)))
+            bak, note = _backup(paths, data)
+            if note:
+                warnings.append(note)
+            if unread:
+                warnings.append(unread)
+            try:
+                _replace(target, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid,
+                         st.st_gid, expect=(st.st_ino, st.st_size, st.st_mtime_ns, st.st_nlink))
+            except BaseException:
+                _unlink_quiet(bak)  # rien n'a été remplacé : la sauvegarde qu'on vient d'écrire n'a pas lieu d'être
+                raise
             return Installed("%s : ligne Include %s en tête (sauvegarde : %s)%s"
                              % (p, "déplacée" if drop else "ajoutée", bak, " ; " + lk.written() if lk else ""),
                              warnings)
@@ -1849,7 +2017,9 @@ def uninstall(paths: Paths) -> Uninstalled:
     mode et propriétaire gardés) ; une ligne qui inclut aussi d'autres fichiers (ou un joker qui
     le couvre) est gardée, avec un avertissement ; `~/.ssh/sshvault/config` supprimé ; dans
     `pub/`, seuls les `*.pub` (fichiers ordinaires) supprimés, le dossier s'il est vide.
-    `~/.ssh/sshvault/` lui-même est gardé. ~/.ssh/config lien symbolique : même règle
+    `~/.ssh/sshvault/` lui-même est gardé. Fichier écrit à plusieurs liens physiques : refus (code 4,
+    rien modifié) s'il y a des lignes à retirer, avertissement sinon ; sauvegarde comme `install`
+    (`_backup`). ~/.ssh/config lien symbolique : même règle
     qu'`install` (`_follow`) : lignes retirées de sa cible, lien intact ; cible refusée avec des
     lignes à retirer (ou illisible) : code 4, rien modifié, chaque ligne qu'uninstall aurait
     retirée dite (à retirer à la main) ; cible refusée sans ligne de sshvault, absente ou en
@@ -1876,6 +2046,9 @@ def uninstall(paths: Paths) -> Uninstalled:
                 if seen[1]:
                     raise SshConfigError(lk.refusal(_removal(lk.target, seen[0], seen[1]), "uninstall"))
                 res.warnings.append(lk.warning())  # rien à écrire dans la cible
+                n = _nlink_of(lk.target)
+                if n > 1:
+                    res.warnings.append(_nlink_warning(lk.target, n))
                 k = "absent"
         target = lk.target if lk else p
         if k not in ("absent", "file"):
@@ -1919,13 +2092,27 @@ def uninstall(paths: Paths) -> Uninstalled:
             if sole:
                 if lk and lk.nowrite:  # il faut écrire dans la cible : avant toute sauvegarde ou suppression
                     raise SshConfigError(lk.refusal(_removal(target, lines, sole), "uninstall"))
+                if st.st_nlink > 1:  # avant toute sauvegarde ou suppression
+                    raise SshConfigError(_nlink_refusal(p, target, st.st_nlink, _removal(target, lines, sole)))
                 new = "\n".join(l for i, l in enumerate(lines) if i not in set(sole))
-                bak = _backup(paths, data)
-                _replace(target, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid,
-                         expect=(st.st_ino, st.st_size, st.st_mtime_ns))
+                bak, note = _backup(paths, data)
+                if note:
+                    res.warnings.append(note)
+                try:
+                    _replace(target, new.encode(errors="surrogateescape"), stat.S_IMODE(st.st_mode), st.st_uid,
+                             st.st_gid, expect=(st.st_ino, st.st_size, st.st_mtime_ns, st.st_nlink))
+                except BaseException:
+                    _unlink_quiet(bak)  # rien remplacé : la sauvegarde qu'on vient d'écrire n'a pas lieu d'être
+                    raise
                 res.done.append("%s : ligne%s Include de sshvault retirée%s (sauvegarde : %s)%s"
                                 % (p, "s" if len(sole) > 1 else "", "s" if len(sole) > 1 else "", bak,
                                    " ; " + lk.written() if lk else ""))
+            elif st is not None and st.st_nlink > 1:  # rien à y écrire
+                res.warnings.append(_nlink_warning(target, st.st_nlink))
+            if st is not None and not lk:
+                w = _file_unread(p)  # ssh refuserait ce fichier : dit aussi (rien à retirer compris)
+                if w:
+                    res.warnings.append(w)
             # 2) fichiers générés
             try:
                 if ck == "file":

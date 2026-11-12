@@ -51,11 +51,14 @@ Codes de sortie :
      personnel inconnu, ssh-config install refusé (~/.ssh/config non ordinaire, ou lien
      symbolique dont la cible échoue aux contrôles alors qu'il faudrait y écrire : lien cassé,
      boucle, cible non ordinaire, à un autre, droits ou dossier ouverts, dossier de la cible
-     non modifiable ; Include de sshvault dans un bloc Host/Match, chemin
+     non modifiable ; fichier écrit à plusieurs liens physiques ; Include de sshvault dans un
+     bloc Host/Match autre que Host * ou Match all, chemin
      personnel avec %, $ ou joker de glob), ssh-config uninstall refusé (~/.ssh/config non
      ordinaire, ou lien symbolique seulement s'il faudrait écrire dans une cible refusée, lignes
-     de sshvault à retirer, ou si sa cible est illisible ou non ordinaire ; ~/.ssh/sshvault, sa
-     config ou pub/ d'un type inattendu : rien modifié),
+     de sshvault à retirer, ou si sa cible est illisible ou non ordinaire ; fichier à plusieurs
+     liens physiques avec des lignes à retirer ; ~/.ssh/sshvault, sa
+     config ou pub/ d'un type inattendu : rien modifié), session illisible (keyctl en panne :
+     délai dépassé, droits, clé révoquée… sans session dans le fichier de repli),
      adoption de l'installation 0.8.0 impossible (rien modifié ; account add
      refusé tant qu'elle n'est pas faite), account rename : destination existante ou
      déplacement impossible, account remove : données impossibles à supprimer, magasin de
@@ -114,7 +117,7 @@ from . import keyfile
 from .ensure import Deadline
 from .prompt import DEFAULT_TIMEOUT as PROMPT_TIMEOUT, PromptError, ask_password, prompt_timeout
 from .bw import DEFAULT_TIMEOUT as BW_TIMEOUT
-from .session import DEFAULT_TTL, SessionStore, SessionStoreError
+from .session import DEFAULT_TTL, SessionStore, SessionStoreError, keyctl_timeout
 from .settings import logged_out_path, seconds, set_logged_out
 from .text import clean  # texte venu du coffre, pour un terminal
 from . import sshconfig
@@ -595,6 +598,8 @@ def run(args, accts: Accounts) -> int:
             b.unlock(prompt, ttl=args.ttl)
             _clear_unlock_failure(a)
             where = b.info()["session"]
+            if where == "file" and getattr(b.store, "keyring_unreadable", False):
+                where = "file, keyring illisible"  # la session est dans le fichier : le keyring n'a pas répondu
             print("coffre déverrouillé%s (%s)" % (" : " + a if accts.multi else "",
                                                   "session %ds, %s" % (args.ttl, where) if where
                                                   else "session non rangée"))
@@ -1096,6 +1101,12 @@ def _forgot(b, had: Optional[bool]) -> bool:
     return had is True and _session_state(b) is False
 
 
+def _session_stuck(b, had: Optional[bool]) -> bool:
+    """La session n'a pas pu être oubliée (magasin en erreur, keyctl en panne…) : dite en
+    avertissement de fin de commande, et la commande rend le code 4 (comme `lock`)."""
+    return had is not False and _session_state(b) is not False
+
+
 def _set_logged_out_marker(alias: str, b=None) -> None:
     """Pose le marqueur `logged-out` du compte (dans son dossier persistant, lu par ensure),
     seulement si ce dossier existe ; il est retiré par le backend dès que bw est vu connecté.
@@ -1149,7 +1160,7 @@ def account_remove(args, accts: Accounts) -> int:
         except (VaultError, SessionStoreError, ConfigError) as e:
             err("avertissement : verrouillage de %s : %s" % (alias, classify(e)[1]))
             try:
-                SessionStore(alias=alias).clear()
+                b.store.clear()  # même magasin que b.lock() : un keyctl illisible n'attend qu'une fois
             except SessionStoreError as e2:
                 err("magasin de session : %s" % e2)
                 rc = RC_BACKEND
@@ -1213,7 +1224,8 @@ def run_logout(args, accts: Accounts) -> int:
     `login`). Compte gardé au registre, blocs du ssh_config gardés. Plusieurs comptes :
     --account obligatoire (code 2). Rien du tout à faire (non connecté, ni clé, ni état
     d'agent, absence de session sûre) : une ligne, code 0, rien touché. Agent verrouillé ou en
-    erreur, `bw logout` en échec ou état inconnu : une ligne, code 4."""
+    erreur, `bw logout` en échec ou état inconnu : une ligne, code 4 ; session impossible à oublier
+    (magasin en erreur, keyctl en panne) : avertissement de fin de commande, code 4 (comme `lock`)."""
     if not args.account and len(accts.registry) > 1:
         raise AccountError("logout : préciser --account ALIAS (comptes : %s)" % ", ".join(accts.registry))
     alias = accts.write_one(args.account, "logout") if (args.account or not accts.registry) \
@@ -1251,6 +1263,7 @@ def run_logout(args, accts: Accounts) -> int:
         elif had is not False:
             _forget_session(b)
         forgot = _forgot(b, had)
+        stuck = _session_stuck(b, had)
         nothing = not connected and not changed and had is False
         if not nothing:  # « rien à faire » : rien touché, mémoire d'échec de déverrouillage comprise
             _clear_unlock_failure(alias)
@@ -1265,7 +1278,7 @@ def run_logout(args, accts: Accounts) -> int:
     print("compte %s %s : %s ; compte et blocs du ssh_config gardés ; reconnecter : « sshvault login --account %s »"
           % (alias, "déconnecté" if connected else "non connecté",
              ", ".join((["session oubliée"] if forgot else []) + [_keys_removed(removed)]), alias))
-    return RC_OK
+    return RC_BACKEND if stuck else RC_OK
 
 
 def run_lock_unload(accts: Accounts, aliases: list) -> int:
@@ -1413,6 +1426,7 @@ def account_set(args, accts: Accounts) -> int:
                 _set_logged_out_marker(alias, b)
         else:
             _forget_session(b)
+        stuck = _session_stuck(b, had)
         what = ", ".join((["déconnecté de l'ancien compte"] if connected else [])
                          + (["session oubliée"] if _forgot(b, had) else []) + [_keys_removed(removed)])
         try:
@@ -1428,7 +1442,7 @@ def account_set(args, accts: Accounts) -> int:
     print("compte %s modifié : %s ; %s" % (alias, changed, what))
     rc = _regen_after_registry_change(fresh={alias: []})
     print("lancer « sshvault login --account %s »" % alias)
-    return rc
+    return max(rc, RC_BACKEND) if stuck else rc
 
 
 def _regen_after_login() -> int:
@@ -3306,6 +3320,7 @@ def run_ensure(args) -> int:
         try:
             for name, default in (("SSHVAULT_PROMPT_TIMEOUT", PROMPT_TIMEOUT), ("SSHVAULT_BW_TIMEOUT", BW_TIMEOUT)):
                 seconds(os.environ, name, default)
+            keyctl_timeout(os.environ)
             total = fastpath.ensure_timeout(os.environ)
         except ValueError as e:
             raise ConfigError(str(e)) from None
@@ -3432,6 +3447,11 @@ def main(argv=None) -> int:
             except ValueError as e:
                 err(e)
                 return RC_USAGE
+        try:
+            keyctl_timeout(os.environ)
+        except ValueError as e:
+            err(e)
+            return RC_USAGE
         reap_orphans_quietly()
         cfg = Config()
         try:

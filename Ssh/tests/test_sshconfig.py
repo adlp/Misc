@@ -16,6 +16,8 @@ from sshvault.backend import SshKeyItem
 
 SSH = shutil.which("ssh")
 needs_ssh = pytest.mark.skipif(SSH is None, reason="client ssh absent")
+#: root passe outre les droits de fichiers et de dossiers : ces tests n'ont pas de sens sous root
+needs_nonroot = pytest.mark.skipif(os.geteuid() == 0, reason="droits de fichiers sans effet pour root")
 
 
 def _ssh_version():
@@ -28,6 +30,15 @@ def _ssh_version():
 #: Témoins d'une mesure faite sur cette version précise (comportement d'OpenSSH, pas de sshvault).
 measured_89 = pytest.mark.skipif("OpenSSH_8.9p1" not in _ssh_version(),
                                  reason="mesure propre à OpenSSH 8.9p1 (%s)" % (_ssh_version() or "ssh absent"))
+
+
+@pytest.fixture(autouse=True)
+def _umask_prive():
+    """Fichiers de test créés en 0600 (umask 002 du poste : `~/.ssh/config` en 0664, que ssh refuse
+    et que `--check` signale) ; les cas de droits ouverts font leur `chmod` explicite."""
+    old = os.umask(0o077)
+    yield
+    os.umask(old)
 
 
 def mode(p):
@@ -2256,14 +2267,13 @@ def test_uninstall_lien_refuse_rien_modifie(bench):
     assert tree(bench.home) == before
 
 
-def test_avertissements_et_check_sur_cible_liee(bench, tmp_path):
-    """status (--check) et avertissements des régénérations lisent la cible du lien (lecture
-    seule : même sous /tmp), formes `~` et absolue reconnues."""
+def test_avertissements_et_check_sur_cible_liee(bench):
+    """status (--check) et avertissements des régénérations lisent la cible du lien, formes `~` et
+    absolue reconnues ; cible sûre seulement (story 22 : cible refusée par ssh, voir
+    test_check_cible_de_lien_refusee_par_ssh)."""
+    safe_home(bench)
     unlocked(bench)
-    ssh = _ssh_dir(bench)
-    target = tmp_path / "dotfiles-config"
-    target.write_text("Host a\n")
-    (ssh / "config").symlink_to(target)
+    link, target = dotfiles(bench, "Host a\n")
     r = bench.run("ssh-config")
     assert r.returncode == 0 and "n'inclut pas" in r.stderr, r.stderr
     target.write_text("User x\n" + include(bench) + "\n")
@@ -2275,7 +2285,7 @@ def test_avertissements_et_check_sur_cible_liee(bench, tmp_path):
         assert r.returncode == 0 and r.stderr == "", r.stderr
         r = bench.run("ssh-config", "--check")
         assert r.returncode == 0 and "à jour" in r.stdout, r.stdout + r.stderr
-    assert os.path.islink(ssh / "config")
+    assert os.path.islink(link)
 
 
 @needs_ssh
@@ -2530,3 +2540,692 @@ def test_install_lien_deja_en_tete_dossier_cible_non_modifiable_sans_avertisseme
     assert r.stdout == "%s : ligne Include déjà en tête, rien changé (lien suivi : %s)\n" % (link, target)
     assert "lien symbolique" not in r.stderr and "non modifiable" not in r.stderr, r.stderr
     assert tree(bench.home) == before
+
+
+# --- story 22 : Host * / Match all, lien refusé par ssh, liens physiques, sauvegarde hors dépôt ---
+
+STAR_FORMS = ["Host *", "Host   *  # tout", "HOST \"*\"", "Host * ?*", "Match all", "match ALL", "Match all # tout",
+              # mesuré, OpenSSH 8.9 (voir test_ssh_G_include_sous_host_etoile) : un motif positif attrape-tout suffit
+              "Host web *", "Host * *.example.com", "Host ?*", "Match host *", "Match originalhost *",
+              "Match host web,*"]
+
+
+@pytest.mark.parametrize("block", STAR_FORMS)
+def test_include_sous_host_etoile_en_tete(bench, block):
+    """Matrice : `Host *`/`Match all` puis l'Include de sshvault en 1re ligne effective : en tête
+    (--check à jour), install ne change rien."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("# réglages\n%s\n    %s\nHost a\n    User x\n" % (block, include(bench)))
+    before = cfg.read_bytes()
+    st = os.stat(cfg)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout and r.stderr == "", r.stdout + r.stderr
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déjà en tête" in r.stdout, r.stdout + r.stderr
+    assert cfg.read_bytes() == before and os.stat(cfg).st_mtime_ns == st.st_mtime_ns
+    assert not list(cfg.parent.glob("config.sshvault.bak*"))
+
+
+def test_include_sous_blocs_etoile_vides_successifs_en_tete(bench):
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("Host *\nMatch all\nHost *\n    %s\n" % include(bench))
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("orig", [
+    "Host a\n    User x\nHost *\n    {inc}\n",       # bloc avant
+    "User x\nHost *\n    {inc}\n",                    # directive avant
+    "Host *\n    ServerAliveInterval 5\n    {inc}\n",  # directive du bloc avant
+    "Match all\n    ServerAliveInterval 5\n    {inc}\n",
+    "Include autre\nHost *\n    {inc}\n",             # autre Include avant
+])
+def test_include_sous_host_etoile_plus_bas(bench, orig):
+    """Matrice : un bloc ou une directive effective précède : « pas en tête » (jamais conditionnel),
+    install le déplace en tête comme une ligne hors bloc."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg = _ssh_dir(bench) / "config"
+    text = orig.format(inc=include(bench))
+    cfg.write_text(text)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and "pas en tête" in r.stdout and "conditionnel" not in r.stdout, r.stdout + r.stderr
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déplacée en tête" in r.stdout, r.stdout + r.stderr
+    new = cfg.read_text()
+    assert new.split("\n")[0] == include(bench) and new.count(include(bench)) == 1
+    assert new == include(bench) + "\n" + text.replace("    %s\n" % include(bench), "")
+    assert (_ssh_dir(bench) / "config.sshvault.bak").read_text() == text
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("block", ["Host web", "Host * !web", "Host !web *", "Host *.*", "Host *.example.com", "Host ??*",
+                                   "Host . ", "Host ?", "Match canonical all", "Match host x", "Match host *,!web",
+                                   "Match host * user x", "Match all user x"])
+def test_include_sous_un_autre_bloc_reste_conditionnel(bench, block):
+    """Tout autre bloc reste conditionnel : refus d'install (code 4), rien modifié."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    orig = "%s\n    %s\n" % (block, include(bench))
+    cfg.write_text(orig)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4 and "Include conditionnel" in one_line_error(r), r.stderr
+    assert cfg.read_text() == orig and not list(cfg.parent.glob("config.sshvault.bak*"))
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and "conditionnel" in r.stdout, r.stdout
+
+
+def test_include_bloc_ordinaire_puis_host_etoile_hors_bloc_precedent(bench):
+    """`Host web` puis `Host *` : l'Include sous `Host *` n'est plus conditionnel (le bloc courant
+    change à chaque ligne Host/Match)."""
+    sc = sshconfig.scan("Host web\n    User x\nHost *\n    %s\n" % include(bench), sshconfig.default_paths(bench.env))
+    assert sc.state() == "below" and sc.conditional == []
+    sc = sshconfig.scan("Host *\n    User x\nHost web\n    %s\n" % include(bench), sshconfig.default_paths(bench.env))
+    assert sc.state() == "conditional"
+
+
+def ssh_G_main(main, host, home=None):
+    """`ssh -G -F <main> <host>` : [(clé, valeur)] (HOME de la sonde : `home`, pour les `~`)."""
+    env = dict(os.environ, HOME=str(home)) if home else None
+    r = subprocess.run([SSH, "-G", "-F", str(main), host], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, timeout=30, env=env)
+    assert r.returncode == 0, r.stderr
+    return [tuple(l.split(" ", 1)) for l in r.stdout.splitlines()]
+
+
+@needs_ssh
+@measured_89
+@pytest.mark.parametrize("block", ["Host *", "Match all", "Host web *", "Host * *.example.com", "Host ?*",
+                                   "Match host *", "Match originalhost *"])
+def test_ssh_G_include_sous_un_bloc_tous_les_hotes(bench, tmp_path, block):
+    """OpenSSH du poste : l'Include sous un bloc qui prend tous les hôtes s'applique à tous ; une
+    valeur qui précède l'emporte (« plus bas »). `install` met la ligne en tête : sshvault gagne."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    conf = sv_dir(bench) / "config"
+    agent = str(bench.runtime / "sshvault" / "agent.sock")
+    main = tmp_path / "ssh_config_de_test"
+    main.write_text('%s\n    Include "%s"\n' % (block, conf))
+    main.chmod(0o600)
+    assert values(ssh_G_main(main, "Prod.Example.Com"), "identityagent") == [agent]
+    sc = sshconfig.scan(main.read_text(), sshconfig.default_paths(bench.env))
+    assert sc.state() == "head", block
+    # une valeur qui précède l'emporte : « pas en tête » ; install déplace la ligne, sshvault gagne
+    user = _ssh_dir(bench) / "config"
+    user.write_text('IdentityAgent /tmp/autre.sock\n%s\n    %s\n' % (block, include(bench)))
+    assert values(ssh_G_main(user, "Prod.Example.Com", bench.home), "identityagent") == ["/tmp/autre.sock"]
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and "pas en tête" in r.stdout, r.stdout + r.stderr
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déplacée en tête" in r.stdout, r.stdout + r.stderr
+    assert values(ssh_G_main(user, "Prod.Example.Com", bench.home), "identityagent") == [agent]
+
+
+@needs_ssh
+@measured_89
+@pytest.mark.parametrize("block", ["Host ?", "Host web", "Match host web"])
+def test_ssh_G_include_sous_un_autre_bloc_ne_s_applique_pas(bench, tmp_path, block):
+    """Témoins : `Host ?` (un seul caractère) et les autres blocs ne s'appliquent pas à ce hôte ;
+    sshvault les tient pour conditionnels."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    main = tmp_path / "ssh_config_de_test"
+    main.write_text('%s\n    Include "%s"\n' % (block, sv_dir(bench) / "config"))
+    main.chmod(0o600)
+    assert values(ssh_G_main(main, "Prod.Example.Com"), "identityagent") != [
+        str(bench.runtime / "sshvault" / "agent.sock")]
+    sc = sshconfig.scan(main.read_text(), sshconfig.default_paths(bench.env))
+    assert sc.state() == "conditional", block
+
+
+# lien symbolique : contrôles d'ssh dans --check et les régénérations
+
+def test_check_cible_de_lien_refusee_par_ssh(bench):
+    """Matrice : lien vers une cible 0664 : --check ne dit pas « à jour » mais une ligne d'avertissement
+    (raison d'ssh, chmod proposé) ; la régénération la dit aussi (stderr)."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\nHost a\n", mode=0o664)
+    unlocked(bench)
+    r = bench.run("ssh-config")
+    assert r.returncode == 0, r.stderr
+    lines = r.stderr.splitlines()
+    assert len(lines) == 1 and lines[0].startswith("sshvault: avertissement : %s : lien symbolique vers %s non conforme" % (
+        link, target)), r.stderr
+    assert "modifiable par le groupe ou les autres" in lines[0] and "chmod g-w,o-w %s" % target in lines[0]
+    assert "ssh refuse de lire toute la configuration" in lines[0] and "plus stricte" not in lines[0]
+    r = bench.run("ssh-config", "--check")
+    out = r.stdout.splitlines()
+    assert r.returncode == 1 and "à jour" not in r.stdout and len(out) == 1, r.stdout + r.stderr
+    assert out[0] == lines[0][len("sshvault: avertissement : "):]
+    target.chmod(0o600)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout and r.stderr == "", r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("cassé", "lien cassé : cible absente"), ("boucle", "boucle de liens symboliques"),
+    ("fifo", "cible pas un fichier ordinaire"),
+])
+def test_check_lien_autres_raisons_d_ssh(bench, case, reason):
+    safe_home(bench)
+    ssh = _ssh_dir(bench)
+    if case == "cassé":
+        (ssh / "config").symlink_to("../absent")
+    elif case == "boucle":
+        (ssh / "config").symlink_to("boucle")
+        (ssh / "boucle").symlink_to("config")
+    elif case == "fifo":
+        os.mkfifo(bench.home / "fifo", 0o600)
+        (ssh / "config").symlink_to("../fifo")
+    unlocked(bench)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and "à jour" not in r.stdout, r.stdout + r.stderr
+    line = [l for l in r.stdout.splitlines() if "lien symbolique vers" in l]
+    assert len(line) == 1 and reason in line[0], r.stdout
+    # ssh ne lit rien : ce n'est pas un refus d'ssh
+    assert "ssh n'y lit rien" in line[0] and "ssh refuse" not in line[0], line[0]
+
+
+def test_check_lien_dossier_ouvert_raison_et_chmod_exacts(bench):
+    """Dossier de la cible ouvert (0777) : règle de sshvault plus stricte que celle d'ssh (ssh lit la cible,
+    il ne dit pas « ssh refuse »), qui nomme ce dossier ; le chmod proposé le vise."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\n")
+    target.parent.chmod(0o777)
+    unlocked(bench)
+    want = ("%s : lien symbolique vers %s non conforme (dossier %s modifiable par le groupe ou les autres) : règle de "
+            "sshvault plus stricte que celle d'ssh : ssh lit la cible, sshvault n'y écrit pas ; corriger par "
+            "« chmod g-w,o-w %s »" % (link, target, target.parent, target.parent))
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and r.stderr == "sshvault: avertissement : %s\n" % want, r.stderr
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and r.stdout.splitlines() == [want], r.stdout + r.stderr
+    target.parent.chmod(0o700)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout, r.stdout + r.stderr
+
+
+def test_check_lien_dossier_cible_non_modifiable_pas_dit(bench):
+    """« Dossier de la cible non modifiable » n'est pas un contrôle d'ssh : pas dit par --check."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\nHost a\n")
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    target.parent.chmod(0o500)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout and r.stderr == "", r.stdout + r.stderr
+
+
+# liens physiques
+
+def hardlinked(bench, text):
+    """~/.ssh/config à deux liens physiques (l'autre nom : ~/config.ailleurs)."""
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text(text)
+    cfg.chmod(0o600)
+    other = bench.home / "config.ailleurs"
+    os.link(cfg, other)
+    return cfg, other
+
+
+def test_install_liens_physiques_refuse(bench):
+    """Matrice : config à st_nlink = 2, Include absent : refus (code 4), action à la main, rien modifié."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg, other = hardlinked(bench, "Host a\n    User x\n")
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4
+    assert one_line_error(r) == (
+        "sshvault: %s : fichier à 2 liens physiques refusé (le réécrire le détacherait de ses autres noms) : "
+        "rien modifié ; ajouter en première ligne de %s : %s" % (cfg, cfg, include(bench)))
+    assert tree(bench.home) == before and os.stat(cfg).st_nlink == 2 and os.path.samefile(cfg, other)
+
+
+def test_install_liens_physiques_include_plus_bas_refuse(bench):
+    unlocked(bench)
+    cfg, other = hardlinked(bench, "User x\n%s\n" % include(bench))
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4 and "2 liens physiques" in r.stderr
+    assert tree(bench.home) == before
+
+
+def test_install_liens_physiques_deja_en_tete_avertit(bench):
+    """Rien à écrire : code 0, un avertissement, fichier intact."""
+    unlocked(bench)
+    cfg, other = hardlinked(bench, include(bench) + "\nHost a\n")
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déjà en tête" in r.stdout, r.stderr
+    assert "%s a 2 liens physiques : sshvault ne le réécrit pas" % cfg in r.stderr, r.stderr
+    assert tree(bench.home) == before
+
+
+def test_install_lien_vers_cible_a_liens_physiques_refuse(bench):
+    safe_home(bench)
+    link, target = dotfiles(bench)
+    os.link(target, bench.home / "autre-nom")
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 4
+    assert one_line_error(r) == (
+        "sshvault: %s : lien symbolique vers %s : cible à 2 liens physiques refusé (le réécrire le détacherait de "
+        "ses autres noms) : rien modifié ; ajouter en première ligne de %s : %s" % (link, target, target, include(bench)))
+    assert tree(bench.home) == before
+
+
+def test_uninstall_liens_physiques_refuse(bench):
+    """Ligne à retirer : refus (code 4), action à la main, config générée et pub/ gardés."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg, other = hardlinked(bench, "Host a\n%s\n" % include(bench))
+    pubs = sorted(os.listdir(sv_dir(bench) / "pub"))
+    before = tree(bench.home)
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 4
+    assert one_line_error(r) == (
+        "sshvault: %s : fichier à 2 liens physiques refusé (le réécrire le détacherait de ses autres noms) : "
+        "rien modifié ; retirer de %s la ligne 2 : %s" % (cfg, cfg, include(bench)))
+    assert tree(bench.home) == before and sorted(os.listdir(sv_dir(bench) / "pub")) == pubs
+    assert (sv_dir(bench) / "config").exists()
+
+
+def test_uninstall_liens_physiques_rien_a_retirer_avertit(bench):
+    """Rien à écrire dans le fichier : code 0 et un avertissement ; le reste est désinstallé."""
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg, other = hardlinked(bench, "Host a\n")
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    assert "%s a 2 liens physiques : sshvault ne le réécrit pas" % cfg in r.stderr, r.stderr
+    assert not (sv_dir(bench) / "config").exists()
+    assert cfg.read_text() == "Host a\n" and os.stat(cfg).st_nlink == 2
+
+
+def test_liens_physiques_un_seul_nom_ecrit_normalement(bench):
+    """st_nlink = 1 : comportement inchangé (sauvegarde, remplacement atomique)."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("Host a\n")
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and cfg.read_text() == include(bench) + "\nHost a\n", r.stderr
+    assert (_ssh_dir(bench) / "config.sshvault.bak").read_text() == "Host a\n"
+    assert "liens physiques" not in r.stderr
+
+
+# sauvegarde hors de l'arbre d'un ~/.ssh lien symbolique
+
+def dotssh_link(bench, text="Host a\n    User x\n"):
+    """~/.ssh lien vers ~/dotfiles/dotssh (dépôt versionné) ; config ordinaire dedans."""
+    d = bench.home / "dotfiles" / "dotssh"
+    d.mkdir(parents=True)
+    (bench.home / ".ssh").symlink_to("dotfiles/dotssh")
+    (d / "config").write_text(text)
+    (d / "config").chmod(0o600)
+    return d
+
+
+def test_install_ssh_lien_sauvegarde_hors_de_l_arbre(bench):
+    """Matrice : ~/.ssh lien vers un dépôt : sauvegarde sous ~/.local/state/sshvault/ (0700), chemin
+    dit, avertissement sur ~/.ssh/sshvault/ ; rien de `config.sshvault.bak*` dans l'arbre du lien."""
+    unlocked(bench)
+    d = dotssh_link(bench)
+    orig = (d / "config").read_text()
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    state = bench.home / ".local" / "state" / "sshvault"
+    bak = state / "config.sshvault.bak"
+    assert bak.read_text() == orig and mode(bak) == 0o600 and mode(state) == 0o700
+    assert "sauvegarde : %s" % bak in r.stdout, r.stdout
+    assert "%s est un lien symbolique" % (bench.home / ".ssh") in r.stderr and str(sv_dir(bench)) in r.stderr, r.stderr
+    assert (d / "config").read_text() == include(bench) + "\n" + orig
+    assert not [n for n in os.listdir(d) if n.startswith("config.sshvault.bak")]
+    assert not list(d.rglob("config.sshvault.bak*"))
+    # sauvegardes jamais écrasées
+    (d / "config").write_text("User y\n" + include(bench) + "\n")
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert bak.read_text() == orig and (state / "config.sshvault.bak.1").read_text() == "User y\n%s\n" % include(bench)
+    assert not list(d.rglob("config.sshvault.bak*"))
+
+
+def test_uninstall_ssh_lien_sauvegarde_hors_de_l_arbre(bench):
+    unlocked(bench)
+    d = dotssh_link(bench, include(bench) + "\nHost a\n")
+    assert bench.run("ssh-config").returncode == 0
+    r = bench.run("ssh-config", "uninstall", env={"XDG_STATE_HOME": str(bench.home / "etat")})
+    assert r.returncode == 0, r.stderr
+    bak = bench.home / "etat" / "sshvault" / "config.sshvault.bak"
+    assert bak.read_text() == include(bench) + "\nHost a\n" and mode(bak.parent) == 0o700
+    assert "sauvegarde : %s" % bak in r.stdout and "lien symbolique" in r.stderr, r.stdout + r.stderr
+    assert (d / "config").read_text() == "Host a\n"
+    assert not list(d.rglob("config.sshvault.bak*")) and not (bench.home / ".local" / "state").exists()
+
+
+def test_install_ssh_lien_xdg_state_home_relatif_ignore(bench):
+    unlocked(bench)
+    d = dotssh_link(bench)
+    r = bench.run("ssh-config", "install", env={"XDG_STATE_HOME": "relatif"})
+    assert r.returncode == 0, r.stderr
+    assert (bench.home / ".local" / "state" / "sshvault" / "config.sshvault.bak").exists()
+    assert not list(d.rglob("config.sshvault.bak*"))
+
+
+def test_install_ssh_dossier_ordinaire_sauvegarde_inchangee(bench):
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("Host a\n")
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "lien symbolique" not in r.stderr, r.stderr
+    assert (_ssh_dir(bench) / "config.sshvault.bak").read_text() == "Host a\n"
+    assert not (bench.home / ".local" / "state" / "sshvault").exists()
+
+
+# fichier ordinaire : propriétaire et droits comme ssh
+
+def test_check_fichier_ordinaire_modifiable_par_les_autres(bench):
+    """`~/.ssh/config` 0664 : ssh refuse (« Bad owner or permissions ») ; --check le dit (code 1, chmod
+    proposé) au lieu de « à jour », la régénération aussi."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text(include(bench) + "\nHost a\n")
+    cfg.chmod(0o664)
+    want = ("%s non conforme (fichier modifiable par le groupe ou les autres (0664)) : ssh refuse de lire toute la "
+            "configuration (chaque ssh s'arrête sur « Bad owner or permissions »), la ligne Include de sshvault "
+            "comprise ; corriger par « chmod g-w,o-w %s »" % (cfg, cfg))
+    r = bench.run("ssh-config")
+    assert r.returncode == 0 and r.stderr == "sshvault: avertissement : %s\n" % want, r.stderr
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 1 and r.stdout.splitlines() == [want], r.stdout + r.stderr
+    cfg.chmod(0o600)
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout and r.stderr == "", r.stdout + r.stderr
+    cfg.chmod(0o644)  # lisible par tous mais fermé en écriture : ssh l'accepte
+    r = bench.run("ssh-config", "--check")
+    assert r.returncode == 0 and "à jour" in r.stdout, r.stdout + r.stderr
+
+
+@needs_nonroot
+def test_file_unread_autre_proprietaire(tmp_path, monkeypatch):
+    """Autre propriétaire (ni l'utilisateur ni root) : dit sans chmod (inutile) ; root accepté (comme ssh)."""
+    f = tmp_path / "config"
+    f.write_text("x\n")
+    f.chmod(0o600)
+    assert sshconfig._file_unread(str(f)) is None
+    owner = os.stat(str(f)).st_uid
+    monkeypatch.setattr(sshconfig.os, "getuid", lambda: owner + 1)
+    w = sshconfig._file_unread(str(f))
+    assert "fichier à un autre utilisateur (uid %d)" % owner in w and "chmod" not in w, w
+    assert sshconfig._file_unread(str(tmp_path / "absent")) is None
+
+
+# st_nlink, course
+
+def test_install_lien_physique_ajoute_entre_lecture_et_ecriture(bench, monkeypatch):
+    """Un nom physique de plus entre la lecture et le remplacement : rien remplacé (code 4)."""
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("Host a\n")
+    real = sshconfig._backup
+
+    def backup_then_link(paths, data):
+        out = real(paths, data)
+        os.link(cfg, bench.home / "autre-nom")
+        return out
+    monkeypatch.setattr(sshconfig, "_backup", backup_then_link)
+    with pytest.raises(sshconfig.SshConfigError, match="modifié pendant l'écriture : rien changé"):
+        sshconfig.install(sshconfig.Paths(str(bench.home)))
+    assert cfg.read_text() == "Host a\n" and os.stat(cfg).st_nlink == 2
+    assert not list(cfg.parent.glob("config.sshvault.bak*")), "sauvegarde écrite puis retirée : rien n'a eu lieu"
+    assert not [n for n in os.listdir(cfg.parent) if n.endswith(".tmp")]
+
+
+def test_uninstall_lien_physique_ajoute_entre_lecture_et_ecriture(bench, monkeypatch):
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("Host a\n%s\n" % include(bench))
+    real = sshconfig._backup
+
+    def backup_then_link(paths, data):
+        out = real(paths, data)
+        os.link(cfg, bench.home / "autre-nom")
+        return out
+    monkeypatch.setattr(sshconfig, "_backup", backup_then_link)
+    with pytest.raises(sshconfig.SshConfigError, match="modifié pendant l'écriture : rien changé"):
+        sshconfig.uninstall(sshconfig.Paths(str(bench.home)))
+    assert cfg.read_text() == "Host a\n%s\n" % include(bench)
+    assert not list(cfg.parent.glob("config.sshvault.bak*"))
+    assert (sv_dir(bench) / "config").exists(), "config générée gardée"
+
+
+def test_lien_refuse_deja_en_tete_avec_liens_physiques_avertit_aussi(bench):
+    """Cible de lien refusée (0664), Include déjà en tête, st_nlink = 2 : les deux avertissements."""
+    safe_home(bench)
+    link, target = dotfiles(bench, include(bench) + "\nHost a\n", mode=0o664)
+    os.link(target, bench.home / "autre-nom")
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déjà en tête" in r.stdout, r.stderr
+    lines = r.stderr.splitlines()
+    assert any("non conforme" in l for l in lines) and any("%s a 2 liens physiques" % target in l for l in lines), r.stderr
+    r = bench.run("ssh-config", "uninstall")  # ligne de sshvault à retirer d'une cible refusée : refus
+    assert r.returncode == 4 and "lien symbolique vers" in one_line_error(r)
+
+
+def test_uninstall_lien_refuse_rien_a_retirer_avec_liens_physiques_avertit(bench):
+    safe_home(bench)
+    link, target = dotfiles(bench, "Host a\n", mode=0o664)
+    os.link(target, bench.home / "autre-nom")
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    lines = r.stderr.splitlines()
+    assert any("non conforme" in l for l in lines) and any("%s a 2 liens physiques" % target in l for l in lines), r.stderr
+    assert target.read_text() == "Host a\n"
+
+
+# dossier de sauvegarde sous un ~/.ssh lien
+
+def test_install_ssh_lien_etat_dans_l_arbre_du_lien_refuse(bench):
+    """XDG_STATE_HOME dans l'arbre de ~/.ssh : refus (code 4), rien modifié, chemin dit."""
+    unlocked(bench)
+    d = dotssh_link(bench)
+    before = tree(d)
+    inside = bench.home / ".ssh" / "etat"  # par le lien
+    r = bench.run("ssh-config", "install", env={"XDG_STATE_HOME": str(inside)})
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "le dossier de sauvegarde %s est dans son arbre (%s)" % (inside / "sshvault", d) in line, line
+    assert "rien modifié" in line and "XDG_STATE_HOME" in line
+    assert tree(d) == before and not (d / "etat").exists()
+    # par le chemin réel, et par un lien du dossier d'état vers l'arbre
+    r = bench.run("ssh-config", "install", env={"XDG_STATE_HOME": str(d / "etat")})
+    assert r.returncode == 4 and tree(d) == before
+    (bench.home / "etat-lien").symlink_to(d)
+    r = bench.run("ssh-config", "install", env={"XDG_STATE_HOME": str(bench.home / "etat-lien")})
+    assert r.returncode == 4 and tree(d) == before
+
+
+def test_uninstall_ssh_lien_etat_dans_l_arbre_du_lien_refuse(bench):
+    unlocked(bench)
+    d = dotssh_link(bench, include(bench) + "\nHost a\n")
+    assert bench.run("ssh-config").returncode == 0
+    before = tree(d)
+    r = bench.run("ssh-config", "uninstall", env={"XDG_STATE_HOME": str(d)})
+    assert r.returncode == 4 and "dans son arbre" in one_line_error(r)
+    assert tree(d) == before
+
+
+@pytest.mark.parametrize("how", ["fichier", pytest.param("parent-ferme", marks=needs_nonroot)])
+def test_install_ssh_lien_dossier_de_sauvegarde_impossible(bench, how):
+    """Dossier d'état impossible à créer : code 4, rien modifié, le chemin est dit."""
+    unlocked(bench)
+    d = dotssh_link(bench)
+    before = tree(d)
+    base = bench.home / "etat"
+    if how == "fichier":
+        base.write_text("pas un dossier\n")
+    else:
+        base.mkdir()
+        base.chmod(0o500)
+    try:
+        r = bench.run("ssh-config", "install", env={"XDG_STATE_HOME": str(base)})
+    finally:
+        base.chmod(0o700) if base.is_dir() else None
+    assert r.returncode == 4
+    line = one_line_error(r)
+    assert "%s : dossier de sauvegarde impossible à créer" % (base / "sshvault") in line and "rien modifié" in line, line
+    assert tree(d) == before
+
+
+def test_install_ssh_lien_etat_par_defaut_depuis_home(bench, tmp_path):
+    """Défaut : `$HOME/.local/state` (comme les données de sshvault), pas le répertoire de passwd."""
+    unlocked(bench)
+    d = dotssh_link(bench)
+    other = tmp_path / "autre-home"
+    other.mkdir()
+    r = bench.run("ssh-config", "install", env={"HOME": str(other)})
+    assert r.returncode == 0, r.stderr
+    assert (other / ".local" / "state" / "sshvault" / "config.sshvault.bak").exists()
+    assert not (bench.home / ".local" / "state").exists() and not list(d.rglob("config.sshvault.bak*"))
+
+
+# install / uninstall sur un ~/.ssh/config ordinaire que ssh refuserait
+
+WIDE = ("%s non conforme (fichier modifiable par le groupe ou les autres (0664)) : ssh refuse de lire toute la "
+        "configuration (chaque ssh s'arrête sur « Bad owner or permissions »), la ligne Include de sshvault comprise ; "
+        "corriger par « chmod g-w,o-w %s »")
+
+
+def test_install_fichier_refuse_par_ssh_avertit_deja_en_tete(bench):
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text(include(bench) + "\nHost a\n")
+    cfg.chmod(0o664)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "déjà en tête" in r.stdout, r.stderr
+    assert WIDE % (cfg, cfg) in r.stderr and "n'existe pas encore" in r.stderr, r.stderr
+    assert mode(cfg) == 0o664, "rien changé"
+
+
+def test_install_fichier_refuse_par_ssh_avertit_apres_ecriture(bench):
+    unlocked(bench)
+    cfg = _ssh_dir(bench) / "config"
+    cfg.write_text("Host a\n")
+    cfg.chmod(0o664)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0 and "ajoutée en tête" in r.stdout, r.stderr
+    assert WIDE % (cfg, cfg) in r.stderr, r.stderr
+    assert mode(cfg) == 0o664 and cfg.read_text() == include(bench) + "\nHost a\n", "mode gardé"
+
+
+def test_uninstall_fichier_refuse_par_ssh_avertit(bench):
+    unlocked(bench)
+    assert bench.run("ssh-config").returncode == 0
+    cfg = _ssh_dir(bench) / "config"
+    for text, removed in (("Host a\n", False), (include(bench) + "\nHost a\n", True)):
+        cfg.write_text(text)
+        cfg.chmod(0o664)
+        r = bench.run("ssh-config", "uninstall")
+        assert r.returncode == 0, r.stderr
+        assert WIDE % (cfg, cfg) in r.stderr, (removed, r.stderr)
+        assert (cfg.read_text() == "Host a\n") and mode(cfg) == 0o664
+        assert bench.run("ssh-config").returncode == 0  # régénère pour le tour suivant
+
+
+# blocs « tous les hôtes » : témoins ssh -G sur un nom d'une lettre, sans point
+
+ALL_HOSTS = ["Host *", "Host web *", "Host * *.example.com", "Host ?*", "Match all", "Match host *",
+             "Match originalhost *", "Match host web,*"]
+#: (bloc, hôte sonde, options) : le bloc ne s'applique pas à cette sonde, sshvault le tient pour conditionnel
+NOT_ALL_HOSTS = [("Host *.*", "a", ()), ("Host ??*", "a", ()), ("Host * !web", "web", ()),
+                 ("Host !web *", "web", ()), ("Match host *,!web", "web", ()),
+                 ("Match host * user x", "a", ("-l", "y")), ("Host ?", "ab", ()), ("Host .", "a", ())]
+
+
+@needs_ssh
+@measured_89
+@pytest.mark.parametrize("block", ALL_HOSTS)
+def test_ssh_G_bloc_tous_les_hotes_nom_d_une_lettre(bench, tmp_path, block):
+    """Témoin : le bloc s'applique même à `a` (une lettre, sans point) ; sshvault le tient pour « tous les hôtes »."""
+    main = tmp_path / "ssh_config_de_test"
+    main.write_text("%s\n    User temoin\n" % block)
+    main.chmod(0o600)
+    assert values(ssh_G_main(main, "a"), "user") == ["temoin"], block
+    sc = sshconfig.scan('%s\n    %s\n' % (block, include(bench)), sshconfig.default_paths(bench.env))
+    assert sc.state() == "head" and sc.conditional == [], block
+
+
+@needs_ssh
+@measured_89
+@pytest.mark.parametrize("block,host,opts", NOT_ALL_HOSTS)
+def test_ssh_G_bloc_pas_tous_les_hotes_temoin_negatif(bench, tmp_path, block, host, opts):
+    """Témoin négatif : le bloc ne s'applique pas à cette sonde ; sshvault le tient pour conditionnel."""
+    main = tmp_path / "ssh_config_de_test"
+    main.write_text("%s\n    User temoin\n" % block)
+    main.chmod(0o600)
+    env = [(k, v) for k, v in ssh_G_main(main, host)] if not opts else None
+    if opts:
+        r = subprocess.run([SSH, "-G", "-F", str(main), *opts, host], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        assert r.returncode == 0, r.stderr
+        env = [tuple(l.split(" ", 1)) for l in r.stdout.splitlines()]
+    assert values(env, "user") != ["temoin"], block
+    sc = sshconfig.scan('%s\n    %s\n' % (block, include(bench)), sshconfig.default_paths(bench.env))
+    assert sc.state() == "conditional", block
+
+
+# modes de ce que sshvault crée, sous un umask 002 (celui du poste)
+
+def test_modes_sous_umask_002(bench):
+    """Config, dossiers, sauvegarde, dossier d'état : 0600 / 0700 quel que soit l'umask du processus."""
+    unlocked(bench)
+    os.umask(0o002)  # restauré par la fixture
+    ssh = bench.home / ".ssh"
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    assert mode(ssh) == 0o700 and mode(ssh / "config") == 0o600, "créés par install"
+    assert bench.run("ssh-config").returncode == 0
+    assert mode(sv_dir(bench)) == 0o700 and mode(sv_dir(bench) / "config") == 0o600 and mode(sv_dir(bench) / "pub") == 0o700
+    assert all(mode(sv_dir(bench) / "pub" / n) == 0o600 for n in os.listdir(sv_dir(bench) / "pub"))
+    (ssh / "config").write_text("Host a\n")
+    (ssh / "config").chmod(0o600)
+    r = bench.run("ssh-config", "uninstall")
+    assert r.returncode == 0, r.stderr
+    (ssh / "config").write_text("Host a\n")
+    (ssh / "config").chmod(0o600)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    baks = sorted(ssh.glob("config.sshvault.bak*"))
+    assert baks and all(mode(b) == 0o600 for b in baks)
+    assert mode(ssh / "config") == 0o600
+
+
+def test_modes_sauvegarde_et_dossier_d_etat_sous_umask_002(bench):
+    unlocked(bench)
+    os.umask(0o002)
+    d = dotssh_link(bench)
+    r = bench.run("ssh-config", "install")
+    assert r.returncode == 0, r.stderr
+    state = bench.home / ".local" / "state"
+    assert mode(bench.home / ".local") == 0o700 and mode(state) == 0o700 and mode(state / "sshvault") == 0o700
+    assert mode(state / "sshvault" / "config.sshvault.bak") == 0o600
+
+
+# HOME de la sauvegarde : absolu seulement
+
+@pytest.mark.parametrize("home", ["relatif", "/", ""])
+def test_install_ssh_lien_home_relatif_ou_racine_repertoire_de_sshvault(bench, home):
+    """HOME relatif, « / » ou vide : la sauvegarde va sous le répertoire personnel de sshvault, jamais
+    sous « / » ni sous un chemin relatif au dossier courant."""
+    unlocked(bench)
+    d = dotssh_link(bench)
+    r = bench.run("ssh-config", "install", env={"HOME": home})
+    assert r.returncode == 0, r.stderr
+    assert (bench.home / ".local" / "state" / "sshvault" / "config.sshvault.bak").exists()
+    assert not list(d.rglob("config.sshvault.bak*"))

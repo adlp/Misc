@@ -198,7 +198,8 @@ def adopt_legacy(cfg: Config, notify: Callable[[str], None], bw_path: Optional[C
             return None  # adoptée par un autre processus pendant l'attente
         try:
             st = BwBackend(store=SessionStore(), appdata=legacy, bw_path=bw_path, warn=warn).status()
-        except (VaultError, ConfigError) as e:  # bw absent, bw-path invalide… : `config set` doit rester possible
+        except (VaultError, ConfigError, SessionStoreError) as e:
+            # bw absent, bw-path invalide, keyctl en panne… : `config set` doit rester possible
             DEFERRED.append(str(e))
             notify("avertissement : installation 0.8.0 non adoptée (%s) : retenté au prochain lancement" % e)
             return None

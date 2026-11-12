@@ -1,5 +1,65 @@
 # Changelog — sshvault
 
+## sshvault 0.17.0 — Robustesse de ssh-config et du magasin de session — 2026-11-12
+
+Cinq défauts reportés des stories 16, 19 et 20.
+
+- **Blocs « tous les hôtes »** : un `Include` de sshvault sous `Match all`, `Match host *`,
+  `Match originalhost *` ou un `Host` qui porte au moins un motif positif `*` ou `?*` et aucun motif nié
+  (`Host *`, `Host web *`, `Host * *.example.com`) s'applique à tous les hôtes (mesuré, OpenSSH 8.9) : il n'est
+  plus pris pour conditionnel (`install` ne le refuse plus). « En tête » si rien d'effectif ne précède la ligne du
+  bloc ; sinon « pas en tête », et `install` déplace la ligne exacte comme une ligne hors bloc. `Host ?`,
+  `Host * !web`, `Host *.*`, `Host ??*` et tout autre bloc restent conditionnels.
+- **`--check`, régénérations et `~/.ssh/config` que ssh refuserait** : une ligne d'avertissement, jamais
+  « à jour » (`--check` : code 1), avec le `chmod` proposé s'il suffit. Trois cas, dits à part pour un lien
+  symbolique : la cible est refusée par ssh lui-même (propriétaire ni vous ni root, ou modifiable par le groupe ou
+  les autres : « Bad owner or permissions », toute la configuration est perdue, chaque ssh s'arrête) ; ssh ne lit
+  rien (lien cassé, boucle, cible non ordinaire) ; seule une règle de sshvault, plus stricte que celle d'ssh
+  (cible à root, dossiers ouverts), échoue : ssh lit la cible, sshvault n'y écrit pas. « Dossier de la cible non
+  modifiable » n'est pas dit. Même contrôle pour un `~/.ssh/config` ordinaire, y compris dans `install` et
+  `uninstall` (« déjà en tête » et « rien à retirer » compris).
+- **Liens physiques** : fichier écrit (`~/.ssh/config` ou cible de son lien) avec `st_nlink > 1` : `install` et
+  `uninstall` refusent (code 4, rien modifié, action à faire à la main) au lieu de le détacher de ses autres
+  noms ; rien à y écrire : code 0 et un avertissement (cible de lien refusée déjà en tête ou sans ligne à retirer
+  comprise). Le remplacement atomique vérifie aussi `st_nlink` entre la lecture et l'écriture ; refusé, la
+  sauvegarde qu'on vient d'écrire est retirée.
+- **`~/.ssh` lien symbolique** : la sauvegarde `config.sshvault.bak*` est écrite sous
+  `$XDG_STATE_HOME/sshvault/` (défaut `$HOME/.local/state/sshvault/`, ou le répertoire personnel de sshvault si
+  `HOME` est relatif ou « / » ; dossier 0700, `~/.local` et `~/.local/state` créés s'ils manquent), plus dans
+  l'arbre du lien ; son chemin est dit, avec un avertissement que `~/.ssh/sshvault/` (config générée, `pub/`) est
+  dans l'arbre du lien. Dossier d'état dans l'arbre de `~/.ssh` ou impossible à créer : code 4, rien modifié,
+  chemin dit.
+- **Erreurs de `keyctl`** (`search` comme `pipe`) : « Required key not available », « Key has expired » et « Key
+  has been revoked » = pas de session ; keyring refusé (« Operation not permitted », « Function not implemented »)
+  ou `keyctl` impossible à lancer (ENOENT, EACCES, ENOEXEC, ENOTDIR, ELOOP, ENAMETOOLONG) = repli fichier
+  silencieux, comme avant ; toute autre erreur (délai dépassé, « Permission denied », erreur transitoire EAGAIN,
+  ENOMEM…) sans session dans le fichier de repli : `session illisible : keyctl <raison>` (code 4) au lieu d'un
+  « coffre verrouillé » intermittent ; la session rangée n'est ni effacée ni réécrite.
+  - Le fichier de repli est lu avant le keyring (il n'existe que si le dernier `put` a évité le keyring) : une
+    vieille clé du keyring ne masque pas la session neuve.
+  - Un keyring vu illisible l'est pour toute la vie du magasin de ce compte (un seul délai par compte et par
+    commande ; l'adoption 0.8.0 et `account rename` ouvrent leurs propres magasins). `unlock` le traite comme
+    « pas de session », range la session dans le fichier seulement (« file, keyring illisible ») sans toucher au
+    keyring ni effacer le fichier.
+  - `lock`, `logout` et `account set` qui ne peuvent pas oublier la session (toute erreur du magasin) le disent
+    (« la session peut rester dans le keyring » pour keyctl) et rendent le code 4.
+  - `SSHVAULT_KEYCTL_TIMEOUT` règle le délai d'un appel (0 exclu à 600 s, défaut 10) ; invalide : code 2.
+  - Une adoption 0.8.0 est reportée au lancement suivant.
+- **Tests** (une ligne par ligne de la matrice, plus les cas de la relecture) :
+  - `tests/test_sshconfig.py` : `Host *`/`Match all`/`Host web *`/`Match host *`… en tête, plus bas, conditionnels
+    (`Host ?`, `Host * !web`, `Match host * user x`…), `ssh -G` réel sur un nom d'une lettre et témoins
+    négatifs ; `--check` et régénération sur cible de lien refusée (0664, cassé, boucle, FIFO, dossier ouvert) et
+    sur `~/.ssh/config` ordinaire 0664 ; `install`/`uninstall` sur un fichier refusé ; liens physiques (refus,
+    déjà en tête, rien à retirer, cible de lien, course avec sauvegarde retirée) ; sauvegarde sous `~/.ssh` lien
+    (dossier d'état par défaut, `XDG_STATE_HOME`, dans l'arbre, impossible à créer, `HOME` relatif ou « / ») ;
+    modes sous umask 002. `test_avertissements_et_check_sur_cible_liee` passe sous `/run/user/<uid>` (une cible
+    sous `/tmp` est refusée) ; le module tourne sous umask 077.
+  - `tests/test_session.py` : faux `keyctl` (délai, « Permission denied », révoquée, pas de session, refusé,
+    absent, errno de lancement), mémorisation, `put` après keyring illisible, délai d'environnement (code 2 pour
+    nan, inf, 0, 601), `list` puis `ensure`, `lock`, `logout`, `unlock` (aussi avec une vieille clé du keyring),
+    deux comptes dont un cassé ; sautés sans anneau de test dédié.
+  - `tests/test_accounts.py` : adoption 0.8.0 reportée, `logout` et `account set` en code 4.
+
 ## sshvault 0.16.2 — Client OpenSSH récent en conteneur dans la maquette — 2026-11-11
 
 Tests et maquette seulement : aucun changement du comportement de sshvault.

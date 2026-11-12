@@ -360,6 +360,29 @@ def test_adoption_installation_existante(bench):
     assert "adoptée" not in r.stderr, "une seule fois"
 
 
+def test_adoption_keyctl_en_panne_reportee(bench, tmp_path):
+    """Story 22 : keyctl en panne (autre erreur que « clé absente ») pendant l'adoption : reportée au
+    prochain lancement, avertissement ; rien déplacé, session 0.8.0 rangée intacte dans les deux magasins."""
+    if not bench.ring:
+        pytest.skip("pas de session keyring dédiée")
+    legacy = legacy_install(bench)
+    tok = "c2Vzc2lvbi1sZWdhY3ktMTIzNDU2Nzg5MA=="
+    assert bench.stored_session(None) == (tok, None)
+    fake = tmp_path / "keyctl-faux"
+    fake.write_text("#!/bin/sh\nif [ \"$1\" = search ]; then echo 'keyctl_search: Permission denied' >&2; exit 1; fi\n"
+                    "exec keyctl \"$@\"\n")
+    fake.chmod(0o755)
+    r = bench.run("account", "list", env={"SSHVAULT_KEYCTL": str(fake)})
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "installation 0.8.0 non adoptée (session illisible : keyctl keyctl_search: Permission denied)" in r.stderr, r.stderr
+    assert legacy.exists() and not bench.appdata.exists() and not (bench.home / ".config" / "sshvault" / "config.json").exists()
+    assert bench.stored_session(None) == (tok, None), "session rangée intacte"
+    assert bench.stored_session("alice") == (None, None)
+    r = bench.run("status")  # keyctl rétabli : adoptée, ancienne session oubliée
+    assert "adoptée : compte" in r.stderr, r.stderr
+    assert bench.stored_session(None) == (None, None)
+
+
 def test_adoption_alias_deduit_de_l_email(bench):
     legacy_install(bench, session=False)
     st = json.loads((bench.home / ".local/share/sshvault/bw/data.json").read_text())
@@ -2371,8 +2394,32 @@ def test_logout_magasin_de_session_en_erreur_pas_rien_a_faire(bench, monkeypatch
     monkeypatch.setattr(SessionStore, "clear", broken)
     rc = cli.main(["logout", "--account", "client"])
     out, errs = capsys.readouterr()
-    assert rc == 0 and "rien à faire" not in out and out.startswith("compte client non connecté : 0 clé"), (out, errs)
+    # la session n'a pas pu être oubliée : dit, code 4 (comme `lock`)
+    assert rc == 4 and "rien à faire" not in out and out.startswith("compte client non connecté : 0 clé"), (out, errs)
     assert "session non oubliée : magasin en panne" in errs
+
+
+def test_account_set_magasin_de_session_en_erreur_code_4(bench, monkeypatch, capsys):
+    """`account set` : registre corrigé, mais session impossible à oublier : dit, code 4."""
+    from sshvault import cli
+    from sshvault.session import SessionStore, SessionStoreError
+    bench.unlocked(where(bench))
+    bench.add_account("client", "carol@client.test", server=OTHER, logged_in=False)
+    for k in list(os.environ):
+        if k.startswith(("SSHVAULT_", "FAKE_BW_", "XDG_")):
+            monkeypatch.delenv(k, raising=False)
+    for k, v in bench.env.items():
+        monkeypatch.setenv(k, v)
+
+    def broken(self):
+        raise SessionStoreError("magasin en panne")
+    monkeypatch.setattr(SessionStore, "get", broken)
+    monkeypatch.setattr(SessionStore, "clear", broken)
+    rc = cli.main(["account", "set", "client", "--email", "carole@client.test"])
+    out, errs = capsys.readouterr()
+    assert rc == 4 and "compte client modifié" in out, (out, errs)
+    assert "session non oubliée : magasin en panne" in errs
+    assert registry(bench)["accounts"]["client"] == {"server": OTHER, "email": "carole@client.test"}
 
 
 # --- story 11, revue 4 -------------------------------------------------------------------

@@ -500,7 +500,12 @@ class BwBackend(VaultBackend):
         return token
 
     def unlock(self, prompt: Optional[Prompt], ttl: int = DEFAULT_TTL) -> None:
-        session = self.store.get()
+        try:
+            session = self.store.get()
+        except SessionStoreError:
+            # keyring illisible, pas de session dans le fichier : rien à vérifier ni à effacer ;
+            # le déverrouillage doit rester possible (la session sera rangée dans le fichier)
+            session = None
         if session:
             st = self._bw_status(session)
             if st.state == "unlocked":
