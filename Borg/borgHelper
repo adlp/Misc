@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.217"
+Version="1.0.218"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -807,8 +807,14 @@ def _secret_form(repo):
     return sc(m.group(1),m.group(2)) if m else "…"
 
 def _borg_runs_elsewhere(cfg):
-    """SSH_REPO ou SSH_REMFO posé : le borg du Bkp tourne sur SER_NAME, un BORG_REPO local désigne un chemin de CETTE machine que
-    ce borg-là ne voit pas forcément — jamais lu ici (verrou : _repo_local_path ; place : _storage_of, 1.0.209 revue 87b row 3)."""
+    """SSH_REPO ou SSH_REMFO posé : le dépôt écrit au Bkp n'est pas forcément BORG_REPO (borg du Bkp sur SER_NAME en Bkp tiré, ou
+    borg local qui écrit SSH_REPO), un BORG_REPO local désigne un chemin de CETTE machine que ce borg-là ne voit pas forcément —
+    jamais lu ici (verrou : _repo_local_path ; place : _storage_of, 1.0.209 revue 87b row 3).
+    1.0.218 (story 119, K2 de l'étude work/proxyjump/etude.md, décision de l'utilisateur du 2026-11-11) : réponse INCHANGÉE, différente
+    à dessein de la règle de backup() (_bkp_pull_mode : SSH_REPO seul = borg LOCAL avec BORG_REPO=SSH_REPO). Côté prudent : avec
+    SSH_REPO, le dépôt que borg écrit au Bkp n'est pas BORG_REPO (le borg du client en BKP_PULL = direct, ou le borg local en
+    SSH_REPO seul) — lire le lock.roster de BORG_REPO ou y mesurer la place désignerait peut-être un autre dépôt ; « ailleurs » ne fait
+    que renoncer (Status/BkpReconcile « non vérifiable », place par df ssh ou STORAGE_SIZE), jamais une fausse certitude."""
     return bool((cfg.get('SSH_REPO') or '').strip() or (cfg.get('SSH_REMFO') or '').strip())
 
 def _storage_of(cfg,nick=None,resolve=None):
@@ -3013,7 +3019,7 @@ def _dbg_mask(obj):
         return x
     return m(obj)
 
-# 1.0.213 (story 115, décisions de l'utilisateur du 2026-11-09) : variables BORG_* du borg DISTANT d'un Bkp tiré (SSH_REMFO, preBorg)
+# 1.0.213 (story 115, décisions de l'utilisateur du 2026-11-09) : variables BORG_* du borg DISTANT d'un Bkp tiré (SSH_REMFO ou BKP_PULL = direct, preBorg)
 # — clé du rc SSH_ENV : `sendenv` (défaut, inchangé : `ssh -o SendEnv BORG_*`, reçues seulement si le sshd du client les accepte,
 # AcceptEnv) ou `commande` (dans la commande distante : `exec env BORG_X=<valeur citée> … <borg> …`, plus de SendEnv ; tous les sshd).
 # BORG_PASSPHRASE n'est JAMAIS dans une ligne de commande : écrite sur l'entrée de ssh, lue par le shell distant (`read -r`, une ligne).
@@ -3177,13 +3183,20 @@ def _bkp_pull_env(cfg,nick):
     except configparser.InterpolationError as e: raise _RcValueError(e) from None
     if isinstance(keys,str): return None,keys   # fichier de /etc/ssh fautif, nommé
     if not keys: return None,_PULL_HOSTKEY_ERR
+    return {'BORG_REPO':f"ssh://{user}@{host}:{int(t[0])}{path}",'BORG_RSH':_pull_rsh(nick,keys,key)},None
+
+def _pull_rsh(nick,keys,key):
+    """1.0.216 (story 117 ; extraite en 1.0.218, story 119 : même construction pour BKP_PULL = direct) : BORG_RSH épinglé du borg du
+    client — `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null
+    -o HostKeyAlias=borghelper-<nick> -o KnownHostsCommand=… [-o IdentitiesOnly=yes -i <key>]` (shlex.join) ; `keys` : liste non vide
+    de 'type base64' (_pull_hostkeys) ; `key` : SSH_REPO_KEY déjà vérifiée (ni « % » ni « ${ »), vide = identités par défaut."""
     alias='borghelper-'+re.sub(r'[^a-z0-9._-]','_',nick.lower())
     khc=' '.join(_ssh_cfg_word(a) for a in ['/bin/sh','-c','for l do echo "$l"; done','sh',*(f"{alias} {k}" for k in keys)])
     # « % » doublé (jetons d'OpenSSH) : défense, inatteignable aujourd'hui (types, base64 et alias n'en contiennent jamais — revue 1 row 16)
     rsh=['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','UserKnownHostsFile=/dev/null','-o','GlobalKnownHostsFile=/dev/null',
          '-o',f"HostKeyAlias={alias}",'-o',"KnownHostsCommand="+khc.replace('%','%%')]
     if key: rsh+=['-o','IdentitiesOnly=yes','-i',key]
-    return {'BORG_REPO':f"ssh://{user}@{host}:{int(t[0])}{path}",'BORG_RSH':shlex.join(rsh)},None
+    return shlex.join(rsh)
 
 def _pull_openssh_old(stderr):
     """1.0.216 (story 117) : sortie d'erreur d'un borg create du client avec « Bad configuration option: knownhostscommand » (casse
@@ -3262,10 +3275,87 @@ def _pull_ssh_tail(cfg,opts=_PULL_SSH_OPTS):
     if 'SSH_KEY' in cfg.keys(): a+=['-i',cfg['SSH_KEY']]
     return a
 
-def _is_pull(cfg):
-    """1.0.217 (story 118) : Bkp tiré (SSH_REMFO non vide, la règle de backup()). Valeur à « % » mal formée : _RcValueError."""
-    try: return cfg is not None and 'SSH_REMFO' in cfg.keys() and len(cfg['SSH_REMFO'])>0
+# 1.0.218 (story 119, décisions de l'utilisateur des 2026-11-09 — Q7 — et 2026-11-11) : clé BKP_PULL — mode du Bkp tiré. `tunnel`
+# (le borg du client joint le dépôt par le tunnel inverse -R SSH_REMFO : mode d'avant, défaut quand SSH_REMFO est posé) ou `direct`
+# (ssh vers le client SANS -R, le borg du client joint SSH_REPO lui-même : client qui voit le serveur de dépôts). Absente ou vide : règle
+# d'avant 1.0.218 à l'identique (SSH_REMFO non vide = tunnel, sinon Bkp local — SSH_REPO seul = borg LOCAL avec BORG_REPO=SSH_REPO).
+_BKP_PULL_MODES=('tunnel','direct')
+_DIRECT_HOSTKEY_ERR="clé d'hôte du dépôt mal formée (SSH_REPO_HOSTKEY)"
+
+def _bkp_pull_mode(cfg):
+    """1.0.218 (story 119) : mode du Bkp du nick -> (mode, refus) ; mode None (Bkp local), 'tunnel' ou 'direct' ; refus : texte (sans
+    secret) ou None. BKP_PULL absente ou vide : (('tunnel' si SSH_REMFO non vide — `len(cfg['SSH_REMFO'])>0`, la règle de backup() —
+    sinon None), None), seule SSH_REMFO lue (erreur d'interpolation telle quelle, comme avant). BKP_PULL posée (casse et espaces
+    ignorés) : `tunnel` exige SSH_REMFO non vide ; `direct` exige SSH_REMFO absente ou vide (conflit sinon) et SSH_REPO non vide ;
+    autre valeur : refus (valeurs admises, caractères de contrôle de la valeur citée -> espace : une seule ligne) ; « % » mal formé dans
+    BKP_PULL, SSH_REMFO ou SSH_REPO : _RcValueError.
+    Revue 1 (décision de l'utilisateur du 2026-11-12) : une clé de même majuscule écrite autrement (`bkp_pull`, `Bkp_Pull` — clés du rc
+    sensibles à la casse, optionxform=str ; section ou [DEFAULT]) : refus nommant la bonne casse, AVANT tout (sinon ignorée : Bkp local)
+    — seuls les rc qui ont une telle clé sont touchés (keys() seul, aucune valeur lue)."""
+    bad=sorted(k for k in cfg.keys() if k!='BKP_PULL' and k.upper()=='BKP_PULL')
+    if bad: return None,f"clé « {bad[0][:40]} » : s'écrit BKP_PULL (majuscules — sinon ignorée, Bkp local)"
+    try: v=(cfg.get('BKP_PULL') or '').strip()
     except configparser.InterpolationError as e: raise _RcValueError(e) from None
+    if not v: return ('tunnel' if 'SSH_REMFO' in cfg.keys() and len(cfg['SSH_REMFO'])>0 else None),None
+    m=v.lower()
+    if m not in _BKP_PULL_MODES:
+        vq=re.sub(r'[\x00-\x1f\x7f]',' ',v[:40])   # revue 1 : valeur sur plusieurs lignes -> refus sur une ligne
+        return None,f"BKP_PULL inconnu (« {vq} » ; attendu : tunnel ou direct)"
+    try:
+        remfo=bool((cfg.get('SSH_REMFO') or '').strip())
+        if m=='tunnel':
+            if remfo: return 'tunnel',None
+            return None,"BKP_PULL = tunnel sans SSH_REMFO (tunnel inverse -R) — poser SSH_REMFO, ou BKP_PULL = direct"
+        if remfo: return None,("BKP_PULL = direct avec SSH_REMFO : conflit (direct = sans tunnel -R) — retirer SSH_REMFO (ou la vider dans la "
+                               "section si elle vient de [DEFAULT]), ou BKP_PULL = tunnel")
+        if not (cfg.get('SSH_REPO') or '').strip():
+            return None,"BKP_PULL = direct sans SSH_REPO (dépôt joint par le borg du client) — poser SSH_REPO = ssh://…"
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None
+    return 'direct',None
+
+def _bkp_direct_env(cfg,nick):
+    """1.0.218 (story 119) : BKP_PULL = direct — variables du borg du client, toujours dans la commande distante (comme la 117) ->
+    ({'BORG_REPO': SSH_REPO[, 'BORG_RSH': du rc ou construit]}, None) ou (None, texte du refus). BORG_RSH : celui du rc s'il est non vide
+    (section du nick ou [DEFAULT] ; revue 1, décision de l'utilisateur : comme le construit, dans la commande distante ET en `--rsh` ;
+    vide = absente) ; sinon, SSH_REPO_HOSTKEY non vide : construit comme la 117 (_pull_rsh : épinglage KnownHostsCommand,
+    HostKeyAlias=borghelper-<nick>, SSH_REPO_KEY facultative — « % » ou « ${ » : refus ; clé mal formée : refus _DIRECT_HOSTKEY_ERR) ;
+    sinon aucun (ssh du client avec sa propre config et son known_hosts — jamais de TOFU ajouté ici). SSH_REPO_KEY sans SSH_REPO_HOSTKEY :
+    ignorée. Refus de la revue 1 (décisions de l'utilisateur du 2026-11-12) : SSH_REPO sur plusieurs lignes ou à marqueur {…} (comme la
+    117) ; SSH_REPO à identifiants ou de forme non reconnue (_secret_form, « @ »/« = » dans le chemin compris : il passerait dans l'argv,
+    visible dans ps) ; BORG_RSH du rc ET
+    SSH_REPO_HOSTKEY (choisir l'un). « % » mal formé : _RcValueError."""
+    try:
+        repo=cfg['SSH_REPO']
+        env={'BORG_REPO':repo}
+        if '{' in repo or re.search(r'[\x00-\x1f\x7f]',repo):
+            return None,"SSH_REPO à marqueur {…} ou sur plusieurs lignes — dépôt du client inconnu"
+        sf=_secret_form(repo.strip())
+        if sf is not None:
+            return None,(f"SSH_REPO refusé en direct ({sf}) : identifiants possibles (« @ » ou « = » dans le chemin compris) ou forme non "
+                         "ssh — il passerait dans la commande, visible dans ps ; utiliser ssh://utilisateur@hôte/chemin et une clé ssh")
+        rsh=(cfg.get('BORG_RSH') or '').strip()
+        raw=(cfg.get('SSH_REPO_HOSTKEY') or '').strip()
+        if rsh and raw:
+            return None,("BORG_RSH du rc et SSH_REPO_HOSTKEY : choisir l'un — retirer BORG_RSH de [DEFAULT] et le poser dans les sections "
+                         "qui en ont besoin, ou retirer SSH_REPO_HOSTKEY")   # revue 2 row 17 : jamais « vider » (un BORG_RSH vide casse les borg d'ici)
+        if rsh: return dict(env,BORG_RSH=cfg['BORG_RSH']),None
+        if not raw: return env,None
+        key=(cfg.get('SSH_REPO_KEY') or '').strip()
+        if '%' in key or '${' in key:
+            return None,"SSH_REPO_KEY contient « % » ou « ${ » (jetons de ssh : `-i` ne les accepte pas) — renommer la clé du client"
+        keys=_pull_hostkeys(cfg,'')   # SSH_REPO_HOSTKEY posée : seule lue (aucune cible de tunnel)
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None
+    if not keys or isinstance(keys,str): return None,_DIRECT_HOSTKEY_ERR
+    return dict(env,BORG_RSH=_pull_rsh(nick,keys,key)),None
+
+def _is_pull(cfg):
+    """1.0.217 (story 118) : Bkp tiré (la règle de backup()). 1.0.218 (story 119) : _bkp_pull_mode — tunnel ou direct ; BKP_PULL
+    refusée par _bkp_pull_mode : False (rien à sonder) ; un refus plus tardif (_bkp_direct_env, SSH_ENV, construction 117) laisse
+    True, comme les refus de la 117. Valeur à « % » mal formée : _RcValueError."""
+    if cfg is None: return False
+    try: m,err=_bkp_pull_mode(cfg)
+    except configparser.InterpolationError as e: raise _RcValueError(e) from None
+    return m is not None and err is None
 
 def _pull_probe_argv(cfg):
     """1.0.217 (story 118, décision de l'utilisateur Q4) : sonde du client d'un Bkp tiré — même destination, clé et options que le ssh
@@ -3641,6 +3731,8 @@ _HELP={
               "En fin de Bkp : place libre du stockage mesurée (borgHelper_storage ; voir Storage), jamais un échec du Bkp.",
               "Bkp tiré (SSH_REMFO) avec SSH_REPO_USER : BORG_REPO et BORG_RSH du client construits ici (clé d'hôte",
               "épinglée : /etc/ssh ou SSH_REPO_HOSTKEY ; OpenSSH >= 8.5 sur le client) ; vus par Status et -d.",
+              "BKP_PULL = direct : Bkp tiré SANS tunnel -R, le borg du client joint SSH_REPO lui-même (SSH_REPO requis,",
+              "SSH_REMFO interdit ; BORG_RSH du rc, ou épinglé si SSH_REPO_HOSTKEY) ; BKP_PULL = tunnel : SSH_REMFO requis.",
               "Bkp tiré, client injoignable (ssh en échec réseau avant borg) : « [ABSENT] », code 1, ni push ni",
               "Sentry — pas un échec ; ssh du pull : BatchMode, ConnectTimeout=30, ServerAlive 30 s × 6.")),
     'prune':_H('Prune',0,"Supprime les vieilles archives selon les règles KEEP_*","-c Prune [-n nick|a,b|ALL]",(_HNALL,),
@@ -8043,7 +8135,8 @@ def _argv_bkp_run(a):
     exactement comme backup() l'écrit : sous-commande create (première sous-commande borg de l'argv), puis --comment, puis
     « borgHelper run <run_id> » (lisible d'un uid à l'autre, contrairement à environ) ; run_id = 32 caractères hexadécimaux
     (uuid4().hex de backup()). --comment ailleurs (revue 3), sans --comment, autre commentaire, forme --comment=…,
-    commentaire cité pour le shell distant (SSH_REMFO : dépôt distant, inchangé), run d'une autre forme : None."""
+    commentaire cité pour le shell distant (Bkp tiré — SSH_REMFO ou BKP_PULL = direct — : dépôt distant, inchangé), run d'une autre forme :
+    None."""
     j=next((i for i,x in enumerate(a) if i>0 and x in _BORG_SUBCMDS),None)
     if j is None or a[j]!='create' or a[j+1:j+2]!=['--comment'] or len(a)<j+3: return None
     c=a[j+2]
@@ -10378,11 +10471,13 @@ class BorgHelper:
         except (sqlite3.Error,DbCodecError) as e:
             printer(f"  [WARN] {nick}: comptage des fichiers de la paire impossible : {e}"); return None
 
-    def _bkp_server_version(self,nick,cfg,preBorg,repo,client_version):
+    def _bkp_server_version(self,nick,cfg,preBorg,repo,client_version,direct=False):
         """1.0.165 (story 28, A44) : version du borg qui a reçu les données d'un Bkp (décision de l'utilisateur, selon le mode).
         -> (version ou None, raison à signaler ou None). Ne lève JAMAIS (appelée avant les mesures non régénérables).
         - Tunnel inverse (SSH_REMFO, preBorg) vers CETTE machine : `<BORG_REMOTE_PATH|borg> --version` local ; tunnel vers
           une autre machine ou forme inconnue : None (jamais devinée).
+        - 1.0.218 (story 119) : Bkp tiré direct (`direct`, BKP_PULL = direct, preBorg sans -R) : le borg du client a joint SSH_REPO
+          lui-même, aucun tunnel vers ici — None, « version non mesurable d'ici » (rien lancé).
         - Dépôt ssh direct : `<BORG_RSH|ssh> [options] [-p port] hôte <BORG_REMOTE_PATH|borg> --version` ; une clé à commande
           forcée lance borg serve, qui répond `Borg X.Y: Got connection close…` (mesuré) : version lue quand même.
         - Dépôt local (`/…`, `file://`) : le même borg que le créateur.
@@ -10391,6 +10486,8 @@ class BorgHelper:
         (sans terminal : jamais d'invite de mot de passe), groupe tué au délai et ses _MEI retirés, sortie décodée en
         tolérant. Réponse sans numéro (code 0) : None sans raison — « — » en silence (décision de l'utilisateur)."""
         try:
+            if preBorg is not None and direct:   # 1.0.218 (story 119) : avant toute lecture (rien à mesurer d'ici)
+                return None,"Bkp tiré direct (BKP_PULL = direct, sans tunnel) : borg du dépôt joint par le client, version non mesurable d'ici"
             try: rp=shlex.split((cfg.get('BORG_REMOTE_PATH') or '').strip()) or ['borg']
             except ValueError as e: return None,f"BORG_REMOTE_PATH illisible ({e})"
             if preBorg is not None:
@@ -10439,28 +10536,36 @@ class BorgHelper:
             forceEnv={'BORG_REPO':cfg['SSH_REPO']}
         else:
             forceEnv=None
-        # 1.0.213 (story 115) : SSH_ENV lue pour un Bkp tiré seulement (SSH_REMFO non vide : preBorg) ; `commande` -> ni `-o SendEnv`
+        # 1.0.213 (story 115) : SSH_ENV lue pour un Bkp tiré seulement (SSH_REMFO non vide ou BKP_PULL = direct : preBorg) ; `commande` -> ni `-o SendEnv`
         # ni BORG_* dans l'environnement de ssh (boex) ; valeur inconnue, passphrase à saut de ligne : refus plus bas, rien lancé
+        # 1.0.218 (story 119) : mode du Bkp (_bkp_pull_mode) — BKP_PULL absente : SSH_REMFO non vide = tunnel, sinon local (règle d'avant, à
+        # l'identique) ; BKP_PULL refusée (valeur inconnue, direct + SSH_REMFO, direct sans SSH_REPO, tunnel sans SSH_REMFO) : refus plus
+        # bas, rien lancé (preBorg None en attendant : aucun ssh)
+        pull_mode,mode_err=_bkp_pull_mode(cfg)
         ssh_env,ssh_env_err='sendenv',None
-        if 'SSH_REMFO' in cfg.keys() and len(cfg['SSH_REMFO'])>0:
+        if pull_mode is not None:
             try: ssh_env=_ssh_env_mode(cfg)
             except ValueError as e: ssh_env_err=str(e)
         preBorg=['ssh','-T'] if ssh_env=='commande' else ['ssh','-o','SendEnv BORG_*']   # revue 1 row 3 : -T, jamais d'écho par un pty
-        if 'SSH_REMFO' in cfg.keys():
+        if 'SSH_REMFO' in cfg.keys() and pull_mode!='direct':   # 1.0.218 : jamais de -R en direct
             preBorg.append('-R'); preBorg.append(cfg['SSH_REMFO'])
         # 1.0.217 (story 118) : + BatchMode, ConnectTimeout, ServerAlive* (_PULL_SSH_OPTS) juste avant la destination
         preBorg.extend(_pull_ssh_tail(cfg))
-        if 'SSH_REMFO' not in cfg.keys() or len(cfg['SSH_REMFO'])==0:
+        if pull_mode is None:
             preBorg=None
         # 1.0.216 (story 117) : Bkp tiré avec SSH_REPO_USER (ni SSH_REPO ni BORG_RSH) -> BORG_REPO et BORG_RSH du client construits, transmis
         # par forceEnv comme SSH_REPO ; refus (SSH_REMFO illisible, BORG_REPO relatif, clé d'hôte inconnue…) plus bas, rien lancé
+        # 1.0.218 (story 119) : direct -> BORG_REPO=SSH_REPO (+ BORG_RSH construit si SSH_REPO_HOSTKEY, sans BORG_RSH du rc), même chemin
         pull=pull_err=None
         if preBorg is not None:
-            pr=_bkp_pull_env(cfg,nick)
+            pr=_bkp_pull_env(cfg,nick) if pull_mode=='tunnel' else _bkp_direct_env(cfg,nick)
             if pr is not None: pull,pull_err=pr
             if pull: forceEnv=dict(forceEnv or {},**pull)
+        pull_rsh=(pull or {}).get('BORG_RSH')   # BORG_RSH construit (117, ou direct épinglé) ou du rc en direct (revue 1) : --rsh
+        # aide OpenSSH < 8.5 : BORG_RSH construit seulement (KnownHostsCommand), jamais celui du rc
+        pull_khc=pull_rsh if pull_rsh and not (pull_mode=='direct' and (cfg.get('BORG_RSH') or '').strip()) else None
         archive_old=None
-        if not no_index and not (pull_err or ssh_env_err):   # revue 1 row 4 : refus connu -> pas de borg list (getlastbkp) inutile
+        if not no_index and not (pull_err or ssh_env_err or mode_err):   # revue 1 row 4 : refus connu -> pas de borg list (getlastbkp) inutile
             try:
                 prev=self.borg.getlastbkp(nick,1,debug=debug,strict=False)
                 archive_old=prev[0] if prev else None
@@ -10476,7 +10581,7 @@ class BorgHelper:
         if archname[:2]=="::": create.append(archname+'-{now:%Y-%m-%dT%H%M%S}')
         else: create.append('::{fqdn}-'+archname+'-{now:%Y-%m-%dT%H%M%S}')
         # 1.0.163 (story 26, A36) : BORG_ROOTBKP = liste de chemins (découpage shell : espaces, guillemets pour un chemin
-        # qui en contient) ; absent : '/'. Borg distant (SSH_REMFO) : la valeur passe telle quelle, le shell distant la
+        # qui en contient) ; absent : '/'. Borg distant (Bkp tiré : SSH_REMFO ou BKP_PULL = direct) : la valeur passe telle quelle, le shell distant la
         # découpe (guillemets compris), comme avant. Erreur (vide, illisible) : signalée après bkp_status (en échec).
         roots,roots_err=_bkp_roots(cfg.get('BORG_ROOTBKP')) if preBorg is None else (None,None)
         if preBorg is not None: create.append(cfg['BORG_ROOTBKP'] if 'BORG_ROOTBKP' in cfg.keys() else '/')
@@ -10490,12 +10595,12 @@ class BorgHelper:
         if 'EXCLUDE_NEXT' in list(cfg.keys()):
             create.extend(cfg['EXCLUDE_NEXT'].split(' '))
         run_id=uuid.uuid4().hex
-        cmt=f'borgHelper run {run_id}'   # 1.0.185 (story 54) : l'archive porte son run (rapprochement d'un Bkp tué) ; SSH_REMFO
+        cmt=f'borgHelper run {run_id}'   # 1.0.185 (story 54) : l'archive porte son run (rapprochement d'un Bkp tué) ; Bkp tiré (SSH_REMFO ou direct)
         create[1:1]=['--comment',cmt if preBorg is None else shlex.quote(cmt)]   # (revue) : ssh joint, le shell distant redécoupe
         # 1.0.216 (story 117, revue 2 row 20) : construction active -> aussi `--rsh <BORG_RSH>` (cité pour le shell distant), APRÈS le
         # commentaire (_proc_create_run lit `create --comment <run>`) : un argument survit à `BORG_EXE = sudo borg` (env_reset) et à une
         # commande forcée qui ne garde que `borg …` ; l'environnement et le préfixe `exec env` restent (BORG_REPO en a besoin)
-        if pull: create[3:3]=['--rsh',shlex.quote(pull['BORG_RSH'])]
+        if pull_rsh: create[3:3]=['--rsh',shlex.quote(pull_rsh)]   # 1.0.218 : aussi BKP_PULL = direct (épinglé, ou BORG_RSH du rc)
         self.db.set_bkp_marker(nick,run_id)   # 1.0.183 (story 50, revue 2) : Report voit ce Bkp dès ici (« en attente de l'Index »)
         self.db.set_priority_lock(nick)
         self.db.wait_index_idle(nick)
@@ -10517,7 +10622,7 @@ class BorgHelper:
                 self.db.set_bkp_untracked(nick,run_id)
                 if not self.db.bkp_untracked(nick,run_id):   # revue : _set_pid_lock avale OSError -> dit, jamais muet
                     printer(f"[WARN] {nick}: trace sans-suivi non écrite (run_id={run_id}) — ce Bkp sera vu « en attente de l'Index »")
-            # 1.0.163 (story 26, choix de l'utilisateur) : borg local seulement (avec SSH_REMFO, borg tourne sur la machine
+            # 1.0.163 (story 26, choix de l'utilisateur) : borg local seulement (Bkp tiré — SSH_REMFO ou direct —, borg tourne sur la machine
             # distante, ses chemins ne se vérifient pas ici). Chemin absent : [WARN], les autres sont sauvegardés (borg
             # ferait de même, code 1) ; tous absents : aucune archive vide, Bkp en échec (code 2, Status, notifications).
             # 1.0.213 (story 115) : SSH_ENV inconnue, ou passphrase à saut de ligne avec SSH_ENV = commande (`read -r` n'en lit qu'une
@@ -10526,12 +10631,16 @@ class BorgHelper:
                 try: pw=cfg.get('BORG_PASSPHRASE')
                 except configparser.InterpolationError: pw=None   # rc illisible : dit par boex, comme avant
                 ssh_env_err=_ssh_env_pw_err(pw)   # revue 1 row 2 : aussi non encodable en UTF-8
-            ssh_env_err=ssh_env_err or pull_err   # 1.0.216 (story 117) : même refus, AVANT ssh
+            ssh_env_err=mode_err or ssh_env_err or pull_err   # 1.0.216 (story 117), 1.0.218 (story 119, BKP_PULL) : même refus, AVANT ssh
             if ssh_env_err:
                 printer(f"[ERREUR] {nick}: {ssh_env_err} — rien lancé")
                 self.db.store_bkp_status_finish(nick,run_id,'error',bkp_status_db)
                 sentry_alert('bkp_error',nick,f"Sauvegarde en échec — {nick} ({ssh_env_err})",cfg,extra={'exitcode':2})
                 sys.exit(2)
+            # 1.0.218 (story 119, revue 1) : direct avec SSH_REPO chemin local (ni ssh ni scp) : le borg du CLIENT écrit sur SON disque
+            if pull_mode=='direct' and pull and _ssh_repo_host(pull['BORG_REPO'].strip()) is None:
+                printer(f"[WARN] {nick}: SSH_REPO = {pull['BORG_REPO'].strip()} : chemin local — le borg du CLIENT écrit sur SON disque "
+                        "(BKP_PULL = direct) ; dépôt de ce serveur : ssh://…")
             missing=[]
             if preBorg is None:
                 missing=[r for r in (roots or []) if _local_state(r)=='absent']   # accès refusé, délai : présent (borg tranche)
@@ -10593,7 +10702,7 @@ class BorgHelper:
                     other.append(i)
                 _print_borg_stderr(other,debug)   # 1.0.175 (story 38, A70) : trace et bandeau de borg réduits ; reste tel quel
             if create_mute_fail: printer(f"[ERREUR] {self._borg_fail_msg(nick,'borg create',_rb_errmsg(anaRet,'borg create'))}")
-            if pull and newretC and _pull_openssh_old(anaRet.get('stderr')): printer(f"[ERREUR] {nick}: {_PULL_OPENSSH_HELP}")   # 1.0.216
+            if pull_khc and newretC and _pull_openssh_old(anaRet.get('stderr')): printer(f"[ERREUR] {nick}: {_PULL_OPENSSH_HELP}")   # 1.0.216, 1.0.218
             for key,label in (('changed_during_backup','fichier(s) modifié(s) PENDANT la sauvegarde — copie possiblement incohérente'),
                               ('read_errors','erreur(s) de lecture — fichier(s) non ou partiellement sauvegardé(s)')):
                 if warn[key]:
@@ -10618,7 +10727,7 @@ class BorgHelper:
                         bv=_show_version_of(anaRet.get('stderr'))
                         if bv is None: printer(f"[WARN] {nick}: version de borg de l'archive inconnue (pas de message --show-version)")
                         repo=(forceEnv or {}).get('BORG_REPO') or cfg.get('BORG_REPO')
-                        sv,why=self._bkp_server_version(nick,cfg,preBorg,repo,bv)
+                        sv,why=self._bkp_server_version(nick,cfg,preBorg,repo,bv,direct=pull_mode=='direct')
                         if sv is None and why: printer(f"[WARN] {nick}: version de borg côté serveur inconnue ({why})")
                         if out is not None: out['borgHelper_borg_versions']={'archive':bv,'server':sv}
                         # Mesures du Bkp (non régénérables) -> history.db (1.0.139, AD-7)
@@ -13074,9 +13183,29 @@ class BorgHelper:
         """1.0.216 (story 117) : Status d'un nick — BORG_REPO et BORG_RSH construits pour le borg du client d'un Bkp tiré (_bkp_pull_env),
         tels que borg les recevra : {'BORG_REPO','BORG_RSH'} ; refus du Bkp : {'error': texte} ; construction inactive, nick absent du rc :
         None (aucune valeur lue sans SSH_REPO_USER). Valeur à « % » mal formée : {'error'} (jamais l'exception : Status du nick gardé). Aucun
-        secret (passphrase jamais lue)."""
+        secret (passphrase jamais lue).
+        1.0.218 (story 119) : BKP_PULL posée (non vide) seulement — refusée : {'error': texte du refus de backup()} ; direct :
+        {'mode': 'direct', 'BORG_REPO': SSH_REPO (forme à identifiants : refusée, _bkp_direct_env), 'BORG_RSH': construit ou None,
+        'rsh': 'construit' | 'rc' (BORG_RSH du rc non vide : commande distante et --rsh, valeur jamais montrée) | 'client' (aucun : config
+        ssh du client)[, 'ignored': ['SSH_REPO_KEY'] (posée sans SSH_REPO_HOSTKEY)]} ; tunnel : vue de la 117. BKP_PULL absente (ni clé
+        de même majuscule) : inchangé."""
         cfg=self.borg.cfgread(nick)
-        if cfg is None or 'SSH_REPO_USER' not in cfg.keys(): return None
+        if cfg is None: return None
+        try:
+            if (cfg.get('BKP_PULL') or '').strip() or any(k!='BKP_PULL' and k.upper()=='BKP_PULL' for k in cfg.keys()):
+                mode,err=_bkp_pull_mode(cfg)
+                if err: return {'error':err}
+                if mode=='direct':
+                    env,err=_bkp_direct_env(cfg,nick)
+                    if err: return {'error':err}
+                    rp=env['BORG_REPO'].strip(); sf=_secret_form(rp)   # défense : une forme à identifiants est refusée plus haut
+                    rc_rsh=bool((cfg.get('BORG_RSH') or '').strip())
+                    v={'mode':'direct','BORG_REPO':rp if sf is None else sf,'BORG_RSH':None if rc_rsh else env.get('BORG_RSH'),
+                       'rsh':'rc' if rc_rsh else ('construit' if env.get('BORG_RSH') else 'client')}
+                    if v['rsh']!='construit' and (cfg.get('SSH_REPO_KEY') or '').strip(): v['ignored']=['SSH_REPO_KEY']   # revue 1 row 10, revue 2 row 22
+                    return v
+        except configparser.InterpolationError as e: return {'error':f"rc illisible ({_rc_err_text(e)})"}
+        if 'SSH_REPO_USER' not in cfg.keys(): return None
         try: pr=_bkp_pull_env(cfg,nick)
         except configparser.InterpolationError as e: return {'error':f"rc illisible ({_rc_err_text(e)})"}
         if pr is None: return None
@@ -13196,6 +13325,11 @@ class BorgHelper:
         bp=st.get('bkp_pull')   # 1.0.216 (story 117)
         if bp:
             if 'error' in bp: printer(f"  Bkp tiré : {bp['error']} — Bkp refusé")
+            elif bp.get('mode')=='direct':   # 1.0.218 (story 119)
+                rsh={'construit':f"BORG_RSH={bp.get('BORG_RSH')}",'rc':"BORG_RSH du rc (dans la commande distante et en --rsh)"}.get(
+                    bp.get('rsh'),"BORG_RSH : aucun (ssh du client avec sa propre config et son known_hosts)")
+                rsh+=" — SSH_REPO_KEY ignorée sans SSH_REPO_HOSTKEY" if bp.get('ignored') else ''   # revue 2 row 22 : aussi avec le BORG_RSH du rc
+                printer(f"  Bkp tiré direct (sans tunnel), borg du client : BORG_REPO={bp['BORG_REPO']}\n    {rsh}")
             else: printer(f"  Bkp tiré, borg du client : BORG_REPO={bp['BORG_REPO']}\n    BORG_RSH={bp['BORG_RSH']}")
 
     def status(self,nick,debug=0,as_json=False):
@@ -26230,6 +26364,314 @@ sys.exit(0)
             if bad: print(f"  {bad}")
             return not bad
         check("Bkp tiré construit par le vrai backup() : SendEnv et commande, inactif = 1.0.215, refus avant ssh, aide OpenSSH < 8.5, Status (story 117)",_pull_bkp_117)
+        def _pull_bkp_119():
+            """1.0.218 (story 119, décisions de l'utilisateur des 2026-11-09 — Q7 —, 2026-11-11 et 2026-11-12 — revue 1) : BKP_PULL par le vrai
+            backup() et le vrai boex ; `ssh` = relais du PATH qui note argv, entrée et BORG_* de son environnement, puis exécute la commande
+            distante par `sh -c` (environnement transmis : sshd `AcceptEnv BORG_*`) — destination `x@h` seulement ; `*@absent-host` : ligne
+            réseau mesurée (118) et 255 ; `borg@depot` : `borg --version` seul (version du serveur d'un Bkp local à SSH_REPO) ; toute autre :
+            255 aussitôt (revue 1 row 12 : jamais de blocage) ; borg factice (BORG_EXE) qui note argv et BORG_* (archive `*-old-*` : sortie
+            d'un OpenSSH < 8.5, code 2) ; `borg` du PATH = piège (noté, 99 ; `--version` seul répond) jamais appelé (revue 2 row 23). Revue 2 :
+            refus « choisir l'un » sans conseil de vider BORG_RSH (row 17), SSH_REPO ou BKP_PULL à tabulation refusés, SSH_REPO forme scp
+            accepté (row 24), Status `ignored` aussi avec le BORG_RSH du rc (row 22). Attentes en dur.
+            direct (exemple de la story, SSH_REPO = ssh://borg@depot:22/srv/x) : sendenv -> argv ENTIER sans -R (options du pull de la 118),
+            `exec env BORG_REPO=…` avant borg, BORG_REPO aussi en SendEnv, reçu par le borg du client ; commande -> `-T`, BORG_REPO dans le
+            préfixe, passphrase sur l'entrée ; « Direct » à espaces = direct ; SSH_KEY -> `-i` après la destination ; SSH_REPO_KEY sans
+            SSH_REPO_HOSTKEY ignorée ; SSH_REPO_HOSTKEY -> BORG_RSH épinglé de la 117 (préfixe + `--rsh`) ; BORG_RSH du rc (section ou
+            [DEFAULT]) -> préfixe ET `--rsh`, sendenv et commande (revue 1 row 1) ; `BORG_RSH =` vide = absente (épinglage) ; BORG_ROOTBKP
+            passé tel quel (un seul élément, aucun chemin vérifié ici) ; SSH_REPO chemin local -> [WARN] ; [WARN] version côté serveur
+            « non mesurable d'ici » ; client injoignable -> [ABSENT] code 1, 'absent' ; OpenSSH < 8.5 : aide en épinglé, jamais avec le
+            BORG_RSH du rc. BKP_PULL = tunnel = mode d'avant (argv ENTIER avec -R).
+            Refus (valeur inconnue, sur deux lignes -> une ligne, direct + SSH_REMFO, direct sans SSH_REPO, tunnel sans SSH_REMFO,
+            SSH_REPO_HOSTKEY mal formée, SSH_REPO_KEY à « % » ou « ${ », SSH_REPO à identifiants — jamais affichés —, à marqueur {…} ou sur
+            deux lignes, BORG_RSH du rc (section ou [DEFAULT]) + SSH_REPO_HOSTKEY, clé `bkp_pull`/`Bkp_Pull` (section, [DEFAULT]),
+            BKP_PULL refusée avant une SSH_ENV inconnue, SSH_ENV inconnue en direct, [DEFAULT] BKP_PULL = direct sur un nick sans SSH_REPO) :
+            [ERREUR] code 2, « — rien lancé », ssh ni borg jamais lancés, bkp_status « error » ; sans NOIDX ni -I : aucun borg ; « % » mal
+            formé dans BKP_PULL (CLI) : code 2, message en dur, rien lancé. Sans BKP_PULL (ou vide, aussi sur un [DEFAULT] direct) : SSH_REPO
+            seul = borg LOCAL avec BORG_REPO=SSH_REPO, tunnel avec ou sans SSH_REPO, tunnel en commande — argv ENTIER et environnement de
+            1.0.217 (en dur). _is_pull, _borg_runs_elsewhere, _repo_local_path (BkpReconcile « non vérifiable »), Status JSON et texte
+            (direct : BORG_REPO, BORG_RSH construit / du rc / aucun, SSH_REPO_KEY ignorée ; refus -> {error}, identifiants jamais montrés ;
+            sans BKP_PULL : clé absente)."""
+            d=os.path.join(tmp,'pullbkp119'); shutil.rmtree(d,ignore_errors=True); os.makedirs(os.path.join(d,'bin')); os.makedirs(os.path.join(d,'src'))
+            rc=os.path.join(d,'rc'); rlog=os.path.join(d,'relais.jsonl'); blog=os.path.join(d,'borg.jsonl')
+            relay=os.path.join(d,'bin','ssh'); fb=os.path.join(d,'borgfx'); repo=os.path.join(d,'repo'); src=os.path.join(d,'src')
+            ED='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP3Wf/Rbrxiz5wim4+0X3m+rZoOZY299khmK2rNeUSdl'
+            NET='ssh: connect to host absent-host port 22: Connection refused'
+            with open(relay+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json,subprocess
+a=sys.argv[1:]; i=0; dest=None
+while i<len(a):
+    x=a[i]
+    if x in ('-o','-R','-i','-p','-L','-l','-F','-J','-E','-S','-W','-b','-c','-m','-D','-e','-w','-B','-Q','-O','-I'): i+=2; continue
+    if x.startswith('-'): i+=1; continue
+    if dest is None: dest=x; i+=1; continue
+    break
+cmd=' '.join(a[i:]); data=sys.stdin.buffer.read()
+open({rlog!r},'a').write(json.dumps(dict(argv=a,cmd=cmd,stdin=data.decode('utf-8','replace'),env={{k:v for k,v in os.environ.items() if k.startswith('BORG')}}))+chr(10))
+if str(dest).endswith('@absent-host'): sys.stderr.write({NET!r}+chr(10)); sys.exit(255)
+if dest=='borg@depot' and cmd=='borg --version': print('borg 1.2.6'); sys.exit(0)   # version du serveur d'un dépôt ssh (Bkp local à SSH_REPO)
+if dest!='x@h': sys.stderr.write('relais : destination inattendue '+str(dest)+chr(10)); sys.exit(255)   # revue 1 row 12 : borné
+sys.exit(subprocess.run(['sh','-c',cmd],input=data).returncode)
+''')
+            os.chmod(relay+'.tmp',0o700); os.replace(relay+'.tmp',relay)
+            with open(fb+'.tmp','w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json
+a=sys.argv[1:]
+open({blog!r},'a').write(json.dumps(dict(argv=a,env={{k:v for k,v in os.environ.items() if k.startswith('BORG_')}}))+chr(10))
+if a[:1]==['create'] and any('-old-' in x for x in a):
+    sys.stderr.write(json.dumps(dict(type='log_message',levelname='WARNING',name='root',message='Remote: command-line: line 0: Bad configuration option: knownhostscommand'))+chr(10))
+    sys.stderr.write(json.dumps(dict(type='log_message',levelname='ERROR',name='borg.archiver',message='Connection closed by remote host. Is borg working on the server?'))+chr(10))
+    sys.exit(2)
+if a[:1]==['create']:
+    sys.stderr.write(json.dumps(dict(type='log_message',levelname='INFO',name='borg.output.show-version',message='borgbackup version 1.2.6'))+chr(10))
+    print(json.dumps(dict(archive=dict(name='a1',start='2026-11-12T10:00:00.000000',duration=1,stats=dict(original_size=1,compressed_size=1,
+          deduplicated_size=1,nfiles=1)),cache=dict(stats=dict()))))
+sys.exit(0)
+''')
+            os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+            # revue 2 row 23 : `borg` du PATH (BORG_EXE ignoré) -> noté, 99 ; jamais appelé — sauf `borg --version` (version du serveur d'un
+            # tunnel vers cette machine, _bkp_server_version) : « borg 1.2.6 », jamais le vrai borg
+            trap=os.path.join(d,'borg-piege.log')
+            with open(os.path.join(d,'bin','borg.tmp'),'w') as f:
+                f.write(f"#!/bin/sh\n[ \"$*\" = --version ] && {{ echo 'borg 1.2.6'; exit 0; }}\necho \"$*\" >> {shlex.quote(trap)}\nexit 99\n")
+            os.chmod(os.path.join(d,'bin','borg.tmp'),0o700); os.replace(os.path.join(d,'bin','borg.tmp'),os.path.join(d,'bin','borg'))
+            SR='ssh://borg@depot:22/srv/x'
+            base=(f"SER_NAME=h\nSER_LOGIN=x\nGLOB_ARCH=*\nEXCLUDE=--exclude-caches\nDB_ENCRYPT=false\nNOIDX=1\nBORG_PASSPHRASE=pw-pull-119\n"
+                  f"BORG_EXE={fb}\nBORG_REPO={repo}\n")
+            dr=f"BKP_PULL=direct\nSSH_REPO={SR}\n"; tire="SSH_REMFO=2222:localhost:22\n"; ROOTS='/nulle/part "/a b"'
+            nicks={'dse':dr,'dco':dr+"SSH_ENV=commande\n",'dca':f"BKP_PULL = \tDirect \nSSH_REPO={SR}\n",'dky':dr+"SSH_REPO_KEY=/root/.ssh/id_borg\n",
+                   'dsk':dr+"SSH_KEY=/root/.ssh/id_pull\n",'dbr':dr+f"BORG_ROOTBKP={ROOTS}\n",'dlo':"BKP_PULL=direct\nSSH_REPO=/srv/borg/x\n",
+                   'dpi':dr+f"SSH_REPO_HOSTKEY={ED}\nSSH_REPO_KEY=/root/.ssh/id_borg\n",'dpc':dr+f"SSH_REPO_HOSTKEY={ED}\nSSH_ENV=commande\n",
+                   'drc':dr+"BORG_RSH=ssh -i /k\n",'drm':dr+"BORG_RSH=ssh -i /k\nSSH_ENV=commande\n",'dvi':dr+"SSH_REMFO=\n",
+                   'dab':dr+"SER_NAME=absent-host\n",'tun':"BKP_PULL=tunnel\n"+tire,
+                   'dpo':dr+f"SSH_REPO_HOSTKEY={ED}\nBORG_ARCHNAME=::x-old\n",'dro':dr+"BORG_RSH=ssh -i /k\nBORG_ARCHNAME=::y-old\n",
+                   'rbad':"BKP_PULL=pull\n"+tire,'rcf':dr+tire,'rnr':"BKP_PULL=direct\n",'rnv':"BKP_PULL=direct\nSSH_REPO=\n",'rtu':"BKP_PULL=tunnel\nSSH_REPO=ssh://u@h/r\n",
+                   'rtv':"BKP_PULL=tunnel\nSSH_REMFO=\n",'rhk':dr+"SSH_REPO_HOSTKEY=ssh-ed25519 AAAA\n",'rky':dr+f"SSH_REPO_HOSTKEY={ED}\nSSH_REPO_KEY=/k%%x\n",
+                   'rk2':dr+f"SSH_REPO_HOSTKEY={ED}\nSSH_REPO_KEY=/k${{x}}\n",'rrh':dr+f"BORG_RSH=ssh -i /k\nSSH_REPO_HOSTKEY={ED}\n",
+                   'rcr':"BKP_PULL=direct\nSSH_REPO=ssh://u:mdp@depot/srv/x\n",'rs2':"BKP_PULL=direct\nSSH_REPO=sftp://u:mdp@depot/srv/x\n",
+                   'rmk':"BKP_PULL=direct\nSSH_REPO=ssh://borg@depot/srv/{fqdn}\n",'rml':f"BKP_PULL=direct\nSSH_REPO={SR}\n  suite\n",
+                   'rlc':f"bkp_pull=direct\nSSH_REPO={SR}\n",'rnl':"BKP_PULL=di\n  rect\n"+tire,'rpe':"BKP_PULL=pull\nSSH_ENV=autre\n"+tire,
+                   'rse':dr+"SSH_ENV=autre\n",'rtb':"BKP_PULL=direct\nSSH_REPO=ssh://borg@depot/srv/a\tb\n",'rnt':"BKP_PULL=di\trect\n"+tire,
+                   'dsp':"BKP_PULL=direct\nSSH_REPO=borg@depot:/srv/x\n",'drk':dr+"BORG_RSH=ssh -i /k\nSSH_REPO_KEY=/root/.ssh/id_borg\n",
+                   'lsr':f"SSH_REPO={SR}\nBORG_ROOTBKP={src}\n",'lve':f"BKP_PULL=\nSSH_REPO={SR}\nBORG_ROOTBKP={src}\n",'ltu':tire+f"SSH_REPO={SR}\n",
+                   'lvt':"BKP_PULL=\n"+tire,'ltc':tire+"SSH_ENV=commande\n"}
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\n\n")
+                for nk,x in nicks.items():
+                    bs=base if nk!='dab' else base.replace('SER_NAME=h\n','')
+                    f.write(f"[{nk}]\n{bs}{x}"+("" if 'BORG_ARCHNAME' in x else f"BORG_ARCHNAME={nk}\n")+"\n")
+                f.write(f"[rbi]\n{base.replace('NOIDX=1'+chr(10),'')}BKP_PULL=Tirer\n{tire}BORG_ARCHNAME=rbi\n")
+            os.chmod(rc,0o600)
+            rcd=os.path.join(d,'rc-def'); rcw=os.path.join(d,'rc-casse')   # [DEFAULT] BKP_PULL = direct et BORG_RSH ; [DEFAULT] Bkp_Pull
+            with open(rcd,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\nBKP_PULL=direct\nBORG_RSH=ssh -i /kd\n\n"
+                        f"[ddr]\n{base}SSH_REPO={SR}\nBORG_ARCHNAME=ddr\n\n[ddh]\n{base}SSH_REPO={SR}\nSSH_REPO_HOSTKEY={ED}\nBORG_ARCHNAME=ddh\n\n"
+                        f"[dde]\n{base}SSH_REPO={SR}\nBORG_RSH =\nSSH_REPO_HOSTKEY={ED}\nBORG_ARCHNAME=dde\n\n[ddn]\n{base}BORG_ARCHNAME=ddn\n\n"
+                        f"[ddv]\n{base}BKP_PULL =\nSSH_REPO={SR}\nBORG_ROOTBKP={src}\nBORG_ARCHNAME=ddv\n")
+            with open(rcw,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\nBkp_Pull=direct\n\n"
+                        f"[dwc]\n{base}SSH_REPO={SR}\nBORG_ARCHNAME=dwc\n")
+            os.chmod(rcd,0o600); os.chmod(rcw,0o600)
+            PATHENV={'PATH':os.path.join(d,'bin')+os.pathsep+os.environ.get('PATH',os.defpath)}
+            def mark(): return [len(open(p).read().splitlines()) if os.path.exists(p) else 0 for p in (rlog,blog)]
+            def logs(n0):
+                rl=[json.loads(x) for x in (open(rlog).read().splitlines()[n0[0]:] if os.path.exists(rlog) else [])]
+                bl=[json.loads(x) for x in (open(blog).read().splitlines()[n0[1]:] if os.path.exists(blog) else [])]
+                return rl,bl
+            allb=[]
+            def run(nick,no_index=True,rcf=rc):
+                b=BorgHelper(cfgfile=rcf,cache_dir=os.path.join(d,'cache'))
+                n0=mark(); o=io.StringIO(); code=0
+                with mock.patch.dict(os.environ,PATHENV),contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                    try: b.backup(nick,no_index=no_index)
+                    except SystemExit as e: code=e.code or 0
+                    except Exception as e: code=f"{type(e).__name__}: {e}"
+                rl,bl=logs(n0); allb[:]=bl
+                hp=b.db.get_history_db(nick)
+                rows=_q(hp,f"SELECT result FROM bkp_status WHERE nick='{nick}'") if os.path.exists(hp) else []
+                return code,o.getvalue(),rl,[x for x in bl if x['argv'][:1]==['create']],[r[0] for r in rows]
+            norm=lambda a: [re.sub(r'borgHelper run [0-9a-f]{32}','borgHelper run R',x) for x in a]
+            TAIL=['-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','-o','BatchMode=yes','-o','ConnectTimeout=30',
+                  '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6','x@h']
+            def ARGS(arch,rsh=None,cmt="'borgHelper run R'",roots=('/',)):   # arguments de borg create (1.0.217 ; --rsh : construit ou du rc)
+                return (['create','--comment',cmt]+(['--rsh',shlex.quote(rsh)] if rsh else [])+['--log-json','--json','--debug','-v','--stats',
+                        '--list','--filter','CE','--show-version','::{fqdn}-'+arch+'-{now:%Y-%m-%dT%H%M%S}',*roots,'--exclude-caches'])
+            def FULL(arch,pre=(),rsh=None,head=None,remfo=None,key=None,roots=('/',)):   # argv ENTIER du ssh local
+                return ((head or ['-o','SendEnv BORG_*'])+(['-R',remfo] if remfo else [])+TAIL+(['-i',key] if key else [])+list(pre)+[fb]
+                        +ARGS(arch,rsh,roots=roots))
+            KHC="/bin/sh -c 'for l do echo \"$l\"; done' sh 'borghelper-{n} "+ED+"'"
+            def RSH(n,key=True): return shlex.join(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','UserKnownHostsFile=/dev/null',
+                                                    '-o','GlobalKnownHostsFile=/dev/null','-o',f'HostKeyAlias=borghelper-{n}','-o','KnownHostsCommand='+KHC.format(n=n)]
+                                                   +(['-o','IdentitiesOnly=yes','-i','/root/.ssh/id_borg'] if key else []))
+            ENV0={'BORG_PASSPHRASE':'pw-pull-119','BORG_EXIT_CODES':'legacy'}
+            PW="IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; "
+            KR=shlex.quote('ssh -i /k')
+            res={}
+            def renv(r): return {k:v for k,v in r['env'].items() if k.startswith('BORG_')}
+            def one(rl): return rl[0]['argv'] if len(rl)==1 else []
+            # direct, sendenv (exemple de la story) — aussi « Direct » à espaces, SSH_REPO_KEY seule, SSH_REMFO vide
+            for nk in ('dse','dca','dky','dvi'):
+                code,out,rl,bc,rows=run(nk); a=one(rl)
+                res[f'direct sendenv {nk}']=(code==0 and len(rl)==1 and norm(a)==FULL(nk,[f"exec env BORG_REPO={SR}"]) and '-R' not in a
+                    and renv(rl[0])==dict(ENV0,BORG_REPO=SR) and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=SR) and rows==['success'],
+                    code,a,rl[0]['env'] if rl else None,bc,rows,out[-400:])
+                if nk=='dse':
+                    W=(f"[WARN] dse: version de borg côté serveur inconnue (Bkp tiré direct (BKP_PULL = direct, sans tunnel) : borg du dépôt joint "
+                       "par le client, version non mesurable d'ici)")
+                    m_=re.search(r'^\{$',out,re.M)
+                    try: js=json.loads(out[m_.start():]) if m_ else {}
+                    except ValueError: js={}
+                    res['direct : version côté serveur non mesurable d\'ici (WARN, JSON)']=(W in out and js.get('borgHelper_borg_versions')=={'archive':'1.2.6','server':None},out[-600:])
+            code,out,rl,bc,rows=run('dsk'); a=one(rl)
+            res['direct, SSH_KEY : -i après la destination']=(code==0 and norm(a)==FULL('dsk',[f"exec env BORG_REPO={SR}"],key='/root/.ssh/id_pull')
+                and rows==['success'],code,a,rows,out[-300:])
+            code,out,rl,bc,rows=run('dbr'); a=one(rl)
+            res['direct, BORG_ROOTBKP tel quel (un élément, aucun chemin vérifié ici)']=(code==0 and norm(a)==FULL('dbr',[f"exec env BORG_REPO={SR}"],roots=(ROOTS,))
+                and 'chemin à sauvegarder absent' not in out and rows==['success'],code,a,rows,out[-300:])
+            code,out,rl,bc,rows=run('dlo'); a=one(rl)
+            res['direct, SSH_REPO chemin local : [WARN], Bkp lancé']=(code==0 and norm(a)==FULL('dlo',["exec env BORG_REPO=/srv/borg/x"])
+                and "[WARN] dlo: SSH_REPO = /srv/borg/x : chemin local — le borg du CLIENT écrit sur SON disque (BKP_PULL = direct) ; dépôt de ce serveur : ssh://…" in out
+                and rows==['success'],code,a,rows,out[-400:])
+            code,out,rl,bc,rows=run('dsp'); a=one(rl)
+            res['direct, SSH_REPO forme scp : accepté, argv en dur (revue 2 row 24)']=(code==0 and norm(a)==FULL('dsp',["exec env BORG_REPO=borg@depot:/srv/x"])
+                and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO='borg@depot:/srv/x') and '[WARN] dsp: SSH_REPO' not in out and rows==['success'],
+                code,a,bc,rows,out[-300:])
+            code,out,rl,bc,rows=run('dco'); a=one(rl)
+            res['direct commande']=(code==0 and len(rl)==1 and norm(a)==FULL('dco',[PW+f"exec env BORG_EXIT_CODES=legacy BORG_REPO={SR}"],head=['-T'])
+                and rl[0]['stdin']=='pw-pull-119\n' and not renv(rl[0]) and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=SR) and rows==['success'],
+                code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('dpi'); a=one(rl)
+            res['direct épinglé (SSH_REPO_HOSTKEY), sendenv : BORG_RSH de la 117 + --rsh']=(code==0 and len(rl)==1
+                and norm(a)==FULL('dpi',[f"exec env BORG_REPO={SR} BORG_RSH={shlex.quote(RSH('dpi'))}"],RSH('dpi'))
+                and renv(rl[0])==dict(ENV0,BORG_REPO=SR,BORG_RSH=RSH('dpi')) and len(bc)==1 and bc[0]['argv'][3:5]==['--rsh',RSH('dpi')]
+                and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH=RSH('dpi')) and rows==['success'],code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('dpc'); a=one(rl)
+            res['direct épinglé sans SSH_REPO_KEY, commande']=(code==0 and len(rl)==1
+                and norm(a)==FULL('dpc',[PW+f"exec env BORG_EXIT_CODES=legacy BORG_REPO={SR} BORG_RSH={shlex.quote(RSH('dpc',False))}"],RSH('dpc',False),['-T'])
+                and not renv(rl[0]) and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH=RSH('dpc',False)) and rows==['success'],code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('drc'); a=one(rl)
+            res['direct, BORG_RSH du rc, sendenv : préfixe + --rsh (revue 1 row 1)']=(code==0 and len(rl)==1
+                and norm(a)==FULL('drc',[f"exec env BORG_REPO={SR} BORG_RSH={KR}"],'ssh -i /k')
+                and renv(rl[0])==dict(ENV0,BORG_REPO=SR,BORG_RSH='ssh -i /k') and len(bc)==1 and bc[0]['argv'][3:5]==['--rsh','ssh -i /k']
+                and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH='ssh -i /k') and rows==['success'],code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('drm'); a=one(rl)
+            res['direct, BORG_RSH du rc, commande : préfixe + --rsh']=(code==0 and len(rl)==1
+                and norm(a)==FULL('drm',[PW+f"exec env BORG_EXIT_CODES=legacy BORG_REPO={SR} BORG_RSH={KR}"],'ssh -i /k',['-T'])
+                and not renv(rl[0]) and len(bc)==1 and bc[0]['argv'][3:5]==['--rsh','ssh -i /k']
+                and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH='ssh -i /k') and rows==['success'],code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('ddr',rcf=rcd); a=one(rl)
+            res['[DEFAULT] BKP_PULL = direct et BORG_RSH : direct, préfixe + --rsh']=(code==0 and len(rl)==1
+                and norm(a)==FULL('ddr',[f"exec env BORG_REPO={SR} BORG_RSH={shlex.quote('ssh -i /kd')}"],'ssh -i /kd')
+                and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH='ssh -i /kd') and rows==['success'],code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('dde',rcf=rcd); a=one(rl)
+            res['BORG_RSH vide dans la section = absente : épinglage']=(code==0 and len(rl)==1
+                and norm(a)==FULL('dde',[f"exec env BORG_REPO={SR} BORG_RSH={shlex.quote(RSH('dde',False))}"],RSH('dde',False))
+                and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH=RSH('dde',False)) and rows==['success'],code,a,bc,rows,out[-400:])
+            code,out,rl,bc,rows=run('ddv',rcf=rcd)
+            res['[DEFAULT] direct, BKP_PULL vide dans la section : Bkp local d\'avant']=(code==0 and not any('create' in x['cmd'] for x in rl)
+                and len(bc)==1 and norm(bc[0]['argv'])==ARGS('ddv',cmt='borgHelper run R',roots=(src,))
+                and bc[0]['env']==dict(ENV0,BORG_REPO=SR,BORG_RSH='ssh -i /kd') and rows==['success'],code,rl,bc,rows,out[-300:])
+            code,out,rl,bc,rows=run('dab')
+            res['direct, client injoignable : [ABSENT] code 1, absent']=(code==1 and f"[ABSENT] dab: client injoignable (ssh : {NET}) — Bkp reporté, pas un échec" in out
+                and len(rl)==1 and '-R' not in rl[0]['argv'] and not bc and rows==['absent'],code,rows,out[-300:])
+            HELP="[ERREUR] dpo: OpenSSH ≥ 8.5 requis sur le client (KnownHostsCommand)"
+            code,out,rl,bc,rows=run('dpo')
+            res['direct épinglé, OpenSSH < 8.5 : ligne d\'aide']=(code==2 and HELP in out and len(rl)==1 and rows==['error'],code,out[-400:],rows)
+            code,out,rl,bc,rows=run('dro')
+            res['direct, BORG_RSH du rc, même sortie : pas d\'aide']=(code==2 and 'OpenSSH ≥ 8.5' not in out and 'knownhostscommand' in out
+                and len(rl)==1 and rows==['error'],code,out[-300:],rows)
+            code,out,rl,bc,rows=run('tun'); a=one(rl)
+            res['BKP_PULL = tunnel : argv et environnement d\'avant (-R)']=(code==0 and len(rl)==1 and norm(a)==FULL('tun',remfo='2222:localhost:22')
+                and renv(rl[0])==dict(ENV0,BORG_REPO=repo) and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=repo) and rows==['success'],code,a,bc,rows,out[-300:])
+            # sans BKP_PULL (ou vide) : 1.0.217 à l'identique
+            for nk in ('lsr','lve'):
+                code,out,rl,bc,rows=run(nk)
+                VER=['-o','BatchMode=yes','-o','ControlMaster=no','-o','ControlPath=none','-p','22','borg@depot','borg','--version']   # version côté serveur
+                res[f'sans BKP_PULL {nk} : SSH_REPO seul = borg local, BORG_REPO=SSH_REPO']=(code==0 and [x['argv'] for x in rl]==[VER] and len(bc)==1
+                    and norm(bc[0]['argv'])==ARGS(nk,cmt='borgHelper run R',roots=(src,)) and bc[0]['env']==dict(ENV0,BORG_REPO=SR) and rows==['success'],code,rl,bc,rows,out[-300:])
+            for nk,env in (('ltu',dict(ENV0,BORG_REPO=SR)),('lvt',dict(ENV0,BORG_REPO=repo))):
+                code,out,rl,bc,rows=run(nk); a=one(rl)
+                res[f'sans BKP_PULL {nk} : tunnel d\'avant']=(code==0 and len(rl)==1 and norm(a)==FULL(nk,remfo='2222:localhost:22') and renv(rl[0])==env
+                    and len(bc)==1 and bc[0]['env']==env and rows==['success'],code,a,bc,rows,out[-300:])
+            code,out,rl,bc,rows=run('ltc'); a=one(rl)
+            res['sans BKP_PULL ltc : tunnel en commande d\'avant']=(code==0 and len(rl)==1
+                and norm(a)==FULL('ltc',[PW+f"exec env BORG_EXIT_CODES=legacy BORG_REPO={repo}"],head=['-T'],remfo='2222:localhost:22')
+                and not renv(rl[0]) and len(bc)==1 and bc[0]['env']==dict(ENV0,BORG_REPO=repo) and rows==['success'],code,a,bc,rows,out[-300:])
+            CHOIX=("BORG_RSH du rc et SSH_REPO_HOSTKEY : choisir l'un — retirer BORG_RSH de [DEFAULT] et le poser dans les sections qui en ont "
+                   "besoin, ou retirer SSH_REPO_HOSTKEY")
+            KEYX="SSH_REPO_KEY contient « % » ou « ${ » (jetons de ssh : `-i` ne les accepte pas) — renommer la clé du client"
+            NOREPO="BKP_PULL = direct sans SSH_REPO (dépôt joint par le borg du client) — poser SSH_REPO = ssh://…"
+            TUN="BKP_PULL = tunnel sans SSH_REMFO (tunnel inverse -R) — poser SSH_REMFO, ou BKP_PULL = direct"
+            MARK="SSH_REPO à marqueur {…} ou sur plusieurs lignes — dépôt du client inconnu"
+            CRED=("SSH_REPO refusé en direct ({}) : identifiants possibles (« @ » ou « = » dans le chemin compris) ou forme non ssh — il passerait "
+                  "dans la commande, visible dans ps ; utiliser ssh://utilisateur@hôte/chemin et une clé ssh")
+            REF={'rbad':"BKP_PULL inconnu (« pull » ; attendu : tunnel ou direct)",
+                 'rcf':("BKP_PULL = direct avec SSH_REMFO : conflit (direct = sans tunnel -R) — retirer SSH_REMFO (ou la vider dans la section si elle "
+                        "vient de [DEFAULT]), ou BKP_PULL = tunnel"),
+                 'rnr':NOREPO,'rnv':NOREPO,'rtu':TUN,'rtv':TUN,'rhk':"clé d'hôte du dépôt mal formée (SSH_REPO_HOSTKEY)",'rky':KEYX,'rk2':KEYX,'rrh':CHOIX,
+                 'rcr':CRED.format('ssh://…'),'rs2':CRED.format('sftp://…'),'rmk':MARK,'rml':MARK,
+                 'rlc':"clé « bkp_pull » : s'écrit BKP_PULL (majuscules — sinon ignorée, Bkp local)",
+                 'rnl':"BKP_PULL inconnu (« di rect » ; attendu : tunnel ou direct)",'rpe':"BKP_PULL inconnu (« pull » ; attendu : tunnel ou direct)",
+                 'rse':"SSH_ENV inconnu (« autre » ; attendu : sendenv ou commande)",'rtb':MARK,
+                 'rnt':"BKP_PULL inconnu (« di rect » ; attendu : tunnel ou direct)"}
+            for nk,msg in REF.items():
+                code,out,rl,bc,rows=run(nk)
+                res[f'refus {nk}']=(code==2 and f"[ERREUR] {nk}: {msg} — rien lancé" in out and not rl and not allb and rows==['error']
+                                    and 'mdp' not in out,code,out[-300:],rl,allb,rows)
+            for nk,rcf,msg in (('ddh',rcd,CHOIX),('ddn',rcd,NOREPO),('dwc',rcw,"clé « Bkp_Pull » : s'écrit BKP_PULL (majuscules — sinon ignorée, Bkp local)")):
+                code,out,rl,bc,rows=run(nk,rcf=rcf)
+                res[f'refus [DEFAULT] {nk}']=(code==2 and f"[ERREUR] {nk}: {msg} — rien lancé" in out and not rl and not allb and rows==['error'],code,out[-300:],rl,allb,rows)
+            code,out,rl,bc,rows=run('rbi',no_index=False)
+            res['refus sans NOIDX ni -I : aucun borg lancé']=(code==2 and "[ERREUR] rbi: BKP_PULL inconnu (« Tirer » ; attendu : tunnel ou direct) — rien lancé" in out
+                and not rl and not allb and rows==['error'],code,out[-300:],rl,allb,rows)
+            rcv=os.path.join(d,'rc-pv')
+            with open(rcv,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\n\n[pv]\n{base}BKP_PULL=di%rect\nSSH_REPO={SR}\nBORG_ARCHNAME=pv\n")
+            os.chmod(rcv,0o600); open(os.path.join(d,'nodsn'),'w').close(); n0=mark()
+            cenv={k:v for k,v in os.environ.items() if k not in ('BORGHELPERC_SENTRY_DSN','BORGHELPERC_RUNTIME_PASSPHRASE')}
+            cenv.update(PATHENV,BORGHELPERC_SENTRY_FILE=os.path.join(d,'nodsn'))
+            p_=subprocess.run([sys.executable,os.path.realpath(__file__),'-C',rcv,'-c','Bkp','-n','pv'],capture_output=True,text=True,timeout=120,
+                              env=cenv,stdin=subprocess.DEVNULL)
+            rl_,bl_=logs(n0)
+            res['« % » mal formé dans BKP_PULL (CLI) : code 2, message, rien lancé']=(p_.returncode==2 and not rl_ and not bl_
+                and p_.stderr.startswith(f"[ERREUR] pv : rc illisible : « % » à doubler dans BKP_PULL  [borgHelper v{Version}]"),p_.returncode,p_.stdout[-200:],p_.stderr[-300:],rl_,bl_)
+            b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache'))
+            cr=b.borg.cfgread
+            ip={nk:_is_pull(cr(nk)) for nk in ('dse','dco','drc','tun','ltu','lvt','lsr','lve','rbad','rcf','rnr','rtu','rtv','rlc')}
+            res['_is_pull : direct et tunnel vrais, local et refus faux']=(ip=={'dse':True,'dco':True,'drc':True,'tun':True,'ltu':True,'lvt':True,
+                'lsr':False,'lve':False,'rbad':False,'rcf':False,'rnr':False,'rtu':False,'rtv':False,'rlc':False} and _is_pull(None) is False,ip)
+            loc=configparser.ConfigParser(); loc.optionxform=str; loc.read_dict({'x':{'BORG_REPO':repo,'BKP_PULL':'direct','SSH_REPO':SR}})
+            res['direct : _borg_runs_elsewhere vrai, _repo_local_path None (BkpReconcile non vérifiable), place jamais lue ici']=(
+                _borg_runs_elsewhere(loc['x']) is True and BorgHelperDB._repo_local_path(loc['x']) is None and b.db.repo_orphan_checkable('dse') is False
+                and _storage_of(loc['x'],'x',resolve=lambda p_: (None,None,None))['target'] is None,)
+            SN='dse,dpi,drc,dky,drk,rbad,rcr,rlc,lsr,tun'
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(io.StringIO()): c1=b.status(SN,as_json=True)
+            try: js={x['nick']:x for x in json.loads(o.getvalue())}
+            except ValueError: js={}
+            res['Status -j : bkp_pull']=(c1==0 and js.get('dse',{}).get('bkp_pull')=={'mode':'direct','BORG_REPO':SR,'BORG_RSH':None,'rsh':'client'}
+                and js.get('dpi',{}).get('bkp_pull')=={'mode':'direct','BORG_REPO':SR,'BORG_RSH':RSH('dpi'),'rsh':'construit'}
+                and js.get('drc',{}).get('bkp_pull')=={'mode':'direct','BORG_REPO':SR,'BORG_RSH':None,'rsh':'rc'}
+                and js.get('dky',{}).get('bkp_pull')=={'mode':'direct','BORG_REPO':SR,'BORG_RSH':None,'rsh':'client','ignored':['SSH_REPO_KEY']}
+                and js.get('drk',{}).get('bkp_pull')=={'mode':'direct','BORG_REPO':SR,'BORG_RSH':None,'rsh':'rc','ignored':['SSH_REPO_KEY']}
+                and js.get('rbad',{}).get('bkp_pull')=={'error':REF['rbad']} and js.get('rcr',{}).get('bkp_pull')=={'error':REF['rcr']}
+                and js.get('rlc',{}).get('bkp_pull')=={'error':REF['rlc']} and 'mdp' not in o.getvalue()
+                and 'lsr' in js and 'bkp_pull' not in js['lsr'] and 'tun' in js and 'bkp_pull' not in js['tun'],c1,o.getvalue()[-800:])
+            o=io.StringIO()
+            with contextlib.redirect_stdout(o),contextlib.redirect_stderr(o): b.status(SN)
+            t=o.getvalue(); H=f"  Bkp tiré direct (sans tunnel), borg du client : BORG_REPO={SR}\n    "
+            res['Status texte']=(H+"BORG_RSH : aucun (ssh du client avec sa propre config et son known_hosts)\n" in t
+                and H+f"BORG_RSH={RSH('dpi')}\n" in t and H+"BORG_RSH du rc (dans la commande distante et en --rsh)\n" in t
+                and H+"BORG_RSH : aucun (ssh du client avec sa propre config et son known_hosts) — SSH_REPO_KEY ignorée sans SSH_REPO_HOSTKEY\n" in t
+                and H+"BORG_RSH du rc (dans la commande distante et en --rsh) — SSH_REPO_KEY ignorée sans SSH_REPO_HOSTKEY\n" in t
+                and f"  Bkp tiré : {REF['rbad']} — Bkp refusé\n" in t and f"  Bkp tiré : {REF['rcr']} — Bkp refusé\n" in t
+                and f"  Bkp tiré : {REF['rlc']} — Bkp refusé\n" in t and 'mdp' not in t and t.count('Bkp tiré')==8,t[-1200:])
+            res['borg du PATH jamais appelé (BORG_EXE toujours suivi)']=(not os.path.exists(trap),)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("BKP_PULL par le vrai backup() : direct sans -R (sendenv, commande, épinglé, BORG_RSH du rc, absent), tunnel, refus avant ssh, sans BKP_PULL = 1.0.217, Status (story 119)",_pull_bkp_119)
         def _absent_unit_118():
             """1.0.217 (story 118, décisions de l'utilisateur des 2026-11-09 et 2026-11-11) : client absent = ssh en 255 sur une erreur
             RÉSEAU avant borg. Lignes de ssh MESURÉES (OpenSSH 8.9p1, work/s118/messages.md, LC_ALL=fr_FR.UTF-8 comme boex), en dur :
@@ -34671,6 +35113,164 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data).returncode)
             _w118="ssh, ssh-keygen ou sshd absent"
         if _w118: skip(_n118,_w118)
         else: _rbc(_n118,_s118_real)
+        def _s119_real():
+            """1.0.218 (story 119) : BKP_PULL = direct sur un VRAI sshd de bac (non root, 127.0.0.1, port libre, config, clés et
+            AuthorizedKeysFile absolus dans le bac, PermitUserRC no ; arrêt par PID vérifié) et un vrai ssh client, vrai borg (BORG_EXE de
+            bac qui exporte BORG_BASE_DIR). Dépôt servi par le sshd en `borg serve --restrict-to-path` (clé à commande forcée). `ssh` du pull
+            = relais du PATH qui note son argv, exécute la commande distante ICI (client simulé, comme la 117) et, comme un sshd `AcceptEnv
+            BORG_PASSPHRASE`, ne transmet parmi les BORG_* que la passphrase (autre destination que `x@h` : 255 aussitôt — un borg lancé ICI
+            par erreur échoue au lieu d'attendre, témoin borné) ; `ssh` du borg du client = relais qui lance le vrai ssh avec
+            `-F /dev/null`, UserKnownHostsFile du bac (clés d'hôte du sshd sous `[127.0.0.1]:<port>`, la « config du client »),
+            GlobalKnownHostsFile=/dev/null, IdentityFile du bac, BatchMode, StrictHostKeyChecking=yes AVANT les options de BORG_RSH (la
+            première valeur l'emporte : le vrai known_hosts n'est jamais lu, aucun TOFU possible). Vrai backup() : SSH_REPO =
+            ssh://<moi>@127.0.0.1:<port><dépôt>, sendenv épinglé (SSH_REPO_HOSTKEY = clés du sshd, SSH_REPO_KEY), commande sans BORG_RSH
+            (config du client), sendenv sans BORG_RSH, sendenv avec BORG_RSH du rc — perdu par le relais du pull, reçu par la commande
+            distante et `--rsh` (revue 1 row 1 ; option notée par le relais du client) -> code 0,
+            bkp_status success, 4 archives dans le dépôt ; épinglage d'une clé étrangère -> code 2, « error », « Host key verification
+            failed. », aucune archive. argv du pull : jamais de -R, en-tête SendEnv / -T ; sécurité du borg client : dépôt joint par
+            l'URL de SSH_REPO ; sshd : 4 connexions acceptées ; known_hosts du bac inchangé, aucun autre known_hosts écrit ; ~/.ssh de
+            l'utilisateur au même listing. Attentes en dur."""
+            import pwd
+            kg=shutil.which('ssh-keygen'); rssh=shutil.which('ssh'); sshd=shutil.which('sshd') or '/usr/sbin/sshd'
+            d=os.path.join(tmp,'s119real'); shutil.rmtree(d,ignore_errors=True); os.makedirs(d); os.chmod(d,0o700)
+            me=pwd.getpwuid(os.getuid()).pw_name; borg=shutil.which('borg'); PW='pw-s119-réel'
+            for n,t in (('hk_ed','ed25519'),('hk_ec','ecdsa'),('other','ed25519'),('bk','ed25519')):
+                r=subprocess.run([kg,'-q','-t',t,'-N','','-C',n,'-f',os.path.join(d,n)],capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL)
+                if r.returncode!=0: print(f"  ssh-keygen {n} : {r.stderr[-200:]}"); return False
+            pub=lambda n: ' '.join(open(os.path.join(d,n+'.pub')).read().split()[:2])
+            bbs,bbc=os.path.join(d,'bbs'),os.path.join(d,'bbc'); repo=os.path.join(d,'repo'); src=os.path.join(d,'src')
+            ws,wc=os.path.join(d,'borg-serve'),os.path.join(d,'borg-client'); b1,b2=os.path.join(d,'bin-pull'),os.path.join(d,'bin-client')
+            for x in (bbs,bbc,src,b1,b2): os.makedirs(x)
+            with open(os.path.join(src,'f'),'w') as f: f.write('contenu 119\n')
+            _rb_wrapper(ws,bbs); _rb_wrapper(wc,bbc)
+            r=_rb_run([borg,'init','-e','repokey',repo],120,env=_rb_env(bbs,BORG_PASSPHRASE=PW))
+            if r.returncode!=0: print(f"  borg init : {r.stderr[-200:]}"); return False
+            with open(os.path.join(d,'auth_keys'),'w') as f:
+                f.write(f'restrict,command="{ws} serve --restrict-to-path {repo}" '+pub('bk')+'\n')
+            s_=socket.socket(); s_.bind(('127.0.0.1',0)); port=s_.getsockname()[1]; s_.close()
+            khc=os.path.join(d,'kh_client'); b2log=os.path.join(d,'ssh-client.log')
+            with open(khc,'w') as f: f.write(f"[127.0.0.1]:{port} {pub('hk_ed')}\n[127.0.0.1]:{port} {pub('hk_ec')}\n")
+            khc0=open(khc).read()
+            with open(os.path.join(b2,'ssh.tmp'),'w') as f:
+                f.write(f'#!/bin/sh\necho "$*" >> {shlex.quote(b2log)}\nexec {shlex.quote(rssh)} -F /dev/null -o UserKnownHostsFile={shlex.quote(khc)} '
+                        f'-o GlobalKnownHostsFile=/dev/null -o IdentityFile={shlex.quote(os.path.join(d,"bk"))} -o BatchMode=yes '
+                        f'-o StrictHostKeyChecking=yes "$@"\n')
+            os.chmod(os.path.join(b2,'ssh.tmp'),0o700); os.replace(os.path.join(b2,'ssh.tmp'),os.path.join(b2,'ssh'))
+            rlog=os.path.join(d,'relais.jsonl')
+            with open(os.path.join(b1,'ssh.tmp'),'w') as f:
+                f.write(f'''#!{sys.executable}
+import sys,os,json,subprocess
+a=sys.argv[1:]; i=0; dest=None
+while i<len(a):
+    x=a[i]
+    if x in ('-o','-R','-i','-p','-L','-l','-F','-J','-E','-S','-W','-b','-c','-m','-D','-e','-w','-B','-Q','-O','-I'): i+=2; continue
+    if x.startswith('-'): i+=1; continue
+    if dest is None: dest=x; i+=1; continue
+    break
+if dest!='x@h': sys.stderr.write('relais du pull : destination inattendue '+str(dest)+chr(10)); sys.exit(255)   # jamais un autre ssh (borg local) : borné
+cmd=' '.join(a[i:]); data=sys.stdin.buffer.read()
+open({rlog!r},'a').write(json.dumps(a[:i])+chr(10))
+env={{k:v for k,v in os.environ.items() if not k.startswith('BORG_') or k=='BORG_PASSPHRASE'}}
+env['PATH']={b2!r}+os.pathsep+os.environ.get('PATH',os.defpath)
+sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
+''')
+            os.chmod(os.path.join(b1,'ssh.tmp'),0o700); os.replace(os.path.join(b1,'ssh.tmp'),os.path.join(b1,'ssh'))
+            cfgp=os.path.join(d,'sshd_config'); pidf=os.path.join(d,'sshd.pid'); slog=os.path.join(d,'sshd.log')
+            with open(cfgp,'w') as f:
+                f.write(f"Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/hk_ed\nHostKey {d}/hk_ec\nAuthorizedKeysFile {d}/auth_keys\n"
+                        f"PidFile {pidf}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+                        f"PermitUserRC no\nPermitUserEnvironment no\nX11Forwarding no\n")
+            hs=os.path.join(pwd.getpwuid(os.getuid()).pw_dir,'.ssh')   # celui de ssh et sshd, pas $HOME
+            def listing():
+                try: return sorted((n,st.st_size,st.st_mtime_ns) for n in os.listdir(hs) for st in [os.lstat(os.path.join(hs,n))])
+                except OSError as e: return repr(e)
+            before=listing(); res={}; pid=None
+            def _pid_by_port():   # PidFile absent -> PID du sshd du bac par son port, cmdline vérifiée
+                try: o_=subprocess.run(['ss','-ltnpH'],capture_output=True,text=True,timeout=10,stdin=subprocess.DEVNULL).stdout
+                except (OSError,subprocess.TimeoutExpired): return None
+                for l_ in o_.splitlines():
+                    if f'127.0.0.1:{port} ' not in l_: continue
+                    for m_ in re.finditer(r'pid=(\d+)',l_):
+                        try:
+                            with open(f'/proc/{m_.group(1)}/cmdline','rb') as f_: cl_=f_.read()
+                        except OSError: continue
+                        if cfgp.encode() in cl_: return int(m_.group(1))
+                return None
+            r=subprocess.run([sshd,'-f',cfgp,'-E',slog],capture_output=True,text=True,timeout=30,stdin=subprocess.DEVNULL)
+            try:
+                for _ in range(100):
+                    if os.path.exists(pidf): break
+                    time.sleep(0.05)
+                try: pid=int(open(pidf).read())
+                except (OSError,ValueError):
+                    pid=_pid_by_port()   # arrêté par le finally : jamais d'orphelin
+                    print(f"  sshd sans PidFile : code {r.returncode}, PID par le port {pid} {r.stderr[-300:]!r}"); return False
+                rc=os.path.join(d,'rc'); SR=f"ssh://{me}@127.0.0.1:{port}{repo}"
+                com=(f"BORG_REPO={repo}\nBORG_PASSPHRASE={PW}\nBORG_EXE={wc}\nBKP_PULL=direct\nSSH_REPO={SR}\n"
+                     f"SER_LOGIN=x\nSER_NAME=h\nBORG_ROOTBKP={src}\nEXCLUDE=--exclude-caches\nNOIDX=1\nDB_ENCRYPT=false\n")
+                HK=f"SSH_REPO_HOSTKEY={pub('hk_ed')}, {pub('hk_ec')}\nSSH_REPO_KEY={os.path.join(d,'bk')}\n"
+                with open(rc,'w') as f:
+                    f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nSTORAGE_ALERT=off\nSTORAGE_ALERT_DAYS=0\n\n"
+                            f"[dps]\n{com}{HK}BORG_ARCHNAME=::dps\nGLOB_ARCH=dps-*\n\n"
+                            f"[dcc]\n{com}SSH_ENV=commande\nBORG_ARCHNAME=::dcc\nGLOB_ARCH=dcc-*\n\n"
+                            f"[dsc]\n{com}BORG_ARCHNAME=::dsc\nGLOB_ARCH=dsc-*\n\n"
+                            f"[drc]\n{com}BORG_RSH=ssh -o ConnectionAttempts=2\nBORG_ARCHNAME=::drc\nGLOB_ARCH=drc-*\n\n"
+                            f"[dpx]\n{com}SSH_REPO_HOSTKEY={pub('other')}\nBORG_ARCHNAME=::dpx\nGLOB_ARCH=dpx-*\n")
+                os.chmod(rc,0o600)
+                for nk in ('dps','dcc','dsc','drc','dpx'):
+                    b=BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')); o=io.StringIO(); code=0
+                    with mock.patch.dict(os.environ,{'PATH':b1+os.pathsep+os.environ.get('PATH',os.defpath)}), \
+                         contextlib.redirect_stdout(o),contextlib.redirect_stderr(o):
+                        try: b.backup(nk,no_index=True)
+                        except SystemExit as e: code=e.code or 0
+                        except Exception as e: code=f"{type(e).__name__}: {e}"
+                    rows=[x[0] for x in _q(b.db.get_history_db(nk),f"SELECT result FROM bkp_status WHERE nick='{nk}'")] if os.path.exists(b.db.get_history_db(nk)) else []
+                    ok=((code==0 and rows==['success'] and '"archive"' in o.getvalue()) if nk!='dpx' else
+                        (code==2 and rows==['error'] and '"archive"' not in o.getvalue() and 'Host key verification failed.' in o.getvalue()))
+                    res[f'Bkp {nk}']=(ok,code,rows,o.getvalue()[-600:])
+                rl=[json.loads(x) for x in open(rlog).read().splitlines()] if os.path.exists(rlog) else []
+                T=['-A','-o','VisualHostKey=no','-o','StrictHostKeyChecking=accept-new','-o','BatchMode=yes','-o','ConnectTimeout=30',
+                   '-o','ServerAliveInterval=30','-o','ServerAliveCountMax=6','x@h']
+                S,C=['-o','SendEnv BORG_*'],['-T']
+                res['argv du pull : sans -R (sendenv, commande, sendenv, sendenv, sendenv)']=(rl==[S+T,C+T,S+T,S+T,S+T],rl)
+                try:
+                    with open(b2log) as f: cl=f.read().splitlines()
+                except OSError: cl=[]
+                res['ssh du client : 5 appels, BORG_RSH du rc reçu (drc), épinglage (dps, dpx)']=(len(cl)==5 and 'HostKeyAlias=borghelper-dps' in cl[0]
+                    and 'HostKeyAlias' not in cl[1] and 'HostKeyAlias' not in cl[2] and 'ConnectionAttempts=2' in cl[3] and 'HostKeyAlias' not in cl[3]
+                    and 'HostKeyAlias=borghelper-dpx' in cl[4],cl)
+                r=_rb_run([borg,'list','--short',repo],120,env=_rb_env(bbs,BORG_PASSPHRASE=PW))
+                names=r.stdout.split()
+                res['archives créées (4)']=(r.returncode==0 and [x.split('-')[0] for x in names]==['dps','dcc','dsc','drc'],r.returncode,names)
+                locs=[]   # le borg du client a joint le dépôt par SSH_REPO (ssh), pas par le chemin local du rc
+                for x in glob.glob(os.path.join(bbc,'.config','borg','security','*','location')):
+                    with open(x) as f: locs.append(f.read().strip())
+                res['dépôt joint par SSH_REPO (sécurité du borg client)']=(locs==[SR],locs)
+                with open(slog) as f: acc=sum(1 for l in f if l.startswith(f'Accepted publickey for {me} '))
+                res['sshd : 4 connexions acceptées (4 Bkp réussis)']=(acc==4,acc)
+            finally:
+                if pid:
+                    try:
+                        with open(f'/proc/{pid}/cmdline','rb') as f: cl=f.read()
+                    except OSError: cl=b''
+                    if cfgp.encode() in cl:
+                        with contextlib.suppress(OSError): os.kill(pid,signal.SIGTERM)
+                        for _ in range(100):
+                            if not os.path.exists(f'/proc/{pid}'): break
+                            time.sleep(0.05)
+                        else:
+                            with contextlib.suppress(OSError): os.kill(pid,signal.SIGKILL)
+                    res['sshd arrêté']=(not os.path.exists(f'/proc/{pid}'),pid)
+            res['known_hosts du client inchangé, aucun autre known_hosts écrit']=(open(khc).read()==khc0
+                and not glob.glob(os.path.join(d,'**','known_hosts*'),recursive=True),)
+            res['~/.ssh : même listing']=(listing()==before,)
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        _n119="BKP_PULL direct sur vrai sshd de bac et vrai borg : sans -R, épinglé, config du client, BORG_RSH du rc, clé étrangère refusée, archives (story 119)"
+        _w119=None if list_only or not _selected(_n119) else _ssh_ok_117()
+        if _w119: skip(_n119,_w119)
+        else: _rbc(_n119,_s119_real)
         def _repo_stats_real_borg():
             """1.0.136 (deferred-work point 9) : capture repo_stats de backup()/prune() sur un VRAI dépôt borg jetable —
             vérifie l'enchaînement réel (borg create/prune/compact/info --json, format de la réponse de CETTE

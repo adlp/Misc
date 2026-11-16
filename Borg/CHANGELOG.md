@@ -1,5 +1,43 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.218 — Bkp tiré direct : clé BKP_PULL, le borg du client joint le dépôt sans tunnel — 2026-11-16
+
+Story 119 (chantier « Bkp tiré / client à IP flottante, ProxyJump », étude `work/proxyjump/etude.md` ; décisions de l'utilisateur
+des 2026-11-09 — Q7, nouveau mode sans tunnel — et 2026-11-11 — clé dédiée `BKP_PULL`, `SSH_REPO` seul inchangé, exemple corrigé).
+
+- **borgHelper — clé `BKP_PULL`** (section du nick ou `[DEFAULT]`, casse et espaces ignorés) : absente ou vide = comportement de
+  1.0.217 à l'identique (argv et environnement : contrôlé en dur) ; `tunnel` = défaut explicite (exige `SSH_REMFO`) ; `direct` = Bkp
+  tiré SANS `-R` : même ssh vers `SER_LOGIN@SER_NAME` (`SSH_KEY`, `SSH_ENV`, options du pull de la 1.0.217), le borg du client reçoit
+  `BORG_REPO=SSH_REPO` (obligatoire), toujours dans la commande distante (`exec env BORG_REPO=…`, en `sendenv` aussi) et en SendEnv.
+- **borgHelper — `BORG_RSH` du client en `direct`** : celui du rc s'il est non vide (vide = absente), dans la commande distante ET
+  en `--rsh` comme le construit (sendenv et commande — visible dans `ps` : aucun secret ; un `BORG_RSH` de `[DEFAULT]` part aussi au
+  client) ; sinon, avec `SSH_REPO_HOSTKEY`, construit et épinglé comme en 1.0.216
+  (`KnownHostsCommand`, `HostKeyAlias=borghelper-<nick>`, `SSH_REPO_KEY` facultative, `--rsh`) ; sinon aucun (config ssh et
+  known_hosts du client — aucun TOFU ajouté par borgHelper).
+- **borgHelper — refus avant tout lancement** (`[ERREUR] <nick>: … — rien lancé`, code 2, Bkp « error », ni ssh ni borg) :
+  `BKP_PULL` inconnue (valeurs admises citées), `direct` avec `SSH_REMFO` (conflit), `direct` sans `SSH_REPO`, `tunnel` sans
+  `SSH_REMFO`, clé de `SSH_REPO_HOSTKEY` mal formée, `SSH_REPO_KEY` à « % » ou « ${ » ; revue 1 (décisions de l'utilisateur du
+  2026-11-12) : clé `bkp_pull`/`Bkp_Pull` (autre casse, section ou `[DEFAULT]`), `SSH_REPO` à identifiants possibles ou de forme non ssh
+  (`@`/`=` dans le chemin compris — visible dans `ps` en direct ; jamais affiché), `SSH_REPO` à marqueur `{…}` ou à caractère de
+  contrôle, `BORG_RSH` du rc ET `SSH_REPO_HOSTKEY` (choisir l'un : retirer `BORG_RSH` de `[DEFAULT]`, jamais le vider) ; « % » mal formé dans `BKP_PULL` : rc illisible, code 2. `SSH_REPO` chemin local en
+  `direct` : `[WARN]` (le borg du client écrit sur son disque).
+- **borgHelper — comme le tunnel** : client absent (`[ABSENT]`, code 1), `BORG_ROOTBKP` passé tel quel, nom d'archive résolu sur le
+  client, commentaire cité ; version du borg côté serveur : `—` et `[WARN] … version non mesurable d'ici` ; Storage et BkpReconcile
+  comme `SSH_REPO` (« non vérifiable », pas de df local). `_is_pull` (sonde et `/access bkp_pull` de borgHelperWWW, sans changement
+  de son code) : vrai pour `direct`, faux pour une `BKP_PULL` refusée.
+- **borgHelper — Status** : « Bkp tiré direct (sans tunnel), borg du client : BORG_REPO=… » puis le `BORG_RSH` construit, « du rc »
+  (valeur jamais affichée) ou « aucun » ; JSON `bkp_pull {mode, BORG_REPO, BORG_RSH, rsh}` ; `BKP_PULL` refusée : « Bkp tiré : <motif>
+  — Bkp refusé ». Aide `-H Bkp` : deux lignes.
+- **`_borg_runs_elsewhere`** : réponse inchangée (`SSH_REPO` seul reste « ailleurs », côté prudent pour les verrous et la place) ;
+  docstring qui dit pourquoi (K2 de l'étude).
+- **Docs** : `docs/borghelperrc.example` corrigé (K1 : `SSH_REMFO` n'est pas « rare », `SSH_REPO` seul ne lance pas borg sur
+  `SER_NAME`, exemple d'URL ssh au lieu d'un chemin local) ; README « Bkp tiré : trois modes (`BKP_PULL`, 1.0.218) » (local, tiré
+  tunnel, tiré direct), Status, versions, BkpReconcile, `/access` ; TECHNICAL (mécanique, inventaire des tests `SSH_REMFO`).
+- Vérifié : contrôles « BKP_PULL par le vrai backup()… » et « BKP_PULL direct sur vrai sshd de bac et vrai borg… » (vrai sshd non
+  root, `borg serve --restrict-to-path`, vrai ssh et borg 1.2.6 côté client : 4 archives — dont `BORG_RSH` du rc reçu malgré un
+  relais qui retire les `BORG_*` —, clé étrangère refusée, jamais de `-R`) ; contrôles des stories 115-118, aide, versions de
+  borg, isolation ; témoin : les deux contrôles échouent sur 1.0.217.
+
 ## borgHelperWWW 1.35.1 — selftest : plus de dossier /tmp/bhw-user-* laissé — 2026-11-12
 
 - **borgHelperWWW — selftest** : le contrôle « notifications : utilisateur enregistré à l'abonnement… » (`_prefs_user_ok`,

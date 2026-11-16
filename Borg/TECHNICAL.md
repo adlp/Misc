@@ -2958,7 +2958,8 @@ clé du rc `SSH_ENV` (nom sensible à la casse : `optionxform=str`, comme toute 
 `_RcValueError`). Seuls lanceurs de borg distant : `backup()` -> `boex(…, preBorg=…)` (inventaire : aucun autre appelant de `boex`
 avec `preBorg`, borgHelperWWW n'en a pas ; `_bkp_server_version` avec preBorg lance `BORG_REMOTE_PATH --version` LOCALEMENT, cible du
 tunnel = cette machine, jamais par ssh : non concernée ; le df par ssh de `_storage_measure` ne lance pas borg). `backup()` lit
-`SSH_ENV` UNE fois, seulement si `SSH_REMFO` est non vide (même prédicat que `preBorg`) : `sendenv` -> `preBorg =
+`SSH_ENV` UNE fois, seulement pour un Bkp tiré (1.0.213 : `SSH_REMFO` non vide ; 1.0.218 : `_bkp_pull_mode` non `None`, `BKP_PULL =
+direct` compris — même prédicat que `preBorg`) : `sendenv` -> `preBorg =
 ['ssh','-o','SendEnv BORG_*', …]` (octet pour octet comme 1.0.212) ; `commande` -> `['ssh','-T', …]` (`-T` : jamais de pty, même
 avec `RequestTTY force` dans ssh_config — un pty renverrait la passphrase en écho sur stdout). Il transmet sa décision à `boex`
 (`sshEnv=ssh_env`) : `boex` ne relit `SSH_ENV` dans le rc que si `sshEnv` est `None` (appelant direct) — avant la revue, un rc
@@ -3097,7 +3098,7 @@ réseau jetables pour les routes, relais TCP pour les coupures).
   `_status_one` -> `bkp_absent` (aussi `null` dans la ligne d'erreur de `status()`) ; `_status_print_one` ; Report :
   `_bkp_absent_mark` (jumelles report/report_offline : lignes ordinaires, « aucune archive », dépôt vide de `report`) — `reste`
   suffixé, `-j` `client_absent`, jamais d'alerte ni de code.
-- Sonde (borgHelperWWW) : `_is_pull(cfg)` (SSH_REMFO non vide, règle de `backup()`), `_pull_probe_argv(cfg)` (`ssh` + tail +
+- Sonde (borgHelperWWW) : `_is_pull(cfg)` (SSH_REMFO non vide, règle de `backup()` ; 1.0.218 : `_bkp_pull_mode`, direct compris), `_pull_probe_argv(cfg)` (`ssh` + tail +
   `true`), `_pull_probe(cfg, wait=_PULL_PROBE_WAIT)` : `Popen` en session propre, entrée fermée, environnement `PATH` + `LC_ALL`,
   délai -> `killpg(SIGKILL)` + `inconnu` ; code ≠ 255 -> `joignable` ; 255 -> `absent` si `_ssh_absent_line`, sinon `inconnu` (revue 3
   row 34, décision de l'utilisateur : dernière ligne `Connection to UNKNOWN port 65535 timed out` (_SSH_PROBE_PROXY_TIMEOUT) -> `inconnu`
@@ -3132,6 +3133,64 @@ Lecteurs de `bkp_status.result` (inventaire de la story 118 ; « absent » jamai
 | Copie vers `history.db` (`INSERT OR IGNORE` de la migration 1.0.139/1.0.201) | colonnes copiées telles quelles | — | `absent` copié tel quel |
 | `close_bkp_status_reconciled` | `finished_at IS NULL` seulement | — | jamais une ligne absente |
 | `bkp_status_notified`, `claim_bkp_status(_start)`, `list_pending_bkp_status_start` | `notified_at`, `start_notified_at` | — | inchangés (le début d'un Bkp absent est notifié comme tout début) |
+
+**Bkp tiré : BKP_PULL, mode direct sans tunnel (1.0.218, story 119, décisions de l'utilisateur des 2026-11-09 — Q7 — et
+2026-11-11)** : `_bkp_pull_mode(cfg)` -> `(mode, refus)`, seule règle « Bkp tiré ? » de `backup()` et de `_is_pull` (sonde et
+`/access` de borgHelperWWW). `BKP_PULL` absente ou vide : `('tunnel' si 'SSH_REMFO' in cfg.keys() and len(cfg['SSH_REMFO'])>0
+sinon None, None)` — l'expression d'avant, lecture brute de `SSH_REMFO` (erreur d'interpolation telle quelle, comme avant) ;
+posée (casse, espaces ignorés) : `tunnel` exige `SSH_REMFO` non vide, `direct` exige `SSH_REMFO` vide/absente et `SSH_REPO` non
+vide, autre valeur refusée ; « % » mal formé dans `BKP_PULL` (ou `SSH_REMFO`/`SSH_REPO` lues pour elle) : `_RcValueError`.
+- `backup()` : `pull_mode, mode_err = _bkp_pull_mode(cfg)` avant tout ; `SSH_ENV` lue si `pull_mode` n'est pas `None` (avant :
+  `SSH_REMFO` non vide — même valeur sans `BKP_PULL`) ; `-R <SSH_REMFO>` ajouté si `SSH_REMFO` est dans le rc ET `pull_mode !=
+  'direct'` (sans `BKP_PULL` : la condition d'avant) ; `_pull_ssh_tail` toujours (KeyError `SER_LOGIN`/`SER_NAME` comme avant) ;
+  `preBorg = None` si `pull_mode is None` (avant : `SSH_REMFO` absente ou vide — même valeur sans `BKP_PULL`). Construction :
+  `_bkp_pull_env` (117) en `tunnel`, `_bkp_direct_env` en `direct` ; résultat fusionné dans `forceEnv` et passé en `cmdEnv`
+  (sendenv) par le même chemin ; `pull_rsh` (BORG_RSH construit, ou du rc en direct) -> `--rsh` ; `pull_khc` (construit seulement :
+  jamais le BORG_RSH du rc) -> aide OpenSSH < 8.5 ; direct avec `SSH_REPO` sans hôte (`_ssh_repo_host` None : chemin local) ->
+  `[WARN]`, après les refus. `_bkp_pull_mode` (revue 1) : clé `k != 'BKP_PULL'` avec `k.upper() == 'BKP_PULL'` dans `cfg.keys()`
+  (section ou [DEFAULT], optionxform=str) -> refus nommant la clé, avant toute lecture de valeur ; valeur refusée citée avec ses
+  caractères de contrôle remplacés par une espace (une ligne). Refus : `mode_err or ssh_env_err
+  or pull_err`, même bloc que 115/117 (après `wait_index_idle` et le rapprochement d'un Bkp tué — `_reconcile_killed_bkp` peut lancer
+  un `borg list` s'il reste une ligne de Bkp tué ouverte —, avant tout ssh et tout `borg create` ; `getlastbkp` sauté) ; ordre `mode_err` / `ssh_env_err` STRUCTUREL : `mode_err` posé implique `pull_mode` None, donc `_ssh_env_mode` jamais appelée et `ssh_env_err` None — l'ordre de l'expression est inobservable (sous-cas `rpe` gardé en non-régression).
+- `_bkp_direct_env(cfg, nick)` -> `({'BORG_REPO': cfg['SSH_REPO'] [, 'BORG_RSH']}, None)` ou `(None, refus)`, dans l'ordre : `{` ou
+  caractère de contrôle dans `SSH_REPO` -> refus (comme la 117) ; `_secret_form(SSH_REPO)` non `None` (identifiants, borg 2, schéma
+  non ssh, `@`/`=` dans le chemin compris) -> refus citant le schéma seul (la valeur irait dans l'argv : `ps`) ; `BORG_RSH` du rc non vide (nick ou [DEFAULT] ; vide
+  = absente) ET `SSH_REPO_HOSTKEY` non vide -> refus « choisir l'un » (conseil : retirer `BORG_RSH` de [DEFAULT] — jamais le vider, revue 2
+  row 17) ; `BORG_RSH` du rc seul -> rendu tel quel (revue 1, décision de
+  l'utilisateur : préfixe `exec env` et `--rsh` comme le construit) ; sinon `SSH_REPO_HOSTKEY` non vide -> `SSH_REPO_KEY` (« % »,
+  « ${ » : refus 117), `_pull_hostkeys(cfg, '')` (clés de `SSH_REPO_HOSTKEY` seulement ; `None`/vide -> `_DIRECT_HOSTKEY_ERR`),
+  `_pull_rsh(nick, keys, key)` (construction de la 117, extraite de `_bkp_pull_env` à l'identique) ; sinon aucun `BORG_RSH` (config
+  ssh du client — pas de TOFU ajouté). `BORG_REPO` toujours en `cmdEnv` : préfixe `exec env BORG_REPO=…` en `sendenv` aussi (comme
+  la 117), et dans l'environnement du ssh local (SendEnv) ; en `commande`, dans le préfixe `_ssh_env_prefix` (via `forceEnv`).
+- `_bkp_server_version(…, direct=False)` : `preBorg` et `direct` -> `(None, "Bkp tiré direct (BKP_PULL = direct, sans tunnel) : borg
+  du dépôt joint par le client, version non mesurable d'ici")`, rien lancé (`[WARN]` de `backup()`).
+- `_bkp_pull_view` (Status) : `BKP_PULL` non vide, ou clé de même majuscule d'une autre casse, seulement — refus -> `{error}` (forme
+  à identifiants : schéma seul) ; direct -> `{mode, BORG_REPO, BORG_RSH (construit ou None), rsh: construit|rc|client[, ignored:
+  ['SSH_REPO_KEY']]}` (valeur d'un `BORG_RSH` du rc jamais rendue ; `ignored` : `SSH_REPO_KEY` posée sans `SSH_REPO_HOSTKEY`) ;
+  tunnel -> vue 117. Sans `BKP_PULL` : inchangé.
+- `_borg_runs_elsewhere` : inchangé (K2 de l'étude, docstring) — `SSH_REPO` seul reste « ailleurs » bien que `backup()` lance borg
+  ICI : côté prudent, le dépôt écrit au Bkp n'est pas `BORG_REPO` ; `direct` exige `SSH_REPO`, donc « ailleurs » aussi
+  (`_repo_local_path` None : BkpReconcile « non vérifiable », Storage sans df local).
+- Inventaire des tests « SSH_REMFO non vide » (`grep -n SSH_REMFO`, borgHelper et borgHelperWWW, code hors contrôles) :
+
+| Site | Rôle | Concerné par `direct` | Raison |
+|---|---|---|---|
+| `backup()` : `SSH_ENV`, `-R`, `preBorg` | mode du Bkp | oui — `_bkp_pull_mode` | seul lanceur de borg distant |
+| `_is_pull` | sonde WWW, `/access bkp_pull` | oui — `_bkp_pull_mode` | un nick direct est tiré (client à sonder) |
+| `_bkp_pull_env` (117) | construction tunnel | non (appelée en `tunnel` seulement) | `direct` exige `SSH_REPO` : la 117 serait inactive de toute façon |
+| `_bkp_server_version` | version côté serveur | oui — `direct=` | aucun tunnel : non mesurable d'ici |
+| `_borg_runs_elsewhere` (`_repo_local_path`, `_storage_of`) | verrou local, df | non (réponse déjà « ailleurs ») | `SSH_REPO` posé en `direct` |
+| `_storage_of` (tunnel : `SSH_REMFO` + port de `BORG_REPO`) | étiquette de stockage | non | `BORG_REPO` du serveur, pas de tunnel en `direct` |
+| `_remfo_target(_local)` | cible du tunnel | non | appelées pour `SSH_REMFO` seulement |
+| `_argv_bkp_run` (docstring) | run d'un argv | non (commentaire cité en `direct` aussi : None) | `preBorg` posé -> commentaire cité, comme le tunnel |
+| aides `-H Bkp` / `Storage` | texte | `Bkp` : oui (2 lignes) ; `Storage` : non | |
+| borgHelperWWW `/access` (`bkp_pull`), `GET /bkp/probe` | via `_is_pull` | oui, sans changement de code | importent `_is_pull` ; textes de la description OpenAPI de `/bkp/probe` et du commentaire de `/access` disent encore « SSH_REMFO » (non modifiés : borgHelperWWW inchangé) |
+| borgHelperWWW contrôles (`pt`, `pv`, `pn`… l. ~8692) | `/access bkp_pull` | non | rc sans `BKP_PULL` : réponse inchangée |
+
+- Contrôles : « BKP_PULL par le vrai backup()… (story 119) » (relais `ssh`, borg factice, argv ENTIERS en dur : direct sendenv /
+  commande / épinglé / `BORG_RSH` du rc / absent, tunnel, refus, sans `BKP_PULL` = 1.0.217, `_is_pull`, Status) et « BKP_PULL direct
+  sur vrai sshd de bac et vrai borg… (story 119) » (vrai sshd non root, `borg serve --restrict-to-path`, vrai ssh et borg client :
+  4 archives, clé étrangère refusée, jamais de `-R`, known_hosts du bac inchangé, `~/.ssh` au même listing).
 
 **Trace -d sans secret (1.0.215, story 116, décision de l'utilisateur du 2026-11-09)** : seul masquage de la trace, `_dbg_mask(obj)`
 (copie : `dict`, `list`, `tuple` récursifs, texte ; autre type tel quel). Clés `_DBG_SECRET_KEYS` (`BORG_PASSPHRASE`,

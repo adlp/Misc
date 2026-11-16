@@ -68,20 +68,39 @@ BORG_REPO = /srv/backups/mon-serveur
 ; Passphrase du dépôt (borg, pas DB_ENCRYPT) :
 BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue
 
-; Pour un dépôt distant via SSH plutôt que local, remplacer BORG_REPO ci-dessus par SSH_REPO et
-; ajouter SER_NAME/SER_LOGIN (borgHelper construit la commande ssh lui-même — jamais besoin de
-; préfixer soi-même "ssh://" dans SSH_REPO) :
-; Chemin du dépôt CÔTÉ DISTANT :
-;SSH_REPO = /srv/backups/mon-serveur
-; Hôte SSH :
-;SER_NAME = backup-host.example.org
-; Utilisateur SSH :
-;SER_LOGIN = backupuser
-; Clé privée si pas celle par défaut de l'agent :
-;SSH_KEY = /home/backupuser/.ssh/id_ed25519
-; Port distant à forwarder (-R), rare — laisser absent sinon :
-;SSH_REMFO = 2222
-; Variables BORG_* du borg distant d'un Bkp tiré (SSH_REMFO, borgHelper >= 1.0.213) : sendenv (défaut, ssh -o SendEnv BORG_*,
+; Dépôt sur une autre machine (borg serve) : BORG_REPO en URL ssh, ex. ssh://borg@depot.example.org/srv/borg/mon-serveur
+; (et BORG_RSH = ssh -i /root/.ssh/id_borg si besoin) — borg tourne ICI et joint le dépôt lui-même.
+;
+; Bkp TIRÉ (le serveur borgHelper lance borg SUR la machine sauvegardée, par ssh vers SER_LOGIN@SER_NAME) — trois modes
+; (voir README « Bkp tiré ») :
+;   - local (défaut : ni SSH_REMFO ni BKP_PULL) : borg tourne ICI. Attention : SSH_REPO seul ne lance PAS borg sur
+;     SER_NAME — il remplace seulement BORG_REPO pour le borg du Bkp (lectures, Index, Prune gardent BORG_REPO) ;
+;   - tiré par tunnel (SSH_REMFO posé, BKP_PULL absente ou = tunnel) : ssh -R ouvre un tunnel inverse, le borg du client
+;     joint le dépôt par ce tunnel (SSH_REPO = ssh://…@localhost:<port>/…, ou SSH_REPO_USER : voir README) ;
+;   - tiré direct (BKP_PULL = direct, borgHelper >= 1.0.218) : ssh SANS tunnel, le borg du client joint SSH_REPO lui-même
+;     (client qui voit le serveur de dépôts). SSH_REPO obligatoire, SSH_REMFO interdite.
+; Machine sauvegardée d'un Bkp tiré (alias de ~/.ssh/config possible) — même clé que SER_NAME plus bas, une seule par section :
+;SER_NAME = client1.example.org
+; Compte ssh sur la machine sauvegardée :
+;SER_LOGIN = root
+; Clé privée de CE serveur pour joindre la machine sauvegardée, si pas celle par défaut :
+;SSH_KEY = /root/.ssh/id_bh_pull
+; Mode du Bkp tiré : tunnel (défaut quand SSH_REMFO est posé) ou direct ; autre valeur : [ERREUR], code 2, rien lancé.
+; Nom en MAJUSCULES (bkp_pull : refusé) ; dans [DEFAULT] il vaut pour TOUS les nicks (BKP_PULL = vide dans une section
+; pour lui rendre le Bkp local). En direct, la commande distante commence par « exec env BORG_REPO=… » : incompatible
+; avec une clé à commande forcée qui n'accepte que « borg … » :
+;BKP_PULL = direct
+; En direct, BORG_RSH du rc (section ou [DEFAULT]) part au client dans la commande et en --rsh, visible dans ps des deux
+; machines (sendenv compris) : aucun secret dedans ; un BORG_RSH de [DEFAULT] qui est l'identité de CE serveur (ssh -i
+; /root/.ssh/id_depot) part aussi au client — le poser dans les sections qui en ont besoin. BORG_RSH + SSH_REPO_HOSTKEY : refusé.
+; Dépôt VU PAR LE BORG DU CLIENT (URL ssh joignable depuis le client, sans identifiants : refusés en direct, comme un « @ » ou
+; un « = » dans le chemin). C'est le
+; MÊME dépôt que BORG_REPO ci-dessus, vu du client : ici le dépôt /srv/backups/mon-serveur est sur CE serveur
+; (backup-srv.example.org) ; dépôt sur une autre machine : BORG_REPO = la même URL ssh, vue d'ici :
+;SSH_REPO = ssh://borg@backup-srv.example.org/srv/backups/mon-serveur
+; Tunnel inverse d'un Bkp tiré par tunnel (argument de ssh -R : port du client:hôte:port, ex. 8022:localhost:22) :
+;SSH_REMFO = 8022:localhost:22
+; Variables BORG_* du borg distant d'un Bkp tiré (borgHelper >= 1.0.213) : sendenv (défaut, ssh -o SendEnv BORG_*,
 ; il faut AcceptEnv BORG_* côté sshd) ou commande (dans la commande distante, passphrase sur l'entrée de ssh ; shell distant
 ; POSIX, incompatible avec une clé à commande forcée ; les autres valeurs BORG_* deviennent visibles dans ps :
 ; aucun secret dans BORG_RSH & co) :
