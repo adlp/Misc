@@ -2,7 +2,9 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.17.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+Aide-mémoire par cas d'usage : [CHEATSHEET.md](CHEATSHEET.md). Licence : Apache-2.0 (voir « Licence »).
+
+État (0.17.2) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -1848,3 +1850,8 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   `forward remove` : bloc retiré, sous-agent arrêté, champ retiré.
   `register.py` (mode
   conteneur) se lance seul par `SSHVAULT_IT_PASSWORD=… python register.py <url> <e-mail>`.
+
+## Licence
+
+sshvault est publié sous licence Apache-2.0 : voir le fichier [LICENSE](LICENSE). Le reste du dépôt Misc garde sa propre
+licence (GPLv3, fichier `LICENSE` à la racine).

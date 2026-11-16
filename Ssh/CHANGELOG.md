@@ -1,5 +1,17 @@
 # Changelog — sshvault
 
+## sshvault 0.17.2 — Licence Apache-2.0 et aide-mémoire — 2026-11-16
+
+Documentation et licence : aucun changement du comportement de sshvault.
+
+- **Licence Apache-2.0** pour sshvault (`Ssh/LICENSE`, texte intégral) ; `pyproject.toml` déclare
+  `license = "Apache-2.0"` et `license-files = ["LICENSE"]` (PEP 639) : la métadonnée `License-Expression` et le fichier
+  `LICENSE` figurent dans la roue. Le reste du dépôt Misc garde sa licence (GPLv3, `LICENSE` à la racine).
+- **Aide-mémoire** `Ssh/CHEATSHEET.md` : usage de sshvault par cas d'usage (installation, comptes, clés, hôtes, ssh
+  transparent, agent, transfert d'agent restreint, mots de passe d'hôte, synchronisation, codes de sortie, dépannage,
+  référence rapide des commandes), vérifié contre l'aide de chaque commande.
+- `README.md` : lien vers l'aide-mémoire et section « Licence ».
+
 ## sshvault 0.17.1 — Banc de test et maquette, points reportés — 2026-11-12
 
 Tests et maquette : aucun changement du comportement de sshvault ; une correction de `lab.sh`, révélée par les tests.
