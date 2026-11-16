@@ -214,36 +214,63 @@ def ssh_keys(tmp_path_factory):
     return out
 
 
-def cleanup(pop, session, created, report):
-    """Supprime uniquement les éléments de ce run (marqueur relu avant chaque suppression)."""
+#: Contrôle final de la purge illisible (sync ou liste en échec) : ajouté à la liste `remaining` de `purge_marked` (jamais un
+#: identifiant : un élément marqué sans `id` ne peut pas s'y confondre).
+UNREADABLE = object()
+
+
+def marked_ids(items, value, problems):
+    """Identifiants des éléments marqués (marqueur de valeur `value`, `None` : toute valeur) de la liste `items` ; un élément
+    marqué sans identifiant ne peut être ni suivi ni supprimé : écarté et signalé dans `problems` (même texte à chaque étape :
+    `finish_vault` le dédoublonne)."""
+    marked = [it for it in items if has_mark(it, value)]
+    noid = [it for it in marked if not it.get("id")]
+    if noid:
+        problems.append("%d élément(s) marqué(s) sans identifiant : ni suivis ni supprimés" % len(noid))
+    return [it["id"] for it in marked if it.get("id")]
+
+
+def cleanup(pop, session, created, report, left_ids=None, item_problems=None):
+    """Supprime uniquement les éléments de ce run (marqueur relu avant chaque suppression). Éléments de ce run encore
+    présents au contrôle final : un problème, sauf si `left_ids` (liste) est donnée : leurs identifiants y sont alors
+    ajoutés et l'appelant décide (`finish_vault` : la purge de fin peut les supprimer). De même `item_problems`
+    (dictionnaire) : les échecs propres à un élément (relecture, suppression, encore lisible) y sont rangés par
+    identifiant au lieu d'être des problèmes."""
     problems = []
+
+    def item_problem(iid, text):
+        if item_problems is None:
+            problems.append(text)
+        else:
+            item_problems.setdefault(iid, []).append(text)
+
     ids = list(created)
     for listing in (["list", "items"], ["list", "items", "--trash"]):
         r = pop.run(*listing, session=session)
         if r.returncode == 0:
-            for it in json.loads(r.stdout):
-                if has_mark(it) and it.get("id") not in ids:
-                    ids.append(it["id"])
+            for iid in marked_ids(json.loads(r.stdout), RUN, problems):
+                if iid not in ids:
+                    ids.append(iid)
         else:
             problems.append("%s : code %d" % (" ".join(listing), r.returncode))
     for iid in ids:
         r = pop.run("get", "item", iid, session=session)
         if r.returncode != 0:
-            problems.append("relecture de %s : %s" % (iid, r.stderr.strip()))
+            item_problem(iid, "relecture de %s : %s" % (iid, r.stderr.strip()))
             continue
         if not has_mark(json.loads(r.stdout)):
             problems.append("%s sans le marqueur de ce run : non supprimé" % iid)
             continue
         r = pop.delete(iid, session)
         if r.returncode != 0:
-            problems.append("suppression de %s : %s" % (iid, r.stderr.strip()))
+            item_problem(iid, "suppression de %s : %s" % (iid, r.stderr.strip()))
             continue
         g = pop.run("get", "item", iid, session=session)
         report.add("get item après delete --permanent", g)
         if g.returncode == 0:
-            problems.append("%s encore lisible après suppression" % iid)
+            item_problem(iid, "%s encore lisible après suppression" % iid)
     # contrôle final : plus aucun élément de ce run, ni actif ni à la corbeille
-    left = 0
+    still = []
     any_mark = 0
     sy = pop.sync(session)
     source = "après sync" if sy.returncode == 0 else "cache local (sync : %s)" % sy.stderr.strip()
@@ -251,19 +278,25 @@ def cleanup(pop, session, created, report):
         r = pop.run(*listing, session=session)
         if r.returncode == 0:
             items = json.loads(r.stdout)
-            left += sum(1 for it in items if has_mark(it))
+            still += marked_ids(items, RUN, problems)
             any_mark += sum(1 for it in items if has_mark(it, None))
+    left = len(still)
     report.add("nettoyage", note="éléments de ce run restants=%d ; éléments %s (tout run) restants=%d ; %s ; "
                "appels bw bloqués puis relancés pendant le peuplement=%d" % (left, MARK, any_mark, source, pop.blocked))
-    if left:
+    if left and left_ids is None:
         problems.append("%d élément(s) de ce run encore présents" % left)
+    elif left:
+        left_ids.extend(still)
     return problems
 
 
-def purge_marked(pop, session, report, when):
+def purge_marked(pop, session, report, when, deleted=None, remaining=None):
     """Supprime TOUS les éléments marqués `sshvault-test-run` (quelle que soit la valeur : restes
     d'un run précédent interrompu), actifs ou à la corbeille ; sync d'abord, marqueur relu avant
-    chaque suppression, puis contrôle final après sync. Renvoie les problèmes (texte nettoyé)."""
+    chaque suppression, puis contrôle final après sync. Renvoie les problèmes (texte nettoyé) ;
+    `deleted` (liste) : identifiants des éléments dont `pop.delete` a réussi ; `remaining` (liste) : identifiants de TOUT élément encore
+    présent au contrôle final, marqué ou non, listes active et corbeille (`UNREADABLE` y est ajouté si ce contrôle n'a pas pu être lu en entier : sync final ou une des
+    deux listes en échec, auquel cas la liste viendrait du cache local : rien n'est alors prouvé)."""
     problems = []
     sy = pop.sync(session)
     if sy.returncode != 0:
@@ -274,8 +307,8 @@ def purge_marked(pop, session, report, when):
         if r.returncode != 0:
             problems.append("%s : code %d" % (" ".join(listing), r.returncode))
             continue
-        ids += [it["id"] for it in json.loads(r.stdout) if has_mark(it, None) and it.get("id") not in ids]
-    deleted = 0
+        ids += [i for i in marked_ids(json.loads(r.stdout), None, problems) if i not in ids]
+    deleted_n = 0
     for iid in ids:
         g = pop.run("get", "item", iid, session=session)
         if g.returncode != 0:
@@ -289,21 +322,69 @@ def purge_marked(pop, session, report, when):
         if d.returncode != 0:
             problems.append("suppression de %s : %s" % (iid, d.stderr.strip()))
             continue
-        deleted += 1
+        deleted_n += 1
+        if deleted is not None:
+            deleted.append(iid)
     left = 0
     sy = pop.sync(session)
+    if sy.returncode != 0 and remaining is not None:
+        remaining.append(UNREADABLE)
     for listing in (["list", "items"], ["list", "items", "--trash"]):
         r = pop.run(*listing, session=session)
         if r.returncode == 0:
-            left += sum(1 for it in json.loads(r.stdout) if has_mark(it, None))
+            items = json.loads(r.stdout)
+            left += len(marked_ids(items, None, problems))
+            if remaining is not None:  # tout élément présent, marqué ou non : l'absence se prouve par identifiant
+                remaining.extend(it["id"] for it in items if it.get("id"))
         else:
             problems.append("contrôle %s : code %d" % (" ".join(listing), r.returncode))
+            if remaining is not None:
+                remaining.append(UNREADABLE)
     report.add("purge des éléments %s (%s)" % (MARK, when),
                note="trouvés=%d supprimés=%d restants=%d ; %s" % (
-                   len(ids), deleted, left, "après sync" if sy.returncode == 0 else "cache local (sync en échec)"))
+                   len(ids), deleted_n, left, "après sync" if sy.returncode == 0 else "cache local (sync en échec)"))
     if left:
         problems.append("%d élément(s) %s encore présents (%s)" % (left, MARK, when))
     return [report.account.scrub(p) for p in problems]
+
+
+def finish_vault(pop, session, created, report):
+    """Fin de la fixture `vault` : nettoyage des éléments de ce run (`cleanup`), puis purge de tous les éléments marqués
+    (`purge_marked`, « fin »). Renvoie les problèmes réels. Un élément de ce run (resté après `cleanup`, ou dont sa
+    suppression a échoué) est « parti » si et seulement s'il est absent du contrôle final de la purge, lu en entier après un
+    sync réussi, absent par identifiant des listes complètes (active et corbeille, marqué ou non : une marque disparue ne vaut
+    pas « parti »), quel que soit celui qui l'a supprimé : ce n'est alors pas une erreur, une ligne du rapport par élément dit
+    qui l'a supprimé (la purge, ou un tiers). Contrôle final illisible (sync ou liste en échec, purge qui lève) : rien n'est prouvé, tout
+    reste une erreur. Un reste après la purge reste une erreur."""
+    left_after_cleanup, failed, deleted, remaining = [], {}, [], []
+    try:
+        problems = cleanup(pop, session, created, report, left_ids=left_after_cleanup, item_problems=failed)
+    except Exception as e:  # la purge a lieu quand même
+        problems = ["nettoyage interrompu : %s: %s" % (type(e).__name__, e)]
+    controlled = False
+    try:
+        problems += purge_marked(pop, session, report, "fin", deleted=deleted, remaining=remaining)
+        controlled = UNREADABLE not in remaining  # contrôle final lu en entier, après un sync réussi
+    except Exception as e:
+        problems.append("purge interrompue : %s: %s" % (type(e).__name__, e))
+    stay = 0
+    for iid in list(dict.fromkeys(left_after_cleanup + list(failed))):
+        if controlled and iid not in remaining:
+            # ce que la purge a fait : « supprimé par la purge » seulement si elle l'a supprimé, sinon un tiers l'a fait
+            how = "supprimé par la purge" if iid in deleted else "absent du contrôle final (supprimé hors purge)"
+            causes = []
+            if iid in left_after_cleanup:
+                causes.append("resté après cleanup, " + how)
+            if iid in failed:
+                causes.append("suppression échouée, " + ("purgé ensuite" if iid in deleted else how)
+                              + " (%s)" % " ; ".join(failed[iid]))
+            report.add("nettoyage", note="élément %s de ce run : %s" % (iid, " ; ".join(causes)))
+        else:
+            problems += failed.get(iid, [])
+            stay += iid in left_after_cleanup
+    if stay:
+        problems.append("%d élément(s) de ce run encore présents après le nettoyage et la purge" % stay)
+    return [report.account.scrub(p) for p in dict.fromkeys(problems)]
 
 
 @pytest.fixture(scope="module")
@@ -359,14 +440,7 @@ def vault(account, bw_exe, ssh_keys, report):
     finally:
         try:
             if session:
-                try:
-                    problems = cleanup(pop, session, created, report)
-                except Exception as e:  # le logout et la suppression du dossier ont lieu quand même
-                    problems = ["nettoyage interrompu : %s: %s" % (type(e).__name__, e)]
-                try:
-                    problems += purge_marked(pop, session, report, "fin")
-                except Exception as e:
-                    problems.append("purge interrompue : %s: %s" % (type(e).__name__, e))
+                problems = finish_vault(pop, session, created, report)
         finally:
             lo = pop.run("logout")
             report.add("logout (peuplement)", lo)

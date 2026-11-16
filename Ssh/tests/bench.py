@@ -24,6 +24,7 @@ import re
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -144,8 +145,9 @@ def ancestors():
 
 def processes_matching(markers):
     """[(pid, ligne de commande)] des processus de l'utilisateur dont la ligne de commande
-    contient l'un des marqueurs (pytest et tous ses ancêtres exclus : le shell qui a lancé
-    pytest peut contenir un marqueur dans sa ligne de commande, faux positif mesuré)."""
+    contient l'un des marqueurs (texte, ou expression rationnelle compilée : `search`) ; pytest et tous
+    ses ancêtres exclus : le shell qui a lancé pytest peut contenir un marqueur dans sa ligne de
+    commande, faux positif mesuré."""
     me = {int(p) for p in ancestors()}
     out = []
     for d in os.listdir("/proc"):
@@ -158,7 +160,7 @@ def processes_matching(markers):
                 cmd = " " + f.read().replace(b"\0", b" ").decode(errors="replace")
         except OSError:
             continue
-        if proc_alive(int(d)) and any(m in cmd for m in markers):
+        if proc_alive(int(d)) and any((m.search(cmd) if isinstance(m, re.Pattern) else m in cmd) for m in markers):
             out.append((int(d), cmd.strip()))
     return out
 
@@ -208,29 +210,213 @@ def guard_verdict(fails, changes, env=None):
     return ("; ".join(problems) if problems else None), (changes if tolerate else [])
 
 
+#: Marqueurs d'un processus de test qui ne sont pas propres au run (communs à toute suite sshvault de l'utilisateur) :
+#: ils ne comptent que dans la portée du run (`in_scope`).
+SHARED_MARKERS = [FAKE_BW, "sshvault-it-", " -m sshvault ", " -m sshvault.askpass", PWSERVER]
+#: secondes laissées aux processus du run pour disparaître avant que la garde de session échoue
+GUARD_WAIT = 10
+
+
+def shm_prefix(kind):
+    """Préfixe des dossiers de test créés sous /dev/shm : l'identifiant du run (`RUN_ID`) en fait partie (`kind` :
+    rôle du dossier), pour que la garde de session ne compte que les processus de ce run (un `ssh-agent`, dont
+    l'environnement est illisible, n'est rattaché à un run que par le chemin de son socket)."""
+    return "sshvault-test-%s-%s-" % (RUN_ID, kind)
+
+
+def run_leftovers(basetemp, root=None):
+    """[(pid, ligne de commande)] des processus de test de CE run encore vivants : ceux dont la ligne de commande porte
+    un dossier du run (`/dev/shm/sshvault-test-<RUN_ID>-…`, ou le dossier temporaire de pytest `basetemp`), et ceux
+    qui portent un marqueur commun (`SHARED_MARKERS`) et sont dans la portée du run (`in_scope` : descendants de
+    `root` — pytest par défaut — ou marqués SSHVAULT_TEST_RUN=<RUN_ID>). Ceux d'une autre suite sshvault ne comptent
+    pas."""
+    root = os.getpid() if root is None else root
+    own = processes_matching(["/dev/shm/sshvault-test-%s-" % RUN_ID,
+                              # « pytest-1 » ne doit pas retenir « pytest-10 » (autre run)
+                              re.compile(re.escape(str(basetemp)) + r"(?![0-9])")])
+    seen = {pid for pid, _ in own}
+    return own + [(pid, cmd) for pid, cmd in processes_matching(SHARED_MARKERS)
+                  if pid not in seen and in_scope(str(pid), root)]
+
+
+#: Dossier des inscriptions de runs (`register_run`). Attribut du module : les tests de l'inscription le remplacent par un
+#: dossier temporaire, jamais le vrai /dev/shm (où vivent les inscriptions des autres runs en cours).
+REGISTRY_DIR = "/dev/shm"
+#: Résultat de l'inscription de CE run par `register_run` (vrai seulement si elle a réussi) : un test qui constate l'absence de
+#: l'inscription distingue ainsi une inscription ratée (avertissement, test sauté) d'une inscription supprimée (échec).
+REGISTERED = False
+
+
+def _registry(run_id):
+    return "%s/sshvault-test-%s.run" % (REGISTRY_DIR, run_id)
+
+
+_REGISTRY_NAME = re.compile(r"sshvault-test-([0-9a-f]{32})\.run")
+#: fichier temporaire d'inscription : `<inscription>.<pid>.tmp`
+_REGISTRY_TMP = re.compile(r"sshvault-test-([0-9a-f]{32})\.run\.([0-9]+)\.tmp")
+
+
+def run_alive(run_id):
+    """Le pytest du run `run_id` existe-t-il encore ? Inscription ouverte sans blocage ni lien (O_RDONLY, O_NOFOLLOW,
+    O_NONBLOCK : une FIFO ne bloque pas, un lien est refusé), à vérifier par `fstat` (fichier ordinaire de l'utilisateur
+    courant), puis même pid et même date de début."""
+    try:
+        fd = os.open(_registry(run_id), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        pid, started = os.read(fd, 256).decode(errors="replace").split()
+        return _stat_fields(int(pid))[1] == started
+    except (OSError, ValueError, IndexError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def remove_dead_registrations():
+    """Retire de `REGISTRY_DIR` les inscriptions `sshvault-test-<run>.run` de runs dont le pytest a disparu (run tué) et les
+    fichiers temporaires `sshvault-test-<run>.run.<pid>.tmp` dont le pid a disparu : seulement des fichiers ordinaires de
+    l'utilisateur courant (ni lien, ni dossier, ni fichier d'un autre), rien d'autre."""
+    try:
+        names = os.listdir(REGISTRY_DIR)
+    except OSError:
+        return
+    for name in names:
+        m, t = _REGISTRY_NAME.fullmatch(name), _REGISTRY_TMP.fullmatch(name)
+        if not (m or t) or (m and m.group(1) == RUN_ID):
+            continue
+        path = os.path.join(REGISTRY_DIR, name)
+        try:
+            st = os.lstat(path)
+            if not (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()):
+                continue
+            if (m and not run_alive(m.group(1))) or (t and not proc_alive(int(t.group(2)))):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def register_run(run_id=None, started=None):
+    """Inscrit ce run (pid de pytest et date de début ; `run_id` et `started` : pour les tests) dans `REGISTRY_DIR` :
+    `orphan_agents` reconnaît ainsi un run encore vivant. Écriture dans un fichier temporaire (O_EXCL, O_NOFOLLOW, 0600) puis
+    renommage : jamais d'inscription partielle lue. Une inscription impossible (toute exception) est un avertissement (ce run
+    serait pris pour interrompu par les autres suites), jamais un échec. Retire d'abord les inscriptions et temporaires
+    morts (`remove_dead_registrations`)."""
+    global REGISTERED
+    own = not run_id or run_id == RUN_ID
+    run_id = run_id or RUN_ID
+    path = _registry(run_id)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        remove_dead_registrations()
+        started = started or _stat_fields(os.getpid())[1]  # avant toute création de fichier
+        try:
+            os.unlink(tmp)  # reste d'un pid réutilisé
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("%d %s" % (os.getpid(), started))
+        os.replace(tmp, path)
+        if own:
+            REGISTERED = True
+    except Exception as e:
+        if own:
+            REGISTERED = False
+        warnings.warn("inscription du run impossible (%s : %s) : les autres suites le prendront pour un run interrompu" % (path, e))
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def unregister_run():
+    try:
+        os.unlink(_registry(RUN_ID))
+    except OSError:
+        pass
+
+
+_SHM_RUN = re.compile(r"/dev/shm/sshvault-test-([0-9a-f]{32})-")
+
+
+def orphan_agents():
+    """[(pid, ligne de commande)] des processus de l'utilisateur dont la ligne de commande vise un dossier
+    `/dev/shm/sshvault-test-<autre run>-…` d'un run dont le pytest n'existe plus (run interrompu). Un autre run encore vivant
+    n'en fait pas partie. Information seulement : jamais un échec, ces processus ne sont pas de ce run."""
+    out = []
+    for pid, cmd in processes_matching([_SHM_RUN]):
+        m = _SHM_RUN.search(cmd)
+        if m.group(1) != RUN_ID and not run_alive(m.group(1)):
+            out.append((pid, cmd))
+    return out
+
+
+def collect_guard(basetemp, paths, before, wait=None):
+    """Verdicts de fin de session : (échecs, avertissements). Chaque étape est protégée : une exception d'une étape devient un
+    échec nommé, sans masquer les verdicts des autres."""
+    failures, notes = [], []
+
+    def step(name, fn, default=None):
+        try:
+            return fn()
+        except Exception as e:
+            failures.append("%s : %s: %s" % (name, type(e).__name__, e))
+            return default
+
+    def leftovers():
+        deadline = time.monotonic() + (GUARD_WAIT if wait is None else wait)
+        left = run_leftovers(basetemp)
+        while left and time.monotonic() < deadline:
+            time.sleep(0.2)
+            left = run_leftovers(basetemp)
+        return left
+
+    left = step("processus restants", leftovers, [])
+    if left:
+        failures.append("processus de test restants : %s" % left)
+    orphans = step("processus d'un run interrompu", orphan_agents, [])
+    if orphans:  # d'un run interrompu, pas de celui-ci : avertissement seulement
+        notes.append("processus de test d'un run interrompu (hors de ce run, non comptés) : %s" % orphans)
+
+    def real_paths_verdict():
+        after = {k: snapshot(p) for k, p in paths.items()}
+        failure, warned = guard_verdict(*guard_report(paths, before, after))
+        notes.extend("garde de session (%s=warn) : %s" % (GUARD_VAR, w) for w in warned)
+        return failure
+
+    failure = step("dossiers réels", real_paths_verdict)
+    if failure:
+        failures.append(failure)
+    return failures, notes
+
+
 @pytest.fixture(scope="session", autouse=True)
 def session_guard(tmp_path_factory):
-    """Critère d'acceptation (stories 4, 5 et 12), vérifié en fin de session : aucun processus
-    de test restant (agent, surveillant, sshd, bw, askpass, ensure), `~/.ssh` réel inchangé, ni
+    """Critère d'acceptation (stories 4, 5, 12 et 23), vérifié en fin de session : aucun processus
+    de test de ce run restant (agent, surveillant, sshd, bw, askpass, ensure ; ceux d'une autre suite sshvault de
+    l'utilisateur ne comptent pas : `run_leftovers`), `~/.ssh` réel inchangé, ni
     socket, ni état, ni données sshvault réels créés par les tests, et rien de changé dans les
     dossiers sshvault réels déjà existants (instantané récursif : chemins changés listés ;
-    SSHVAULT_TEST_GUARD=warn : avertissement seulement, pour un usage réel concurrent)."""
+    SSHVAULT_TEST_GUARD=warn : avertissement seulement, pour un usage réel concurrent). Tous les verdicts sont relevés
+    (`collect_guard`, chaque étape protégée), les avertissements émis après, puis un seul échec les réunit."""
     paths = real_paths()
     before = {k: snapshot(p) for k, p in paths.items()}
-    yield
-    markers = ["/dev/shm/sshvault-test-", str(tmp_path_factory.getbasetemp()), FAKE_BW, "sshvault-it-",
-               " -m sshvault ", " -m sshvault.askpass", PWSERVER]
-    deadline = time.monotonic() + 10
-    left = processes_matching(markers)
-    while left and time.monotonic() < deadline:
-        time.sleep(0.2)
-        left = processes_matching(markers)
-    assert not left, "processus de test restants : %s" % left
-    after = {k: snapshot(p) for k, p in paths.items()}
-    failure, warned = guard_verdict(*guard_report(paths, before, after))
-    for w in warned:
-        warnings.warn("garde de session (%s=warn) : %s" % (GUARD_VAR, w))
-    assert failure is None, failure
+    register_run()
+    try:
+        yield
+        failures, notes = collect_guard(tmp_path_factory.getbasetemp(), paths, before)
+        for n in notes:
+            try:
+                warnings.warn(n)
+            except Exception as e:  # avertissement transformé en erreur (-W error) : un échec parmi les autres
+                failures.append("%s: %s" % (type(e).__name__, e))
+        assert not failures, " ; ".join(failures)
+    finally:
+        unregister_run()
 
 
 # --- clés de test et coffre factice ---------------------------------------------
@@ -382,7 +568,7 @@ def witness(keys):
     if not HAVE_OPENSSH:
         yield None
         return
-    d = tempfile.mkdtemp(prefix="sshvault-test-temoin-", dir="/dev/shm")
+    d = tempfile.mkdtemp(prefix=shm_prefix("temoin"), dir="/dev/shm")
     os.chmod(d, 0o700)
     sock = os.path.join(d, "agent.sock")
     pid = start_agent(sock, keys["perso"]["private"])
@@ -896,7 +1082,7 @@ def safe_base():
 
 def private_runtime_dir():
     """Dossier 0700 sur tmpfs (/dev/shm), comme un vrai XDG_RUNTIME_DIR."""
-    d = tempfile.mkdtemp(prefix="sshvault-test-run-", dir="/dev/shm")
+    d = tempfile.mkdtemp(prefix=shm_prefix("run"), dir="/dev/shm")
     os.chmod(d, 0o700)
     return d
 
@@ -952,6 +1138,11 @@ def b64_fragments(text):
 #: qu'aux enveloppes (garde contre un usage hors banc).
 RUN_ID = uuid.uuid4().hex
 RUN_VAR = "SSHVAULT_TEST_RUN"
+#: Posé dans l'environnement du processus pytest lui-même : tout processus lancé avec un environnement qui part de `os.environ`
+#: en hérite et reste rattaché à ce run (`scope_of`). Un environnement qui filtre les variables `SSHVAULT_` le perd de ce fait
+#: (banc : `base_env` le repose ; `tests/test_labsh.py` et le pytest enfant de `tests/test_guard.py` ne le reposent pas : leur
+#: processus ne sont pas de ce run) ; les tests qui simulent « un processus d'une autre session » le retirent à dessein.
+os.environ[RUN_VAR] = RUN_ID
 
 
 def _stat_fields(pid):

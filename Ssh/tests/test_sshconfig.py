@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from bench import ID_BASTION, ID_PERSO, ID_PROD
+from bench import ID_BASTION, ID_PERSO, ID_PROD, shm_prefix
 from sshvault import sshconfig
 from sshvault.backend import SshKeyItem
 
@@ -323,7 +323,7 @@ def test_ssh_G_agent_dedie_une_seule_cle(bench, tmp_path):
     """Critère : identityagent = socket dédié, une seule identityfile, identitiesonly yes ;
     chemins avec espace et % (HOME et XDG_RUNTIME_DIR)."""
     rehome(bench, "ho me%h")
-    reruntime(bench, "sshvault-test-run-a b%c-")
+    reruntime(bench, shm_prefix("run") + "a b%c-")
     unlocked(bench)
     r = bench.run("ssh-config")
     assert r.returncode == 0, r.stderr

@@ -11,7 +11,7 @@
 #
 # Environnement : SSHVAULT_LAB_PROJECT (nom du projet Compose, défaut sshvault-lab),
 # SSHVAULT_LAB_DIR (dossier d'état 0700, défaut $XDG_RUNTIME_DIR/sshvault-lab, et pour un autre
-# projet $XDG_RUNTIME_DIR/sshvault-lab/<projet>). Ne lit ni n'écrit jamais ~/.ssh.
+# projet $XDG_RUNTIME_DIR/sshvault-lab/<projet>, retiré avec son parent s'il est vide par `down`). Ne lit ni n'écrit jamais ~/.ssh.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -35,11 +35,13 @@ case $PROJECT in
     *[!a-z0-9_-]*) die "nom de projet invalide : $PROJECT (minuscules, chiffres, - et _)" ;;
 esac
 
+PARENT=
 if [ -n "${SSHVAULT_LAB_DIR:-}" ]; then
     DIR=$SSHVAULT_LAB_DIR
 elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     DIR=$XDG_RUNTIME_DIR/sshvault-lab
-    [ "$PROJECT" = sshvault-lab ] || DIR=$DIR/$PROJECT
+    # autre projet : sous-dossier du dossier commun, que `down` retire à son tour s'il est vide
+    [ "$PROJECT" = sshvault-lab ] || { PARENT=$DIR; DIR=$DIR/$PROJECT; }
 else
     die "XDG_RUNTIME_DIR absent : définir SSHVAULT_LAB_DIR (dossier d'état)"
 fi
@@ -61,9 +63,14 @@ dc() {
     docker compose -p "$PROJECT" -f "$HERE/compose.yaml" "$@"
 }
 
+mkstate() {
+    (umask 077 && mkdir -p "$DIR" "$DIR/keys")
+}
+
 # dossier d'état : 0700, à l'utilisateur
 prepare() {
-    (umask 077 && mkdir -p "$DIR" "$DIR/keys") || die "création de $DIR impossible"
+    # une fois de plus en cas d'échec : le `down` d'un autre projet peut retirer le dossier commun entre les deux `mkdir`
+    mkstate || { echo "lab.sh: création de $DIR impossible, nouvel essai" >&2; mkstate; } || die "création de $DIR impossible"
     for d in "$DIR" "$DIR/keys"; do
         [ -d "$d" ] && [ -O "$d" ] || die "$d n'est pas un dossier à vous"
         chmod 700 "$d"
@@ -137,6 +144,8 @@ cmd_down() {
     dc --profile client down -v --remove-orphans --timeout 5 >&2 || rc=1
     rm -f "$DIR/password" "$DIR/password.new" "$DIR/known_hosts" "$DIR/keys/authorized_keys"
     rmdir "$DIR/keys" "$DIR" 2>/dev/null || true
+    # dossier commun des projets autres que le défaut : retiré s'il est vide (rmdir seulement : jamais le dossier d'un autre projet)
+    [ -z "$PARENT" ] || rmdir "$PARENT" 2>/dev/null || true
     left=$(leftovers) || { echo "lab.sh: projet $PROJECT : $left" >&2; rc=1; }
     [ $rc -eq 0 ] && echo "maquette détruite (projet $PROJECT)"
     return $rc

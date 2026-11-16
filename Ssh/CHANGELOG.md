@@ -1,5 +1,65 @@
 # Changelog — sshvault
 
+## sshvault 0.17.1 — Banc de test et maquette, points reportés — 2026-11-12
+
+Tests et maquette : aucun changement du comportement de sshvault ; une correction de `lab.sh`, révélée par les tests.
+
+- **`lab.sh down`** (correction révélée par `tests/test_labsh.py`) : pour un projet autre que `sshvault-lab`, il laissait
+  `$XDG_RUNTIME_DIR/sshvault-lab` (dossier commun des états, vide) ; il le retire maintenant s'il est vide (`rmdir` seulement :
+  le dossier d'un autre projet, ou `$XDG_RUNTIME_DIR`, ne sont jamais touchés). `up` refait une fois le `mkdir -p` du
+  dossier d'état, en le disant (« nouvel essai ») (le `down` d'un autre projet pouvait retirer le dossier commun entre ses deux étapes).
+- **Garde de session propre au run** (`tests/bench.py`, `session_guard`) : seuls les processus de ce run comptent.
+  Les dossiers de test sous `/dev/shm` portent l'identifiant du run (`sshvault-test-<RUN_ID>-temoin-…`,
+  `sshvault-test-<RUN_ID>-run-…`) et la garde cherche ce préfixe (et le dossier temporaire de pytest, sans
+  confondre `pytest-1` et `pytest-10`) ; les autres marqueurs (faux `bw`, `-m sshvault`, `sshvault-it-…`, serveur
+  de test) ne comptent que dans la portée du run (`in_scope`, story 21). Un `ssh-agent` d'une autre suite
+  sshvault (environnement illisible, qui comptait comme « du test ») ne fait plus échouer la session ; un reste de
+  ce run est toujours nommé. Aucun contrôle affaibli : le délai de 10 s et la liste des marqueurs sont gardés.
+  `SSHVAULT_TEST_RUN=<RUN_ID>` est posé dans l'environnement de pytest lui-même (hérité par tout environnement qui part
+  de `os.environ`). Tous les verdicts de la garde (restes, avertissement d'orphelins, chemins réels) sont relevés (`collect_guard`,
+  chaque étape protégée : une exception devient un échec nommé), les avertissements émis ensuite, puis un seul échec les
+  réunit. Chaque run s'inscrit sous `/dev/shm/sshvault-test-<RUN_ID>.run` (pid et date de début ; écriture
+  temporaire, `O_EXCL`, `O_NOFOLLOW`, puis renommage ; toute exception = avertissement ; les inscriptions et temporaires
+  morts de l'utilisateur, fichiers ordinaires seulement, sont retirés à l'inscription ; lecture sans blocage ni lien
+  (`O_NONBLOCK`, `O_NOFOLLOW`, `fstat` : fichier ordinaire de l'utilisateur) ; dossier du registre `bench.REGISTRY_DIR`,
+  redirigé vers un dossier temporaire dans les tests de l'inscription, pour les appels en processus de `register_run`, `run_alive` et `orphan_agents` ; le vrai `/dev/shm` reste touché par le témoin d'allure morte de l'un d'eux, les dossiers d'agents et le pytest enfant, dont `register_run` fait son ménage normal des inscriptions mortes) : les agents d'un run dont le pytest a disparu sont
+  signalés par un avertissement, jamais un échec.
+  - `tests/test_guard.py` : la garde rejouée par un vrai pytest enfant qui laisse un `ssh-agent` vivant dans un
+    dossier d'un autre run (la garde passe, l'agent est signalé) puis de son propre run (la garde échoue et le nomme) ;
+    inscription pendant la session et retirée après ; `orphan_agents` (run disparu, vivant, même pid avec une autre
+    date de début, agent de ce run non orphelin) ; inscription impossible (l'inscription d'un autre run, dans le vrai `/dev/shm`, survit) ou en exception, nettoyage des
+    inscriptions et temporaires morts, FIFO et lien refusés par `run_alive`, `collect_guard` (une étape qui lève ne masque pas
+    les autres), arrêt de l'agent de l'enfant seulement s'il est vérifié (nom, socket sous son dossier, date de début) ;
+    marqueur commun hors portée ignoré, dans la portée compté ; dossier temporaire de pytest (`pytest-1` n'est pas
+    `pytest-10`).
+- **`lab.sh` sans docker** (`tests/test_labsh.py`, faux `docker` du banc sur le PATH, qui journalise ses appels et
+  échoue sur demande) : `leftovers` rend 2 (jamais « rien ne reste ») quand `docker ps`, `network ls` ou
+  `volume ls` échoue, 1 s'il reste quelque chose ; `down` en échec (docker, `compose down`, reste du projet),
+  jamais « maquette détruite » ; fichier de clés avec CR, options et lignes invalides (lignes écartées comptées et
+  dites, octets vérifiés) ; `chpasswd` en échec : aucun fichier `password` ; mot de passe posé par stdin, jamais en
+  argv ; dossier d'état par défaut (`SSHVAULT_LAB_DIR` absent : `$XDG_RUNTIME_DIR/sshvault-lab[/projet]`, modes 0700 et
+  0600, supprimé par `down`) ; `down` avec `SSHVAULT_LAB_DIR` donné laisse le parent ; `up` refait une fois le `mkdir -p` ;
+  `status`.
+- **Client sans coffre** (`test_client_sans_coffre`, série `lab`, sans compte de test ni `bw` : un exécutable ELF
+  quelconque monté à sa place) : contraintes du conteneur C (réseau `front` seul, montages, système en lecture
+  seule, capacités, seccomp, uid, OpenSSH 10.0), `lab.sh status` le liste, `lab.sh down` le supprime (rien ne reste).
+  Les contrôles du conteneur sont partagés avec le test du coffre (`check_client_container`), qui vérifie aussi, après
+  ses scénarios, que le système de fichiers est encore en lecture seule. `lab.sh status` : colonnes lues d'après l'en-tête
+  complet ; premier `down` affirmé seul. Le `bw` factice ne sert qu'à faire démarrer C : rien ne vérifie qu'il n'est pas lancé.
+  Règle de la story 22 (« bloc qui vaut pour tous les hôtes ») mesurée aussi avec OpenSSH 10.0 : `ssh -G` dans C sur
+  les formes et sondes des témoins 8.9 de `test_sshconfig.py` (`ALL_HOSTS` : s'appliquent à `a` ; `NOT_ALL_HOSTS` : ne
+  s'appliquent pas à leur sonde), mêmes verdicts qu'en 8.9 (mesuré à la main sur la maquette).
+- **Fixture `vault`** (`tests/integration/itbase.py`, `finish_vault`) : un élément de ce run resté après `cleanup`, ou dont
+  la suppression par `cleanup` a échoué, n'est plus une erreur « nettoyage incomplet » s'il est parti : absent du contrôle
+  final de la purge (listes active et corbeille), lu en entier après un sync réussi, quel que soit celui qui l'a supprimé ;
+  une ligne de rapport par élément (identifiant, causes) qui dit ce qui s'est passé : « supprimé par la purge » seulement si
+  la purge l'a supprimé, sinon « absent du contrôle final (supprimé hors purge) » ; « suppression échouée, purgé ensuite ».
+  L'absence se prouve par identifiant dans les listes complètes (active et corbeille, éléments marqués ou non) : une marque
+  disparue ne vaut pas « parti ». Contrôle final illisible (sync ou liste en échec, purge qui lève) : rien n'est prouvé, tout reste une erreur (sentinelle
+  dédiée `UNREADABLE`) ; un élément marqué sans `id` est écarté et signalé (un seul message) ; un reste après la purge reste une erreur.
+  `tests/test_it_vault.py` : faux client `bw` (corbeille, suppression sans effet ou qui échoue une fois, relecture en
+  panne, élément supprimé par un tiers, sync ou liste finale en échec, `cleanup` ou purge qui lèvent).
+
 ## sshvault 0.17.0 — Robustesse de ssh-config et du magasin de session — 2026-11-12
 
 Cinq défauts reportés des stories 16, 19 et 20.

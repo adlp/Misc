@@ -2,7 +2,7 @@
 
 Clés SSH dans un Vaultwarden auto-hébergé, utilisées de façon transparente par ssh.
 
-État (0.17.0) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
+État (0.17.1) : **plusieurs comptes** Vaultwarden utilisés en même temps (alias → serveur
 + e-mail, sur un même serveur ou sur des serveurs différents ; déconnexion par `sshvault
 logout`, serveur ou e-mail corrigé par `sshvault account set` ; voir « Comptes du coffre »),
 **lecture** du coffre via le CLI officiel `bw` (lister et chercher les
@@ -1449,6 +1449,27 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
 - Les tests unitaires passent par `tests/fake_bw.py`, un faux `bw` qui reproduit
   les sorties du vrai (2026.9.1). Ils tournent dans une session keyring anonyme
   neuve, avec un anneau dédié par test : le `@u` réel n'est jamais touché.
+  Garde de session (`tests/bench.py`, fin de session) : aucun processus de test *de ce run* restant, `~/.ssh` et dossiers
+  sshvault réels inchangés ; tous les verdicts (restes, orphelins, chemins réels) sont relevés (`collect_guard`, chaque étape protégée), les avertissements
+  émis ensuite, puis un seul échec les réunit.
+  Les dossiers de test sous `/dev/shm` portent l'identifiant du run (`sshvault-test-<RUN_ID>-…`) : un `ssh-agent`
+  d'une autre suite sshvault lancée en même temps ou laissée vivante n'est pas compté. Les marqueurs communs (faux `bw`,
+  `-m sshvault`, `sshvault-it-…`, serveur de test) ne comptent que dans la portée du run (descendants de pytest ou
+  `SSHVAULT_TEST_RUN=<identifiant>`, posé dans l'environnement de pytest lui-même et hérité par tout environnement qui part de
+  `os.environ`). Chaque run s'inscrit sous `/dev/shm/sshvault-test-<RUN_ID>.run` (pid et date de début de pytest ; écriture
+  temporaire puis renommage, échec = avertissement ; retiré à la fin ; les inscriptions et temporaires morts de l'utilisateur,
+  fichiers ordinaires seulement, sont retirés à l'inscription ; lecture sans blocage ni lien : une FIFO ou un lien à la place
+  d'une inscription est refusé) : un avertissement (jamais un échec) signale les agents d'un run
+  dont le pytest a disparu. `tests/test_guard.py` : la garde rejouée par un pytest enfant qui laisse un `ssh-agent` vivant, dans
+  le dossier d'un autre run (la garde passe, l'agent est signalé comme d'un run interrompu) puis du sien (elle échoue et le
+  nomme) ; inscription du run pendant la session et retirée après ; `orphan_agents` (run disparu, run vivant, même pid avec
+  une autre date de début, agent de ce run non orphelin) ; inscription impossible ou en exception (avertissement ; l'inscription d'un autre run dans le vrai `/dev/shm` survit), nettoyage
+  des inscriptions et temporaires morts (liens, dossiers et autres noms intacts), FIFO et lien refusés ; `collect_guard` ; arrêt de
+  l'agent de l'enfant seulement s'il est vérifié (nom, socket sous son dossier, date de début). Les tests de l'inscription
+  redirigent `bench.REGISTRY_DIR` vers un dossier temporaire pour les appels en processus de `register_run`, `run_alive` et
+  `orphan_agents` ; le vrai `/dev/shm` reste touché par un témoin d'allure morte (posé puis retiré), les dossiers d'agents et
+  le pytest enfant (qui y inscrit son run et y fait le ménage normal des inscriptions mortes) ; marqueurs communs dans et hors de la portée ; dossier
+  temporaire de pytest sans confusion de numéro (`pytest-1` et `pytest-10`).
 - Les tests de l'agent (`tests/test_agent.py`) utilisent les vrais `ssh-agent` et
   `ssh-add` du poste (ignorés s'ils manquent), sur des sockets de test en `/dev/shm`. `SSH_AUTH_SOCK` y pointe sur
   un agent témoin dont le contenu est revérifié inchangé après chaque test ; tout
@@ -1602,7 +1623,9 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   tests est celui du poste (sa version, `ssh -V`, est écrite dans le rapport `.lab`, si `SSHVAULT_IT_REPORT` est
   défini) ; le client OpenSSH 10.0 est celui du conteneur C (voir ci-dessous).
   Environnement : `SSHVAULT_LAB_PROJECT` (projet Compose, défaut `sshvault-lab`),
-  `SSHVAULT_LAB_DIR` (dossier d'état : chemin absolu, sans `:`, `%` ni `"`). La première construction des images télécharge les
+  `SSHVAULT_LAB_DIR` (dossier d'état : chemin absolu, sans `:`, `%` ni `"` ; à défaut `$XDG_RUNTIME_DIR/sshvault-lab`, et pour un
+  projet autre que `sshvault-lab` `$XDG_RUNTIME_DIR/sshvault-lab/<projet>`, que `down` retire avec son parent s'il est vide).
+  La première construction des images télécharge les
   paquets OpenSSH (apt, apk) : accès réseau nécessaire.
 
   Série `lab` : un projet Compose au nom unique par run (`sshvault-lab-<hex>`), démarré et
@@ -1652,6 +1675,15 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   leur chemin. Le client est créé par la série (`Lab.client_up`, même projet Compose, profil `client`) et
   supprimé avec la maquette ; le contrôle final « rien ne reste » le compte. Aucune commande de `lab.sh` ne
   le démarre.
+  `test_client_sans_coffre` (story 23, sans compte de test ni `bw`) : le conteneur client C avec un exécutable ELF
+  quelconque de l'architecture du poste monté en guise de `bw` (il ne sert qu'à faire démarrer C ; rien ne vérifie qu'il n'est pas lancé) : OpenSSH 10.0, uid et gid, réseau
+  `front` seul, montages en lecture seule, système de fichiers en lecture seule, capacités retirées, seccomp par défaut, tmpfs ;
+  `lab.sh status` liste C et les autres services (colonnes lues d'après l'en-tête complet) ; le premier `lab.sh down`, seul (sans
+  le nouvel essai de `Lab.down`), supprime le tout (rien ne reste, relevé une fois). Le test du coffre vérifie aussi que le
+  système de fichiers est encore en lecture seule après ses scénarios. Ces contrôles du
+  conteneur sont communs avec le test du coffre (`check_client_container`) ; la maquette de ce test lui est propre. Il mesure
+  aussi, par `ssh -G` dans C, la règle « bloc qui vaut pour tous les hôtes » de `ssh-config` avec OpenSSH 10.0 : mêmes formes et
+  sondes que les témoins 8.9 de `tests/test_sshconfig.py` (`ALL_HOSTS`, `NOT_ALL_HOSTS`), mêmes verdicts.
   `test_interruption` : SIGINT pendant le démarrage (dès le premier conteneur, avant `PRET`) ou
   après, puis SIGTERM, envoyé au groupe de processus d'une sonde (`labenv.py sonde`) :
   conteneurs, réseaux et volumes du projet supprimés, dossier d'état de la sonde effacé (nettoyage
@@ -1661,10 +1693,26 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
   que le fichier du mot de passe a disparu, éléments marqués purgés, `bw logout`.
 - `tests/test_argvwatch.py` : `ArgvWatch` (`tests/bench.py`) ne relève que les processus du test : descendants
   de pytest (chaîne des ppid), ou dont l'environnement porte `SSHVAULT_TEST_RUN=<identifiant de la session
-  pytest>` (posé par le banc, le HOME de l'intégration et le conteneur client ; agents et surveillants détachés
-  compris). Un environnement illisible compte comme du test (échec fermé), un processus disparu n'est pas relevé.
+  pytest>` (posé dans l'environnement de pytest lui-même, donc hérité par tout environnement qui part de `os.environ`, repris
+  par le banc, le HOME de l'intégration et le conteneur client ; agents et surveillants détachés compris). Un environnement illisible compte comme du test (échec fermé), un processus disparu n'est pas relevé.
   La commande d'une autre session du même utilisateur n'est pas une fuite : processus étranger sans marqueur
   ou avec le marqueur d'une autre session ignoré, processus détaché marqué et descendant de pytest signalés.
+- `tests/test_labsh.py` : `lab/lab.sh` sans docker ni maquette, avec un faux `docker` (script du banc) sur le PATH, qui
+  journalise ses appels et échoue sur demande (`FAKE_DOCKER_FAIL`) : `leftovers` (code 2 si `docker ps`, `network ls` ou
+  `volume ls` échoue : jamais « rien ne reste » ; code 1 s'il reste quelque chose), `down` en échec, fichier de clés
+  publiques avec CR, options et lignes invalides (écartées, comptées et dites), `chpasswd` en échec (aucun fichier
+  `password` ; mot de passe posé par stdin, jamais en argv), dossier d'état par défaut (`XDG_RUNTIME_DIR` temporaire :
+  emplacement, modes 0700 et 0600, supprimé par `down`, qui retire aussi le dossier commun
+  `$XDG_RUNTIME_DIR/sshvault-lab` d'un autre projet s'il est vide, sans toucher celui d'un projet voisin ni le parent d'un
+  `SSHVAULT_LAB_DIR` donné), `up` qui refait une fois le `mkdir -p` du dossier d'état (exactement deux essais, dit « nouvel essai »), `status`.
+- `tests/test_it_vault.py` : fin de la fixture `vault` de l'intégration (`finish_vault`), avec un faux client `bw` : un
+  élément de ce run resté après `cleanup` (aussi à la corbeille), ou dont la suppression par `cleanup` a échoué (suppression,
+  relecture, « encore lisible »), n'est pas une erreur s'il est parti, c'est-à-dire absent par identifiant du contrôle final de la purge (listes complètes, active
+  et corbeille, éléments marqués ou non) lu en entier après un sync réussi, qu'il ait été supprimé par la purge ou par un tiers :
+  une ligne de rapport par élément, qui dit lequel (« supprimé par la purge » ou « absent du contrôle final (supprimé hors
+  purge) »). Une marque retirée ne vaut pas « parti ». Sync
+  ou liste finale en échec, purge ou `cleanup` qui lèvent, suppression sans effet, reste après la purge : erreurs ; élément
+  marqué sans identifiant : signalé.
 - `tests/test_it_pty.py` : `pty_login` de l'intégration (`tests/integration/itbase.py`), sans réseau ni vrai sshvault (faux
   paquet `sshvault` par PYTHONPATH, qui laisse un petit-enfant écrire sans fin sur le terminal
   et garder la sortie standard ouverte) : reste du terminal et sortie standard lus 5 s au
@@ -1771,7 +1819,9 @@ uv run --python 3.10 pytest -q -m lab             # maquette de conteneurs ssh +
     `sshvault-test-run=<uuid>`, pilote sshvault, puis supprime définitivement
     (`--permanent`) les éléments de son run, même en cas d'échec, et fait `bw logout`. Au début
     et à la fin, il purge aussi tout élément marqué `sshvault-test-run` (quelle que soit la
-    valeur : restes d'un run interrompu), marqueur relu avant chaque suppression ; `sync` et
+    valeur : restes d'un run interrompu), marqueur relu avant chaque suppression (un élément de ce run resté après le
+    nettoyage, ou dont la suppression a échoué, mais supprimé par cette purge (et absent de son contrôle final) n'est pas une
+    erreur : il est dit dans le rapport) ; `sync` et
     `delete` sont retentés après une panne réseau passagère (DNS, connexion) ;
   - **conteneur** (`SSHVAULT_IT_MODE=container`) : Vaultwarden 1.37.4 sur un port libre de
     127.0.0.1, 3 comptes créés par l'API (crypto d'inscription Bitwarden, dépendance de test

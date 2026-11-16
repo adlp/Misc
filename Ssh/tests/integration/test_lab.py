@@ -20,6 +20,9 @@ interne), P (mot de passe seul, 10.0) et D (cible de deploy, 10.0). Ports publi�
   le vrai `bw` y sont montés en lecture seule, HOME et XDG_RUNTIME_DIR sont des tmpfs, le login est tapé sous
   un pty (`docker exec -it`), la session est rangée dans un fichier du tmpfs (keyring refusé par le profil
   seccomp par défaut), B est injoignable (ni nom, ni route). Sauté si le serveur du compte est sur la boucle locale.
+- `test_client_sans_coffre` (story 23) : le conteneur client sans compte de test ni vrai `bw` (un exécutable ELF quelconque
+  monté à sa place) : contraintes du conteneur (partagées avec le test du coffre), règle « bloc pour tous les hôtes » avec OpenSSH 10.0, `lab.sh status` le liste, `lab.sh down` le
+  supprime (rien ne reste). Ni compte ni `bw` exigés.
 - `test_interruption` : SIGINT, pendant le démarrage ou après, puis SIGTERM : conteneurs,
   réseaux et volumes du projet supprimés (sonde `labenv.py sonde`).
 
@@ -47,8 +50,9 @@ import pytest
 
 from bench import HAVE_OPENSSH, RUN_ID, ArgvWatch, agent_list, write_askpass
 from itbase import ALIAS, MARK, RUN, TAG, Report, Scrub, check, home, ssh_keys, sv, sv_login, vault  # noqa: F401
+from test_sshconfig import ALL_HOSTS, NOT_ALL_HOSTS  # témoins 8.9 de la story 22 : mêmes formes et mêmes sondes
 from labenv import (CLIENT_BW, CLIENT_CA, COMPOSE, LAB_SH, UP_TIMEOUT, ClientUnavailable, LabError, LabTimeout, docker_available,
-                    running)
+                    elf_machine, running)
 
 pytestmark = pytest.mark.lab
 
@@ -557,6 +561,56 @@ def server_is_loopback(server):
     return any(local_address(a) for a in addrs)
 
 
+def check_client_container(client, lab, bw_path, ca, scrub, report):
+    """Le conteneur client C tel que la maquette le monte (sans coffre ni compte de test, partagé par le test du coffre et
+    par `test_client_sans_coffre`) : OpenSSH 10.0, Python 3.13, uid et gid de l'utilisateur, ni privilège ni capacité (toutes
+    retirées) ni port, système de fichiers en lecture seule, profil seccomp par défaut (keyring refusé), réseau `front` seul
+    (B inconnu), montages en lecture seule (source du dépôt, `bw_path`, certificat `ca` ou /dev/null), HOME, /tmp et
+    XDG_RUNTIME_DIR sur des tmpfs. `scrub` : masque les valeurs secrètes des messages (compte de test)."""
+    r = client.run(["ssh", "-V"])
+    assert r.returncode == 0 and re.match(r"OpenSSH_10\.0", r.stderr), "client OpenSSH 10.0 attendu : %r" % r.stderr
+    report.add("client ssh du conteneur (ssh -V)", note=r.stderr.strip())
+    home, runtime = client.home, client.runtime
+    assert client.run(["id", "-u"]).stdout.strip() == str(os.getuid()) and client.run(["id", "-g"]).stdout.strip() == str(os.getgid())
+    assert client.run(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"]).stdout.strip() == "3.13"
+    c = [x for x in lab.inspect() if x["Config"]["Labels"]["com.docker.compose.service"] == "c"]
+    assert len(c) == 1, "un seul conteneur client"
+    hc = c[0]["HostConfig"]
+    assert not hc.get("Privileged") and not hc.get("CapAdd") and not hc.get("PortBindings"), "ni privilège, ni capacité ajoutée, ni port"
+    assert hc.get("ReadonlyRootfs") is True, "système de fichiers du conteneur en lecture seule"
+    assert [x.upper() for x in (hc.get("CapDrop") or [])] == ["ALL"], "toutes les capacités retirées : %s" % hc.get("CapDrop")
+    opts = hc.get("SecurityOpt") or []
+    assert any(o in ("no-new-privileges:true", "no-new-privileges=true", "no-new-privileges") for o in opts), \
+        scrub("no-new-privileges : %s" % opts)
+    assert not [o for o in opts if "seccomp" in o], scrub("profil seccomp par défaut : %s" % opts)
+    assert set(c[0]["NetworkSettings"]["Networks"]) == {lab.project + "_front"}, "C n'est que sur front"
+    want = {("/src", True), (CLIENT_BW, True), (CLIENT_CA, True)}
+    got = {(m["Destination"], not m["RW"]) for m in c[0]["Mounts"]}
+    assert got == want, scrub("montages en lecture seule : %s" % c[0]["Mounts"])
+    src = {m["Destination"]: os.path.realpath(m["Source"]) for m in c[0]["Mounts"]}
+    repo_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src")
+    sources_ok = (src["/src"] == os.path.realpath(repo_src) and src[CLIENT_BW] == os.path.realpath(bw_path)
+                  and src[CLIENT_CA] == (os.path.realpath(ca) if ca else "/dev/null"))
+    assert sources_ok, "sources des montages : le dépôt (src), bw, et le certificat (ou /dev/null)"
+    assert set(hc["Tmpfs"]) == {home, runtime, "/tmp"}, "HOME, /tmp et XDG_RUNTIME_DIR sur des tmpfs : %s" % hc["Tmpfs"]
+    mounts = client.read("/proc/self/mounts")
+    assert all(re.search(r"^tmpfs %s tmpfs " % re.escape(d), mounts, re.M) for d in (home, runtime, "/tmp"))
+    r = client.run(["keyctl", "padd", "user", "sshvault-lab-sonde", "@u"], input="x")
+    assert r.returncode != 0 and "Operation not permitted" in r.stderr, "keyring refusé dans le conteneur : %s" % r
+    # B injoignable depuis C au niveau réseau : ni nom (absolu ou non), ni route
+    assert client.run(["getent", "hosts", "b"]).returncode == 2, "le nom de B n'est pas résolu depuis C"
+    assert client.run(["getent", "hosts", "b."]).returncode == 2, "le nom absolu de B n'est pas résolu depuis C"
+
+    check_read_only_root(client)
+
+
+def check_read_only_root(client):
+    """Système de fichiers en lecture seule : témoin négatif, une écriture hors des tmpfs échoue (EROFS)."""
+    r = client.run(["sh", "-c", "echo x > /usr/lib/sshvault-lab-ecriture 2>&1"])
+    assert r.returncode != 0 and "Read-only file system" in r.stdout + r.stderr, "écriture hors tmpfs refusée : %s" % r
+    assert client.run(["test", "-e", "/usr/lib/sshvault-lab-ecriture"]).returncode != 0, "rien n'a été écrit"
+
+
 def test_sshvault_depuis_le_client_openssh_recent(request, scrubbed, account, bw_exe, vault, ssh_keys, report, lab):
     """Les scénarios du test précédent, rejoués depuis C (Debian 13 : OpenSSH 10.0, Python 3.13), qui n'est que sur
     `front` : sshvault et le vrai `bw` y tournent (source du dépôt et `bw` montés en lecture seule, système de
@@ -606,39 +660,8 @@ def test_sshvault_depuis_le_client_openssh_recent(request, scrubbed, account, bw
         """Lignes de commande de `bw` (monté) relevées par `w` qui contiennent chacun de `words`."""
         return [a for a in w.seen if a[0] == CLIENT_BW and all(x in a for x in words)]
 
-    # --- le client : version, utilisateur, montages, réseau, privilèges ---
-    r = client.run(["ssh", "-V"])
-    assert r.returncode == 0 and re.match(r"OpenSSH_10\.0", r.stderr), "client OpenSSH 10.0 attendu : %r" % r.stderr
-    report.add("client ssh du conteneur (ssh -V)", note=r.stderr.strip())
-    assert client.run(["id", "-u"]).stdout.strip() == str(uid) and client.run(["id", "-g"]).stdout.strip() == str(os.getgid())
-    assert client.run(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"]).stdout.strip() == "3.13"
-    c = [x for x in lab.inspect() if x["Config"]["Labels"]["com.docker.compose.service"] == "c"]
-    assert len(c) == 1, "un seul conteneur client"
-    hc = c[0]["HostConfig"]
-    assert not hc.get("Privileged") and not hc.get("CapAdd") and not hc.get("PortBindings"), "ni privilège, ni capacité ajoutée, ni port"
-    assert hc.get("ReadonlyRootfs") is True, "système de fichiers du conteneur en lecture seule"
-    assert [x.upper() for x in (hc.get("CapDrop") or [])] == ["ALL"], "toutes les capacités retirées : %s" % hc.get("CapDrop")
-    opts = hc.get("SecurityOpt") or []
-    assert any(o in ("no-new-privileges:true", "no-new-privileges=true", "no-new-privileges") for o in opts), \
-        account.scrub("no-new-privileges : %s" % opts)
-    assert not [o for o in opts if "seccomp" in o], account.scrub("profil seccomp par défaut : %s" % opts)
-    assert set(c[0]["NetworkSettings"]["Networks"]) == {lab.project + "_front"}, "C n'est que sur front"
-    want = {("/src", True), (CLIENT_BW, True), (CLIENT_CA, True)}
-    got = {(m["Destination"], not m["RW"]) for m in c[0]["Mounts"]}
-    assert got == want, account.scrub("montages en lecture seule : %s" % c[0]["Mounts"])
-    src = {m["Destination"]: os.path.realpath(m["Source"]) for m in c[0]["Mounts"]}
-    repo_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src")
-    sources_ok = (src["/src"] == os.path.realpath(repo_src) and src[CLIENT_BW] == os.path.realpath(bw_exe)
-                  and src[CLIENT_CA] == (os.path.realpath(ca) if ca else "/dev/null"))
-    assert sources_ok, "sources des montages : le dépôt (src), bw, et le certificat (ou /dev/null)"
-    assert set(hc["Tmpfs"]) == {home, runtime, "/tmp"}, "HOME, /tmp et XDG_RUNTIME_DIR sur des tmpfs : %s" % hc["Tmpfs"]
-    mounts = client.read("/proc/self/mounts")
-    assert all(re.search(r"^tmpfs %s tmpfs " % re.escape(d), mounts, re.M) for d in (home, runtime, "/tmp"))
-    r = client.run(["keyctl", "padd", "user", "sshvault-lab-sonde", "@u"], input="x")
-    assert r.returncode != 0 and "Operation not permitted" in r.stderr, "keyring refusé dans le conteneur : %s" % r
-    # B injoignable depuis C au niveau réseau : ni nom (absolu ou non), ni route
-    assert client.run(["getent", "hosts", "b"]).returncode == 2, "le nom de B n'est pas résolu depuis C"
-    assert client.run(["getent", "hosts", "b."]).returncode == 2, "le nom absolu de B n'est pas résolu depuis C"
+    # --- le client : version, utilisateur, montages, réseau, privilèges (contrôles partagés avec le test sans coffre) ---
+    check_client_container(client, lab, bw_exe, ca, account.scrub, report)
 
     # --- témoin de la lecture des environnements : un processus planté avec un jeton neuf en est le détenteur ---
     token = "sshvault-lab-plant-" + uuid.uuid4().hex
@@ -828,9 +851,87 @@ def test_sshvault_depuis_le_client_openssh_recent(request, scrubbed, account, bw
              if (it.get("sshKey") or {}).get("keyFingerprint") == fp_gen]
     assert len(found) == 1 and found[0]["sshKey"]["publicKey"] == public
     check(account, sv("logout", "--account", ALIAS), 0, "logout (client)")
-    # système de fichiers en lecture seule : témoin négatif, une écriture hors des tmpfs échoue (EROFS)
-    r = client.run(["sh", "-c", "echo x > /usr/lib/sshvault-lab-ecriture 2>&1"])
-    assert r.returncode != 0 and "Read-only file system" in r.stdout + r.stderr, "écriture hors tmpfs refusée : %s" % r
+    check_read_only_root(client)  # encore vrai après les scénarios (rien n'a remonté le système de fichiers)
+
+
+# --- 2 ter. le conteneur client sans coffre, `lab.sh status` et `down` (story 23) -----------------------
+
+def elf_like_the_host():
+    """Chemin réel d'un exécutable ELF quelconque de l'architecture du poste (le conteneur client le reçoit en guise de
+    `bw`, comme le contrôle de `client_up` l'exige ; il ne sert qu'à faire démarrer C : rien ne vérifie qu'il n'est pas lancé)."""
+    host = elf_machine(os.path.realpath(sys.executable))
+    for name in ("true", "sleep", "cat", "ls"):
+        found = shutil.which(name)
+        if found and host is not None and elf_machine(os.path.realpath(found)) == host:
+            return os.path.realpath(found)
+    pytest.skip("aucun exécutable ELF de l'architecture du poste sous la main")
+
+
+STATUS_HEADER = ["NAME", "IMAGE", "COMMAND", "SERVICE", "CREATED", "STATUS", "PORTS"]
+
+
+def status_rows(text):
+    """{service : {colonne : texte}} de `lab.sh status` (`docker compose ps -a`, colonnes alignées sous l'en-tête
+    complet NAME IMAGE COMMAND SERVICE CREATED STATUS PORTS : découpées d'après les positions de l'en-tête)."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    assert lines and lines[0].split() == STATUS_HEADER, "en-tête de `docker compose ps` : %r" % text[:200]
+    starts = [lines[0].index(h) for h in STATUS_HEADER]
+    assert starts == sorted(starts)
+    rows = {}
+    for l in lines[1:]:
+        cols = {h: l[a:b].strip() for h, a, b in zip(STATUS_HEADER, starts, starts[1:] + [len(l) + 1])}
+        assert cols["SERVICE"] and cols["NAME"] and cols["STATUS"], "ligne de `docker compose ps` : %r" % l
+        rows[cols["SERVICE"]] = cols
+    return rows
+
+
+def client_user_for(client, text, host, opts=(), name="bloc"):
+    """Valeurs de `user` de `ssh -G -F <config `text`> <opts> <host>` dans le conteneur client (config écrite dans son HOME)."""
+    path = "%s/.ssh-%s" % (client.home, name)
+    client.write(path, text, "600")
+    r = client.run(["ssh", "-G", "-F", path, *opts, host])
+    assert r.returncode == 0, "ssh -G (client) : code %d : %s" % (r.returncode, r.stderr.strip()[-500:])
+    return [l.split(" ", 1)[1] for l in r.stdout.splitlines() if l.split(" ", 1)[0] == "user"]
+
+
+def check_all_hosts_rule(client):
+    """Règle « bloc qui vaut pour tous les hôtes » (story 22) avec le client OpenSSH 10.0 : mêmes formes et mêmes sondes que
+    les témoins 8.9 de `test_sshconfig.py` (`ALL_HOSTS`, `NOT_ALL_HOSTS`), mêmes verdicts. Positifs : le bloc s'applique à
+    l'hôte `a` (une lettre, sans point) ; négatifs : il ne s'applique pas à leur sonde."""
+    for block in ALL_HOSTS:
+        assert client_user_for(client, "%s\n    User temoin\n" % block, "a") == ["temoin"], "10.0 : %s doit s'appliquer à a" % block
+    for block, host, opts in NOT_ALL_HOSTS:
+        assert client_user_for(client, "%s\n    User temoin\n" % block, host, opts) != ["temoin"], \
+            "10.0 : %s ne doit pas s'appliquer à %s %s" % (block, host, " ".join(opts))
+
+
+def test_client_sans_coffre(ssh_keys, report):
+    """Le conteneur client C sans compte de test ni vrai `bw` (un exécutable ELF quelconque monté à sa place) : mêmes contraintes
+    que dans le test du coffre (`check_client_container`) ; `lab.sh status` liste C ; `lab.sh down` le supprime, avec le reste du
+    projet (contrôle « rien ne reste » : conteneurs, réseaux, volumes). Maquette propre à ce test (le `down` détruit tout)."""
+    bw = elf_like_the_host()
+    with running(ssh_keys["hotes"]["public"]) as lab:
+        try:
+            client = lab.client_up(bw, None, RUN_ID)
+        except ClientUnavailable as e:
+            pytest.skip(str(e))
+        check_client_container(client, lab, bw, None, lambda text: text, report)
+        check_all_hosts_rule(client)
+        report.add("client sans coffre : blocs « tous les hôtes » (ssh -G, 10.0)",
+                   note="%d formes positives, %d négatives, mêmes verdicts qu'en 8.9" % (len(ALL_HOSTS), len(NOT_ALL_HOSTS)))
+        rows = status_rows(lab.sh("status").stdout)
+        assert sorted(rows) == ["a", "b", "c", "d", "p"], "lab.sh status liste chaque service, C compris : %s" % sorted(rows)
+        assert rows["c"]["IMAGE"] == "sshvault-lab/c" and rows["c"]["STATUS"].startswith("Up"), rows["c"]
+        assert all(r["STATUS"].startswith("Up") for r in rows.values()), rows
+        report.add("client sans coffre : lab.sh status", note="services=%s" % sorted(rows))
+        # le premier `down`, seul (sans le nouvel essai de `Lab.down`) : code 0, rien ne reste
+        r = lab.sh("down", check=False, timeout=300)
+        assert r.returncode == 0 and "maquette détruite" in r.stdout, (r.returncode, r.stdout, r.stderr[-500:])
+        left = lab.left()  # un seul relevé : le même pour l'assertion et son message
+        assert left == {}, "rien ne reste du projet après le premier down : %s" % left
+        assert lab.container_ids() == [], "client et maquette supprimés"
+        assert status_rows(lab.sh("status").stdout) == {}, "lab.sh status ne liste plus rien"
+        report.add("client sans coffre : lab.sh down", note="C supprimé, rien ne reste")
 
 
 # --- 3. interruption ------------------------------------------------------------------------
