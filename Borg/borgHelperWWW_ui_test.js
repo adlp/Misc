@@ -910,7 +910,8 @@ ${grab('_readerJson')}
 ${grab('clearBrowseSearch')}
 async ${grab('loadBrowse')}
 async ${grab('runBrowseSearch')}
-      return {loadBrowse,runBrowseSearch,entries:()=>Object.keys(browseEntriesByPath).sort(),go:p=>{ browsePath=p; }};`)(bdom,bh);
+      return {loadBrowse,runBrowseSearch,entries:()=>Object.keys(browseEntriesByPath).sort(),entry:p=>browseEntriesByPath[p],go:p=>{ browsePath=p; },
+              view:(a,c)=>{ browseArchive=a; browseChanges=c; }};`)(bdom,bh);
     const ent=(p,x)=>Object.assign({name:p.split('/').pop(),full_path:p,parent:p.split('/').slice(0,-1).join('/'),is_dir:false,
       genre:'f',mode:'-rw-r--r--',owner:'u',events:[{type:'added',archive:'a1'}]},x||{});
     const okTree=(...ps)=>({httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{entries:ps.map(p=>ent(p))}})});
@@ -963,6 +964,45 @@ async ${grab('runBrowseSearch')}
     br.go('d'); bh.resp={httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{entries:[]}})}; await br.loadBrowse();
     eq('explorateur, répertoire vide : « Répertoire vide » inchangé, aucune entrée',[errEl.textContent,body.innerHTML.includes('Répertoire vide'),br.entries()],
        ['',true,[]]);
+    // UI 1.28.1 (story 121, décision de l'utilisateur) : notice des droits — vue épinglée = ceux de l'archive affichée ; autres vues : dernier état connu
+    const noticeOf=async(a,c)=>{ br.view(a,c); br.go('a'); bh.resp=okTree('a/f'); await br.loadBrowse(); return bdom.byId('browseRightsNotice').innerHTML; };
+    const nPin=await noticeOf('a1',null), nAll=await noticeOf(null,null), nChg=await noticeOf(null,{from:'a1',to:'a2'});
+    br.view(null,null);
+    eq('notice des droits : épinglée = « ceux de l\'archive affichée » (la définition « plus récente sauvegarde » n y est pas ; les résultats de recherche y sont dits dernier état connu) ; sans archive : dernier état connu ; changements : aussi « pas forcément celui des sauvegardes comparées »',
+       [nPin.includes("ceux de l'archive affichée"),nPin.includes('plus récente sauvegarde'),nAll.includes('dernier état connu'),nAll.includes('comparées'),
+        nAll.includes('épinglée'),nChg.includes('dernier état connu'),nChg.includes('sauvegardes comparées')],[true,false,true,false,false,true,true]);
+    // Boîte de téléchargement en vue épinglée : l'archive affichée est présélectionnée (fichier et dossier)
+    const dd={els:{},byId(id){ return this.els[id]||(this.els[id]={id,hidden:false,value:'',textContent:'',innerHTML:'',checked:false}); }};
+    const mkSel=()=>({options:[],value:'',set innerHTML(h){ this.options=h.includes('dernière archive')?[{value:'',textContent:'dernière archive'}]:[]; this.value=''; },appendChild(o){ this.options.push(o); }});
+    dd.els.dlArchiveSelect=mkSel();
+    const dlh={lst:null};
+    const dl=new Function('dd','hooks',`
+      const document={getElementById:id=>dd.byId(id),createElement:()=>({})};
+      const downloadInScope=()=>true, opAllowed=()=>true; let allowDownloads=true, dlPending=null;
+      let browseNick='n', browseArchive=null, browseChanges=null, browseEntriesByPath={};
+      const apiCall=async()=>hooks.lst;
+${grab('updateEquivCmd')}
+${grab('shQuote')}
+async ${grab('openDownloadDialog')}
+      return {open:openDownloadDialog,set:(a,c,e)=>{ browseArchive=a; browseChanges=c; browseEntriesByPath=e||{}; }};`)(dd,dlh);
+    const selv=()=>dd.els.dlArchiveSelect;
+    dlh.lst={exitcode:0,stdout:'a1 2026-01-01\na2 2026-01-02\na3 2026-01-03\n'};
+    const E=(p,ev,x)=>Object.assign({full_path:p,events:ev},x||{});
+    const P2={listedAt:'a2'};   // marqueur posé par loadBrowse pour les entrées du listage épinglé
+    dl.set('a2',null,{'d/f':E('d/f',[{type:'modified',archive:'a3',date:'2026-01-03'}],P2),'d/g':E('d/g',[],P2),'d/gone':E('d/gone',[],{deleted:true,last_seen_archive:'a1',listedAt:'a2'}),
+                      'd':E('d',[],P2),'s/rech':E('s/rech',[])});   // s/rech : résultat de recherche (dernier snapshot), sans marqueur
+    await dl.open('d/f',false); const f1=selv().value;
+    await dl.open('d/g',false); const f2=selv().value;
+    await dl.open('d/gone',false); const f3=selv().value;
+    await dl.open('d',true); const f4=selv().value;
+    await dl.open('s/rech',false); const fR=selv().value; await dl.open('s/rech',true); const fRd=selv().value;
+    dl.set(null,null,{'d/f':E('d/f',[{type:'modified',archive:'a3',date:'2026-01-03'}])});
+    await dl.open('d/f',false); const f5=selv().value;
+    await dl.open('d',true); const f6=selv().value;
+    dl.set(null,{from:'a1',to:'a2'},{'d/f':E('d/f',[{type:'modified',archive:'a3',date:'2026-01-03'}])});
+    await dl.open('d/f',false); const f7=selv().value;
+    eq('téléchargement en vue épinglée : archive affichée présélectionnée pour une entrée du listage épinglé (fichier avec/sans mouvement, dossier) ; entrée supprimée : sa dernière présence ; résultat de recherche (sans marqueur) et autres vues : inchangé',
+       [f1,f2,f3,f4,f5,f6,f7,fR,fRd],['a2','a2','a1','a2','','','','','']);
     // Recherche (/treefind) : depuis un répertoire affiché.
     const search=async resp=>{
       br.go('a'); bh.resp=okTree('a/f','a/g'); await br.loadBrowse();
@@ -983,6 +1023,16 @@ async ${grab('runBrowseSearch')}
     const s4=await search({httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{matches:[ent('a/f')]}})});
     eq('recherche réussie : message vidé, un résultat',[s4.err,(s4.res.match(/sr-goto-btn/g)||[]).length],['',1]);
 
+    // revue 3 (ligne 44) : une recherche ne remplace pas une entrée du listage épinglé (marqueur listedAt) — « supprimée à la date de X » reste, même si le résultat
+    // de recherche (dernier snapshot) la montre présente ; une entrée absente du listage est publiée normalement (sans marqueur)
+    br.view('a2',null); br.go('a'); bh.resp={httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{entries:[ent('a/gone',{deleted:true,last_seen_archive:'a1'}),ent('a/f')]}})};
+    await br.loadBrowse();
+    bdom.byId('browseSearchInput').value='g'; bh.resp={httpStatus:200,exitcode:0,stderr:'',stdout:JSON.stringify({n:{matches:[ent('a/gone'),ent('a/f'),ent('a/neuf')]}})};
+    await br.runBrowseSearch();
+    const og=br.entry('a/gone'), of=br.entry('a/f'), on=br.entry('a/neuf');
+    br.view(null,null);
+    eq('recherche en vue épinglée : l\'entrée du listage (supprimée à la date de X, marqueur listedAt) n\'est pas écrasée par le résultat ; un résultat hors listage est publié sans marqueur',
+       [og.deleted,og.last_seen_archive,og.listedAt,of.listedAt,on.listedAt],[true,'a1','a2','a2',undefined]);
     // Cinq autres affichages, 403 capturé : le detail (préfixes « Erreur : » gardés).
     const odom={els:{},byId(id){ return this.els[id]||(this.els[id]={id,hidden:false,textContent:'',innerHTML:''}); }};
     const oh={resp:null};

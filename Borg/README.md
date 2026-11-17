@@ -1702,7 +1702,7 @@ plus les enfants directs supprimés depuis mais toujours récupérables (voir pl
 Colonnes : `nom`, `genre` (répertoire / fichier / lien symbolique / fifo / socket / périph. bloc ou
 caractère — type réel stocké par borg), `droits` (ls-style, ex. `drwxr-xr-x`), `propriétaire`
 (`user:group (uid:gid)`, ex. `root:root (0:0)`) — **droits et propriétaire sont le dernier état connu**,
-pas forcément celui de l'archive sélectionnée dans `-b`/`-B` —, type d'événement
+pas forcément celui de l'archive sélectionnée dans `-b`/`-B` (sauf archive épinglée avec son snapshot, voir plus bas) —, type d'événement
 (`added`/`modified`/`removed`/…), archive, date. `aucun événement dans la plage` si l'entrée n'a pas
 bougé sur la période demandée ; genre/droits/propriétaire `inconnu (réindexer)`/`—` si l'entrée a été
 snapshotée avant l'ajout de ces colonnes — réindexer (`Index -F -S`) pour les peupler.
@@ -1718,6 +1718,20 @@ simple `added` ou `removed` d'un fichier niché en dessous — remonte en `modif
 `added`/`removed` emprunté à un descendant.
 
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
+
+**Archive épinglée (`-b X -B X`, bouton « Explorer » d'une archive de l'UI ; depuis 1.0.219)** : la vue d'une archive montre le
+**contenu de cette archive** quand son snapshot est en base (`IDX_SNAP_KEEP` dernières archives) : entrées, type, droits et
+propriétaire de X (champ JSON `archive` = X ; texte : « (snapshot X) ») ; une entrée ajoutée après X n'y figure pas, une entrée
+supprimée après X y est présente (avec les événements de X), et seule une entrée dont le dernier événement **à la date de X** est une
+suppression y est marquée supprimée. Avant 1.0.219 la vue listait le contenu du **dernier** snapshot filtré par la date de X : les ajouts
+postérieurs s'affichaient comme présents, les suppressions postérieures comme « supprimées ». Archive X **sans** snapshot en base
+(au-delà de `IDX_SNAP_KEEP`) : **aucune liste, aucun borg** — message `contenu de X non indexé — snapshots gardés : les N derniers
+(IDX_SNAP_KEEP) ; LstBkpFls / Restore pour le lire` (texte ; JSON `{"error": …}`, comme « aucun snapshot »). Archive X **inconnue de l'index**
+(sauvegarde récente que l'Index n'a pas encore vue, ou faute de frappe) : `X pas encore indexée — lancez Index (ou attendez l'Index de fin de Bkp)` — même texte
+pour une archive connue (`archive_stats`, `diff_index`) mais sans snapshot **plus récente que le dernier snapshot** (ou quand il n'y en a aucun) : elle n'est pas
+encore indexée, elle n'est pas sortie de la rétention ; une archive connue **plus ancienne** que le dernier snapshot garde le message `IDX_SNAP_KEEP`. Snapshot présent mais
+date de X introuvable (`archive_snapshot`, `archive_stats` et `diff_index` sans date) : `date de X inconnue — relancer Index`. Les événements de la vue
+épinglée sont ceux de la paire dont X est l'archive récente (`archive_new = X`) : la plus ancienne archive n'en a aucun.
 
 **Préfixe (`-f`) sensible à la casse et littéral** (depuis 1.0.101, aussi pour `TreeFind -f`, `DuIdx -f 'préfixe/*'`,
 `IdxPurge -x préfixe`) : `-f /Etc` ne trouve pas `/etc`, et `%`/`_` n'y sont pas des jokers (un dossier `a%b` n'inclut jamais
@@ -2686,6 +2700,7 @@ première requête — voir `docs/borghelperrc.example`.
 | `BORGHELPERWWW_USER_HEADER` | `--user-header` | `user_header` | Header HTTP portant l'email/le nom de l'utilisateur (reverse proxy) — journalisé et enregistré avec les abonnements aux notifications (≥ 1.25.0) |
 | `BORGHELPERWWW_REQUIRE_USER` | `--require-user` / `--no-require-user` | `require_user` | Refuse (403) les requêtes sans ce header, sauf `/healthz` — défaut non ; exige `user_header` |
 | `BORGHELPERWWW_SCOPE_CACHE_DB` | `--scope-cache-db` | `scope_cache_db` | Chemin du fichier SQLite du cache de réponses **filtrées** par périmètre (Story 1.5) — défaut : co-localisé avec `cache.db`/`diff.db` (voir [Cache de réponses](#cache-de-réponses)) |
+| `BORGHELPERWWW_PYCACHE_DIR` | `--pycache-dir` | `pycache_dir` | Dossier du **cache de bytecode** de borgHelper (≥ 1.36.0) : chaque borgHelper lancé par le serveur y charge son code compilé au lieu de recompiler ses 2,8 Mo (~0,6-0,8 s par commande, voir TECHNICAL.md « Exploration rapide de TreeHist ») — défaut `<dossier de cache>/<préfixe>-pycache`, à côté de `scopecache.db` ; créé en mode 700, propriétaire = le compte du serveur ; inutilisable : lancement normal sans cache (`[WARN]` une fois) |
 | `BORGHELPERWWW_BKP_WATCHER_INTERVAL` | — | — | Intervalle (secondes) d'interrogation `bkp_status` par le watcher — défaut 30 (voir `POST /bkp` asynchrone ci-dessus) |
 | `BORGHELPERWWW_PUSH_DISABLED` | — | — | `1` : **suspend l'envoi** de toutes les notifications push (1.27.2) — détection et journal inchangés, `POST /push/test` en `503`, bandeau sur la page Notifications ; lu au démarrage. Par serveur et sans redémarrage : `PUSH_MUTE = true` dans le rc |
 | `BORGHELPERWWW_SCHEMA_CHECK_INTERVAL` | — | — | Intervalle (secondes, défaut 3600, min. 60) du contrôle périodique des bases (1.26.6) : structure de la vue `archive_snapshot_v` de chaque serveur, remise à jour si elle diffère ; `[WARN] … redémarrer borgHelperWWW` si borgHelper a été mis à jour sur disque depuis le démarrage (rien n'est alors modifié) |
@@ -3282,9 +3297,10 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
      reste explorable normalement (son ancien contenu s'affiche).
    - **Clic sur un dossier** : l'ouvre (contenu direct, comme `TreeHist -f <dossier>`).
    - **Notice « Droits et propriétaire »** sous l'explorateur (UI ≥ 1.16.1), visible dans tous les modes :
-     ils montrent le dernier état connu (plus récente sauvegarde indexée contenant l'entrée), pas forcément celui de
-     la sauvegarde épinglée ou comparée ; inconnus (—) pour une entrée supprimée ; droits exacts d'une sauvegarde
-     donnée : téléchargement `.tar` « préserve les droits d'accès ».
+     en vue **épinglée** (UI ≥ 1.28.1) : ceux de l'archive affichée ; dans les autres vues : le dernier état connu (plus
+     récente sauvegarde indexée contenant l'entrée), pas forcément celui des sauvegardes comparées ; inconnus (—) pour
+     une entrée supprimée ; droits exacts d'une autre sauvegarde : téléchargement `.tar` « préserve les droits d'accès ».
+     La boîte de téléchargement d'une entrée en vue épinglée présélectionne l'archive affichée.
    - **Affichage « Changements entre deux sauvegardes »** (UI ≥ 1.16.0) : sélecteur au-dessus de la liste, puis deux
      listes d'archives — « Depuis » (état de départ, exclue) et « Jusqu'à » (incluse). Seules les entrées ajoutées,
      modifiées ou supprimées entre les deux s'affichent (`TreeHist -X`) ; un dossier apparaît dès qu'un changement a
@@ -3325,9 +3341,9 @@ répété dans l'en-tête et le pied de page — visible sur toutes les pages.
    des 10 dernières, plus une colonne **Actions** par archive :
    - **🗂 Explorer** : ouvre l'explorateur d'arborescence (point 4) **épinglé sur cette archive** —
      seuls les événements propres à cette sauvegarde sont affichés (`TreeHist -b <archive> -B
-     <archive>`), pas ceux des autres archives. Les colonnes droits/genre/propriétaire restent, comme
-     toujours, le **dernier état connu** (pas forcément celui de cette archive précise — limitation
-     documentée de `TreeHist`).
+     <archive>`), pas ceux des autres archives. Depuis borgHelper 1.0.219, quand le snapshot de cette archive est
+     en base (les `IDX_SNAP_KEEP` dernières), la vue montre **le contenu de cette archive** (entrées, droits,
+     propriétaire) ; sans snapshot : un message « contenu de X non indexé… » ou, archive pas encore vue par l'Index, « X pas encore indexée… » (aucune liste).
    - **🗑 Supprimer** (`DelBkp`) : supprime définitivement cette archive — confirmation, 🔑 passphrase.
    - Bouton **⚡ Lancer Prune** en haut de la vue (portée sur tout le dépôt, pas une archive précise,
      selon `KEEP_*` de la conf) — confirmation, 🔑 passphrase.
@@ -3487,6 +3503,21 @@ un autre processus change l'empreinte, la réponse est recalculée) — « ⏳ B
 au premier appel ; lecture du roster bornée à 1 s (montage figé : dernier état lu, réponse en cache gardée ; le premier appel
 sur un montage figé attend jusqu'à 1 s pour la présence et 1 s pour le roster, par nick). Limite : pour un nick voisin d'un
 dépôt distant (aucun `lock.roster` lisible), le passage « en attente » -> « en cours » du Bkp voisin peut retarder de 5 min.
+
+**Lancement de `borgHelper` (borgHelperWWW 1.36.0)** : une commande que ce cache ne sert pas (premier passage dans un répertoire de
+l'explorateur, base modifiée depuis) lance un `borgHelper`. Ce script de 2,8 Mo n'a jamais de `.pyc` quand il est lancé tel quel : il
+était recompilé à chaque lancement (~0,6-0,8 s). Le serveur lance donc `python3 <lanceur> <borgHelper> <arguments>` : le lanceur
+(`borgHelper-launch.py`, un petit fichier que le serveur écrit lui-même) charge `borgHelper` par son chemin comme programme principal
+(mêmes `sys.argv`, `__name__`, `__file__`, code de sortie, sorties) avec son bytecode dans `BORGHELPERWWW_PYCACHE_DIR` (défaut :
+`<dossier de cache>/<préfixe>-pycache`, créé en 700, **jamais** à côté de `borgHelper`). Dossier inutilisable (non inscriptible,
+autre propriétaire, **déjà existant et accessible au groupe ou aux autres** — jamais resserré, il pourrait être partagé —, chemin relatif,
+parent absent, **parent inscriptible par le groupe ou les autres sans bit sticky, ou à un autre compte que root et le serveur** — un compte
+qui y écrit substituerait le lanceur) : `borgHelper` est lancé normalement, sans cache, avec une ligne `[WARN]` une fois — jamais une erreur. **CACHE_DIR
+inscriptible par le groupe (775, umask 002) = cache `.pyc` désactivé** : le `[WARN]` nomme le parent fautif avec son mode et son compte et donne le remède
+(`chmod g-w,o-w <parent>`, ou un autre dossier avec `--pycache-dir`) ; la règle reste stricte (même quand le groupe ne compte qu'un membre). Les parents
+sont recontrôlés à chaque lancement ; au premier passage du serveur, les anciens sous-dossiers `pyc/<…>` des versions précédentes de `borgHelper` sont supprimés. Dans
+`ps`, l'enfant se présente comme `python3 …/borgHelper-launch.py /chemin/borgHelper -C … -c <commande>`. La commande `Restore`
+affichée à l'utilisateur reste la vraie CLI (`python3 /chemin/borgHelper …`).
 
 ⚠️ **Périmètre de chemin actif ⇒ jamais servi depuis `_RESPONSE_CACHE`** (Story 1.3, étendu Story
 1.4) : pour `/search`, `/filehist`, `/lstbkpfls`, `/diffbkp`, `/treehist`, `/treefind`, `/duidx`,

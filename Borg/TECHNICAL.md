@@ -2148,6 +2148,156 @@ variant de ±30 %) : `TreeHist` racine chiffré **2,85/4,15 s → 1,40/1,64 s**,
 racine) : 2e segment de `etc/sub` altéré → racine affichée avec `etc`, `TreeHist etc` en erreur propre ; 1er segment
 altéré → racine en erreur propre.
 
+### Exploration rapide de `TreeHist` (borgHelper 1.0.219, borgHelperWWW 1.36.0, story 121)
+
+**Demande** (utilisateur, 2026-11-12) : l'ouverture d'un répertoire de l'explorateur prend « un temps monstre », d'autant plus que le
+nick a de fichiers et de sauvegardes. Cause supposée : la base. **Décision** (2026-11-17, après mesure) : correctifs de requêtes sans
+changement de schéma + lancement de `borgHelper` par WWW depuis du bytecode en cache ; la table par répertoire façon System V (un id par
+répertoire, pointeurs vers ses fichiers et sous-répertoires) est écartée — sur le bac elle ne gagnait que ~0,25 s à la racine
+de plus que ces correctifs, pour +33-42 % de taille de base et des invariants à tenir par chaque écrivain (Index incrémental, purges,
+DbEncrypt/Decrypt/Rekey, migration).
+
+**Où allait le temps** (bac `work/s121/bac` écrit par les écrivains réels : 108 118 entrées, 48 archives, 10 snapshots, `diff_index` 30 768
+lignes ; clair et chiffré ; 3 025 entrées dans le gros répertoire) : un clic sur le gros répertoire en mode `-b ALL` = 20-23 s, dont
+97 % dans UNE requête par entrée affichée. Sans statistiques (aucun `ANALYZE` n'est jamais lancé : une base par nick, `nick=?` ne filtre
+rien), SQLite choisit `idx_diff_nick_date (nick=?)` pour les requêtes « événements d'un chemin » (`WHERE nick=? AND path=? ORDER BY
+archive_new_date,id`) afin d'éviter le tri : chacune balaie tout `diff_index` (5 instructions SQLite par ligne), soit (entrées + 1) x lignes
+de `diff_index`, le produit fichiers x archives de l'énoncé (même plan en SQLite 3.37.2 et 3.50.4). Le reste d'un clic ordinaire (1,1-1,8 s) :
+compilation des 2,8 Mo du script à chaque lancement (~0,6-0,8 s), dernière archive par la vue (10,8 M d'instructions, 0,26-0,33 s),
+deux `COUNT(*)` (~50 ms), KDF en base chiffrée (55-70 ms, une fois par processus).
+
+**Correctifs de `TreeHist` (borgHelper 1.0.219)** — sorties inchangées (texte et `-j`, ALL / plage / `-X`), prouvées par comparaison
+avec 1.0.218 (voir Contrôles) :
+
+| Requête | Avant | Maintenant |
+|---|---|---|
+| événements propres d'une entrée (`_events_for`) et dernier événement d'un supprimé | plan `idx_diff_nick_date`, balayage de `diff_index` par entrée | `INDEXED BY idx_diff_nick_path` : une recherche `(nick,path)` puis le tri des quelques lignes du chemin — plan déterministe, indépendant des statistiques et de la version de SQLite (`ANALYZE` écarté : il faisait passer `_date_of` en `SCAN`) ; l'index est créé par `ensure_diff_db` (absent : erreur SQLite visible, jamais une sortie fausse) |
+| dernière archive snapshotée (TreeHist, `-X`, TreeFind) | `SELECT archive FROM archive_snapshot_v … ORDER BY archive_date DESC LIMIT 1` : K x N lignes + recherche + tri | `_latest_snapshot_archive` : K sauts d'index sur `archive_snapshot (nick,archive)` puis la date d'une ligne par archive (`archive_snapshot_v`) |
+| `_is_index_empty` | 2 `COUNT(*)` | 2 `EXISTS` (3,3 M d'instructions et 45-70 ms -> moins de 20 instructions) |
+| `-X` : droits/propriétaire des entrées | une requête par entrée (lecture de toute la dernière archive à chacune) | une requête pour tous les enfants directs (mêmes bornes de répertoire et séparation `instr(rest,'/')=0` que les événements) |
+| `FileHist` (jumelle) | même plan par date, une fois par commande | `INDEXED BY idx_diff_nick_path` |
+
+*Dernière archive — départage à date égale.* L'ancienne requête laissait l'ordre des archives de même date au plan SQLite (nom croissant
+sans statistiques, ordre d'insertion après un `ANALYZE` : mesuré). Il est maintenant explicite — **nom d'archive le plus petit** —,
+identique à ce que rendait toute base réelle, et testé. La liste des candidats vient d'`archive_snapshot` elle-même (pas de la sentinelle
+`archive_snapshot_indexed`, que la story proposait) : même résultat que l'ancienne requête pour une base dont des lignes n'ont pas de
+sentinelle (lignes écrites à la main par les contrôles, base d'avant la sentinelle), une archive sans ligne lisible (sentinelle seule,
+ligne sans version dans `snapshot_file`) restant ignorée comme avant.
+
+*Non retenu (mesuré, gain insuffisant).* Contenu du répertoire par intervalle sur `idx_snapfile_nick_path` (`snap=rng`) et événements
+groupés en deux requêtes (`ev=grp`) : après les correctifs ci-dessus le listage du gros répertoire coûte 1,2 M (clair) / 2,4 M
+(chiffré) d'instructions SQLite au lieu de 420 M ; le plancher restant (lecture de la dernière archive, N lignes) ne vaut pas deux requêtes
+de plus par mode clair/chiffré.
+
+*Jumelles examinées* (requête « événements d'un chemin » de même forme) : `FileHist` (corrigée) ; `TreeFind` (suppressions : `NOT EXISTS` sur
+`e.path=d.path`, plan `idx_diff_nick_path` vérifié sur le bac) ; `Search`, `DuIdx`, `DiffTop`, `IdxTop` (une passe sur un intervalle de
+préfixe ; `_snap_notin` : corrigé, voir plus bas) ; `LstBkpFls` (index `(nick,archive_new)`) ; `Restore` (`_find_last_archive_with_file`, une requête).
+**`_snap_notin`** (revue 1) — `NOT EXISTS (SELECT 1 FROM diff_index d WHERE d.nick=… AND d.path=archive_snapshot_v.path AND d.archive_new_date>=?)`
+par ligne de snapshot de `Search`, de la partie snapshot de `FileHist` et de `DuIdx -b` : avec une borne de date SQLite choisit
+`idx_diff_nick_date (nick=? AND archive_new_date>?)` et relit, pour CHAQUE ligne, les lignes plus récentes de tout `diff_index` (24 M
+d'instructions contre 96 k sur le bac) ; `INDEXED BY idx_diff_nick_path` (sortie identique : même prédicat, autre chemin d'accès). **Événements
+récursifs d'un sous-répertoire** (`_events_for`, `deep`) : sous une plage de dates, `idx_diff_nick_date` lisait toute la plage du nick
+pour chaque sous-répertoire (55 k instructions contre 4 k) ; `INDEXED BY idx_diff_nick_path` quand le répertoire a une borne de chemin
+(la racine n'en a pas : plan inchangé).
+
+**Bug « archive épinglée » (même story).** « Explorer » d'une archive X (`-b X -B X`) listait le contenu du **dernier** snapshot filtré
+par la date de X : sur le bac (Maildir, X = 8 archives avant la dernière), 256 entrées ajoutées après X s'affichaient comme présentes
+et 128 entrées présentes dans X, supprimées après, s'affichaient « supprimées ». Maintenant, si X a un snapshot en base (au moins une
+ligne lisible), c'est lui qui est listé (champ `archive` = X, type/droits/propriétaire de X) et une entrée est « supprimée » si son dernier
+événement **à la date de X** est une suppression (`AND archive_new_date<=<date de X>` dans la requête du dernier événement) : une entrée
+ajoutée puis supprimée après X n'y figure pas. Les événements de la vue sont ceux de la paire dont X est l'archive récente (`archive_new=X`) :
+`_diff_archive_filter._date_of(X)` rend la première ligne où X est `archive_new` OU `archive_old`, donc la date de l'archive SUIVANTE pour la plus
+ancienne archive. `archive_date` NULL dans le snapshot : la date vient d'`_archive_date` (archive_stats, diff_index) ; introuvable : traité comme
+sans snapshot. **X sans snapshot** (au-delà d'`IDX_SNAP_KEEP`) — décision de l'utilisateur du 2026-11-17 : **aucune liste, aucun borg**, message
+`contenu de X non indexé — snapshots gardés : les N derniers (IDX_SNAP_KEEP) ; LstBkpFls / Restore pour le lire` (texte ; JSON `{'error': …}`,
+comme « aucun snapshot ») ; revue 2, décision de l'utilisateur : X **inconnue de l'index** (ni snapshot, ni `archive_stats`, ni `diff_index` : sauvegarde récente
+avant l'Index, ou faute de frappe) -> `X pas encore indexée — lancez Index (ou attendez l'Index de fin de Bkp)` ; X connue (archive_stats, diff_index) sans snapshot : date
+de X >= date du dernier snapshot (`_latest_snapshot_archive`, sa date par sonde ou `_archive_date`), ou aucun snapshot -> le même « pas encore indexée » (revue 3 : l'Index de fin
+de Bkp n'a pas encore listé ses fichiers, ce n'est pas la rétention) ; plus ancienne -> message IDX_SNAP_KEEP ; snapshot présent mais date introuvable partout ->
+`date de X inconnue — relancer Index`. Choix de la dernière archive et listage dans UNE transaction de lecture (`BEGIN` dans `treehist` et `treefind`) : un Index
+concurrent ne peut pas purger un snapshot entre les deux (instantané WAL unique). **UI 1.28.1** : notice « Droits et propriétaire » = ceux de
+l'archive affichée en vue épinglée, dernier état connu ailleurs ; la boîte de téléchargement d'une entrée en vue épinglée présélectionne l'archive affichée.
+**Cache de réponses de WWW** : l'empreinte (`_cache_fingerprint`, donc `scopecache.db`, persistante) porte la version de borgHelper et la date et la taille
+du fichier lancé — une réponse de 1.0.218 (vue épinglée fausse) n'est pas resservie après la mise à jour.
+
+**Lanceur de borgHelper par borgHelperWWW (1.36.0).** `python3 borgHelper` compile le script (2,8 Mo) à chaque lancement : un script
+principal n'a jamais de `.pyc`. Tous les lancements de WWW (`_build_borghelper_argv_env` : commandes synchrones, Bkp détaché, BkpReconcile,
+`_run_scoped`) passent par `[python, <lanceur>, <borgHelper>, -C, <rc>, -c, <commande>, …]`. Le lanceur (`borgHelper-launch.py`, source
+`_LAUNCHER_SRC` de WWW, écrit au premier besoin par `_launcher_prepare` en `.tmp` + `os.replace`, mode 600, relu à chaque lancement s'il a
+disparu) : pose `sys.argv = [<borgHelper>, …]` et `sys.path[0]` = dossier réel du script, charge le fichier par `SourceFileLoader('__main__',
+<chemin absolu>)` — même `__name__`, `__file__` (chemin absolu, comme un script en 3.9+), `sys.modules['__main__']` que le script lancé tel
+quel —, compile **avec `sys.pycache_prefix` posé le temps de `get_code` seulement** (les imports de borgHelper gardent les `.pyc` habituels
+de la bibliothèque standard), puis `exec` : le corps de `__main__` est `_cli_entry()` et rien d'autre. Même processus, mêmes signaux,
+groupe, code de sortie, stdout/stderr (seules les traces d'un plantage montrent UN cadre de plus, `borgHelper-launch.py <module>` : le regroupement Sentry des plantages venus de WWW change une fois à la mise à jour — accepté par l'utilisateur, revue 2). Un lanceur FICHIER et non
+`-c` : `argv.index('-c')` (`_argv_label`, journal, spies de selftest) retrouve toujours la commande de borgHelper.
+
+*Dossier de cache* (`BORGHELPERWWW_PYCACHE_DIR` / `--pycache-dir` / `pycache_dir`, défaut `<CACHE_DIR du maître>/<préfixe>-pycache/`, à côté
+de `scopecache.db`) : créé en 700 (`mkdir` — le parent doit exister — puis `chmod 700` de ce seul dossier) ; un dossier EXISTANT n'est accepté que s'il
+est déjà à ce compte et fermé au groupe et aux autres : trop ouvert ou d'un autre compte, il est **refusé** (jamais `chmod` — ce pourrait être
+un dossier partagé, `/tmp`, `/usr/local/bin` ; jamais vidé), un `.pyc` déposé par un autre compte serait du code exécuté ici. Le lanceur est lu
+sans suivre de lien (`O_NOFOLLOW`, fichier ordinaire du compte) et remplacé s'il diffère. **Parents** (revue 2, façon `StrictModes` d'OpenSSH) : chaque parent du chemin
+RÉEL doit être à root ou au compte du serveur et fermé en écriture au groupe et aux autres (bit sticky toléré : `/tmp`, `1777`) — sinon un compte qui y écrit
+renommerait le dossier et en recréerait un à lui, donc son propre lanceur exécuté sous le compte de WWW. `_launcher_parents_ok` retourne le PREMIER parent fautif
+`(chemin, mode, uid)` (None si tout convient) : le `[WARN]` le nomme avec son mode et son compte et donne le remède (`chmod g-w,o-w <parent>` ou `--pycache-dir`) ;
+décision de l'utilisateur (revue 3) : règle stricte conservée — 775 sous umask 002 désactive le cache même si le groupe n'a qu'un membre. Contrôles par lancement
+(chemin rapide de `_launcher_path`) : parents (`lstat` de chaque parent) ET dossier. La vérification des parents porte sur le **chemin réel** (les liens du chemin configuré
+sont résolus d'abord par `realpath`) ; le dossier lui-même (un `lstat` du chemin réel : vrai dossier — le chemin réel n'est plus un lien —, ce
+compte, mode `0700`) est revérifié à CHAQUE lancement ; `mkdir` puis `fchmod` sur un descripteur `O_DIRECTORY|O_NOFOLLOW` (jamais `chmod` suivant un lien), `FileExistsError`
+toléré (deux workers) puis mêmes contrôles. Les `.pyc` sont rangés sous `pyc/<st_mtime_ns>-<st_size>-<st_ino de borgHelper>/` : un fichier remplacé (même seconde, même
+taille) n'est jamais exécuté depuis l'ancien bytecode ; les anciens sous-dossiers sont supprimés une fois par processus et par dossier, à la préparation (après le contrôle du
+dossier : seuls les vrais sous-dossiers de ce compte au nom `<chiffres>-<chiffres>-<chiffres>` autres que la clé courante, jamais un lien ni un autre nom). Le défaut du dossier passe par `abspath` (un `cache_dir` relatif
+du rc), un `pycache_dir` explicite relatif reste refusé. `pycache_dir` : `~` développé, chemin relatif refusé.
+Inutilisable (non inscriptible, parent absent, trop ouvert, relatif) : **lancement normal** (`[python, <borgHelper>, …]`), une ligne `[WARN]` une
+fois (rejoué après une préparation réussie suivie d'un nouvel échec), jamais une erreur ; préparation échouée : pas de nouvel essai avant 15 s. Le push selftest signale en tête
+« TMPDIR : parents trop ouverts » quand son TMPDIR est inscriptible par le groupe (le lanceur y refuserait le cache, d'où des FAIL sinon opaques). Le lanceur ne compare son contenu qu'à la première préparation du
+processus (deux versions de WWW sur le même dossier : celle qui a écrit en dernier gagne). Serveur arrêté : le dossier peut être supprimé ;
+supprimé serveur vivant entre le choix du lanceur et l'exec, un lancement échoue (code 2) et le suivant réécrit le lanceur. `PYTHONDONTWRITEBYTECODE`
+hérité : levé le temps de charger borgHelper (sinon aucun `.pyc`, gain perdu sans signe) ; `sys.pycache_prefix` précédent restauré ; `PYTHONSAFEPATH` /
+`-P` respectés (`sys.path[0]` intact) ; `__builtins__` = le module, comme pour un script. Le `.pyc` (`pyc/<chemin absolu de borgHelper>cpython-3NN.pyc`) est validé par la date et la taille du
+source : une nouvelle version de borgHelper est recompilée au premier lancement. **Jamais à côté de `borgHelper`** (`/usr/local/bin` en production). Le
+dossier est jetable. L'interpréteur de la production n'est pas connu d'ici : le cache est par étiquette d'interpréteur.
+
+*Lecteurs de la ligne de commande des enfants* (inventaire) : borgHelper — `_proc_create_run` (balayage) lit l'argv de TOUS les processus, borgHelper
+lancés par WWW compris, mais ne retient que ceux dont une sous-commande borg (`create`, `--comment`) y figure : le chemin du lanceur n'en est jamais une,
+classement inchangé ; `/proc/<pid>/cmdline` ailleurs (`_st_cmd`, `_rb_procs`, contrôles de `Restore`,
+`_rb_ext_kill_diff`) : processus de **test** (`sleep`, borg factice, wrapper) — aucun ne reconnaît un borgHelper lancé par WWW. borgHelperWWW —
+aucune lecture de `/proc/<pid>/cmdline` ; consommateurs de la LISTE argv construite : `_argv_label` (`-c`), `_log_child_rc` (`-C`), spies des
+selftests — `-C`/`-c`/`-n` gardent leur index relatif. `ps`/`pgrep -f borgHelper` : le chemin de borgHelper reste dans la ligne.
+La commande Restore **affichée** (`_restore_cli_commands`) reste la vraie CLI.
+
+**Contrôles.** CodecSelfTest (`TreeHist 1.0.219 …`, `_is_index_empty 1.0.219`) : JSON identique à une référence lente recopiée dans le contrôle
+(`_s121_ref_listing`, `_s121_ref_changes` = le code de 1.0.218) sur 286 combinaisons (clair/chiffré, 11 préfixes, ALL/plage/`-b` seul/épinglée sur
+le dernier/`-X`, erreurs) ; départage et cas limites de la dernière archive ; vue épinglée (contenu de X, ajouts et suppressions
+postérieurs, supprimées à la date de X, événements de X seulement, clair == chiffré, X sans snapshot : message, aucune liste) ; garde de plan (toute requête `path=…` tracée pendant un
+listage utilise `idx_diff_nick_path`, jamais `idx_diff_nick_date`, éprouvée sur la requête d'avant) et borne de coût (coût en instructions
+SQLite < 7 x pour 4 x plus d'entrées et de `diff_index` ; un produit donnerait ~16 x). Push selftest de WWW : lanceur (argv, `__name__`,
+`__file__`, `sys.path[0]`, code de sortie, stdout/stderr identiques au script ; `.pyc` sous le dossier de cache et rien à côté ; relancé :
+réutilisé ; source modifiée : recompilée ; dossier inutilisable : lancement normal et un seul `[WARN]` ; dossier existant en 777 ou 750 REFUSÉ, mode inchangé ; lanceur-lien jamais suivi ; dossier d'un autre compte refusé ; câblage de l'option, de la variable, de la clé de conf et du rc, défaut en mode dossier ; empreinte des caches ; SIGTERM de
+groupe au délai ; cmdline de l'enfant ; Restore affiché) et, pour la ligne 14 de la story 119, nicks `BKP_PULL = direct` (sondé), direct avec
+`SSH_REMFO` et `BKP_PULL` inconnue (non tirés, aucune sonde) de `/bkp/probe`.
+
+**Mesures** (`work/s121/mesure_t5.py`, mesure finale sur le code corrigé de la revue 1 ; 7 tours entrelacés avant/après, médiane, Python 3.10 ; machine
+chargée — load average 7 à 16 : d'autres sessions et les comparaisons en cours — donc surtout l'ordre de grandeur, chaque paire de temps étant prise sous
+la même charge ; processus du clic tel que WWW le lance ; bac clair `bigp` / chiffré `bige` ; sortie identique à 1.0.218 hors vue épinglée ; brut :
+`work/s121/out/t5_final_py310.txt`) :
+
+| cas | avant (1.0.218, script) | après (1.0.219 + lanceur) |
+|---|---|---|
+| gros répertoire (3 025 entrées), `-b ALL` | 33,6 s / 47,1 s | 0,34 s / 1,11 s |
+| gros répertoire, archive épinglée | 11,6 s / 12,8 s | 0,39 s / 0,87 s |
+| gros répertoire, `-X` | 4,7 s / 6,1 s | 0,29 s / 0,47 s |
+| répertoire profond, `-b ALL` | 1,69 s / 3,00 s | 0,18 s / 0,55 s |
+| racine, `-b ALL` | 1,95 s / 3,71 s | 0,47 s / 1,04 s |
+
+*Gain du lanceur seul* (revue 2, `T5_REF=new work/s121/mesure_t5.py` : le MÊME code 1.0.219 lancé comme script, puis par le lanceur ; 7 tours entrelacés,
+médiane, Python 3.10, load average 2-3 ; brut `work/s121/out/t5_lanceur_seul_py310.txt`) : gros répertoire `-b ALL` 0,64 s -> 0,15 s (clair), 1,06 s -> 0,44 s
+(chiffré) ; profond 0,58 -> 0,09 s / 0,69 -> 0,18 s ; racine 0,56 -> 0,19 s / 0,80 -> 0,32 s ; `-X` gros 0,56 -> 0,09 s / 0,90 -> 0,22 s — soit ~0,45-0,5 s par
+clic non servi par le cache de réponses, la compilation des 2,8 Mo ; sortie identique octet pour octet.
+
+Instructions SQLite de `_treehist_listing` après : gros répertoire `-b ALL` 1,20 M (clair) / 2,44 M (chiffré) au lieu de 420 M ; racine 1,5 / 3,1 M.
+Le plancher d'un clic est maintenant le démarrage de l'interpréteur et la KDF (base chiffrée), puis la lecture de la dernière archive
+(racine : ses N lignes parcourues en Python).
+
 ## Écriture des chemins et barrière de migration (1.0.102, chiffrement story 3)
 
 Toute écriture de chemin est, comme les lectures (story 2), indépendante du mode : elle passe par `_path_stored(conn,

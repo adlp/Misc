@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- UI_VERSION: 1.28.0 -->
+<!-- UI_VERSION: 1.28.1 -->
 <html lang="fr">
 <head>
 <meta charset="utf-8">
@@ -252,9 +252,8 @@
         <p class="hint">Clic sur un dossier : ouvrir. Clic droit sur un dossier : télécharger un .tar.
           Clic sur un fichier : le télécharger.</p>
         <p class="hint" id="browseRightsNotice">ⓘ <strong>Droits et propriétaire</strong> : dernier état connu, c'est-à-dire
-          celui de la plus récente sauvegarde indexée qui contient l'entrée — pas forcément celui de la sauvegarde
-          épinglée ou des sauvegardes comparées. Inconnus (—) pour une entrée supprimée. Pour les droits exacts d'une
-          sauvegarde donnée : télécharger au format .tar (« préserve les droits d'accès »).</p>
+          celui de la plus récente sauvegarde indexée qui contient l'entrée. Inconnus (—) pour une entrée supprimée. Pour les
+          droits exacts d'une sauvegarde donnée : télécharger au format .tar (« préserve les droits d'accès »).</p>
         <p class="hint" id="browsePinnedHint" hidden></p>
       </div>
     </div>
@@ -1941,6 +1940,15 @@ async function loadBrowse(){
   syncUrl();
   syncBrowseModeControls();
   const hint=document.getElementById('browsePinnedHint');
+  // UI 1.28.1 (story 121, décision de l'utilisateur) : vue épinglée = droits et propriétaire de l'archive affichée (borgHelper >= 1.0.219,
+  // snapshot de l'archive en base) ; autres vues : dernier état connu
+  const notice=document.getElementById('browseRightsNotice');
+  notice.innerHTML=(reqArchive&&!reqChanges)
+    ? "ⓘ <strong>Droits et propriétaire</strong> : ceux de l'archive affichée (résultats de recherche : dernier état connu). Inconnus (—) pour une entrée supprimée. "
+      +"Pour les droits exacts d'une autre sauvegarde : télécharger au format .tar (« préserve les droits d'accès »)."
+    : "ⓘ <strong>Droits et propriétaire</strong> : dernier état connu, c'est-à-dire celui de la plus récente sauvegarde indexée qui contient "
+      +"l'entrée"+(reqChanges?" — pas forcément celui des sauvegardes comparées":"")+". Inconnus (—) pour une entrée supprimée. "
+      +"Pour les droits exacts d'une sauvegarde donnée : télécharger au format .tar (« préserve les droits d'accès »).";
   if(reqChanges){
     document.getElementById('browseTitle').textContent=reqNick+' — changements '+reqChanges.from+' → '+reqChanges.to+' — '+(reqPath||'/');
     hint.hidden=false;
@@ -1949,7 +1957,7 @@ async function loadBrowse(){
   }else if(reqArchive){
     document.getElementById('browseTitle').textContent=reqNick+' — archive '+reqArchive+' — '+(reqPath||'/');
     hint.hidden=false;
-    hint.textContent="Vue épinglée sur l'archive "+reqArchive+" : seuls les événements de cette sauvegarde sont affichés (genre, droits et propriétaire : voir la notice ci-dessous).";
+    hint.textContent="Vue épinglée sur l'archive "+reqArchive+" : le contenu de cette archive, et seuls les événements de cette sauvegarde (genre, droits et propriétaire : voir la notice ci-dessous).";
   }else{
     document.getElementById('browseTitle').textContent=reqNick+' — '+(reqPath||'/');
     hint.hidden=true;
@@ -1980,7 +1988,8 @@ async function loadBrowse(){
   if(!data || data.error){ browseFail((data&&data.error)||'Aucune donnée'); return; }
   const entries=(data.entries||[]).filter(e=>e.name!=='.');
   browseEntriesByPath={};
-  entries.forEach(e=>{ browseEntriesByPath[e.full_path]=e; });
+  // UI 1.28.1 : marqueur « listé dans la vue épinglée » (posé ici seulement — les résultats de /treefind, qui lisent le dernier snapshot, n'en ont pas)
+  entries.forEach(e=>{ if(reqArchive&&!reqChanges) e.listedAt=reqArchive; browseEntriesByPath[e.full_path]=e; });
   const tbody=document.getElementById('browseBody');
   if(entries.length===0){
     tbody.innerHTML=`<tr><td colspan="5" class="hint">${reqChanges?'Aucun changement ici entre ces deux sauvegardes.':'Répertoire vide'}</td></tr>`;
@@ -2042,7 +2051,9 @@ async function runBrowseSearch(){
   // Publiés dans la même map que loadBrowse : openDownloadDialog() lit browseEntriesByPath pour
   // présélectionner last_seen_archive sur une entrée supprimée, peu importe si elle vient de la
   // navigation normale ou d'une recherche.
-  matches.forEach(m=>{ browseEntriesByPath[m.full_path]=m; });
+  // Une entrée DÉJÀ publiée par le listage de la vue épinglée (marqueur listedAt, état « supprimée » à la date de X) n'est jamais écrasée par un résultat de
+  // recherche (dernier snapshot : un fichier supprimé depuis X y manque ou y est présent) : le téléchargement présélectionnerait la mauvaise archive.
+  matches.forEach(m=>{ if(!(browseEntriesByPath[m.full_path]&&browseEntriesByPath[m.full_path].listedAt)) browseEntriesByPath[m.full_path]=m; });
   if(matches.length===0){
     results.innerHTML=`<p class="hint">Aucun résultat pour « ${escapeHtml(pattern)} » sous ${escapeHtml(browsePath||'/')}.</p>`;
     return;
@@ -2105,6 +2116,8 @@ async function openDownloadDialog(fullPath,isDir){
   // chemin — "dernière archive" (option vide par défaut) échouerait, le fichier n'y est plus.
   const dlEntry=browseEntriesByPath[fullPath];
   const dlLastSeenArchive=dlEntry&&dlEntry.deleted?dlEntry.last_seen_archive:null;
+  // UI 1.28.1 : l'archive affichée n'est présélectionnée que pour une entrée DU LISTAGE épinglé (le fichier y est) — jamais pour un résultat de recherche (dernier snapshot)
+  const dlPinned=(dlEntry&&browseArchive&&!browseChanges&&dlEntry.listedAt===browseArchive)?browseArchive:null;
   document.getElementById('dlModalTitle').textContent=(isDir?'Télécharger un .tar de ':'Télécharger ')+fullPath+(dlLastSeenArchive?' (supprimé)':'');
   const dlInScope=downloadInScope(browseNick,fullPath);
   const dlOpOk=opAllowed(browseNick,'restore');   // dépôt externe sans restore (UI 1.19.0)
@@ -2135,6 +2148,7 @@ async function openDownloadDialog(fullPath,isDir){
         sel.appendChild(opt);
       });
       if(dlLastSeenArchive) sel.value=dlLastSeenArchive; // présélection : archive de dernière présence
+      else if(dlPinned&&[...sel.options].some(o=>o.value===dlPinned)) sel.value=dlPinned; // vue épinglée (UI 1.28.1) : l'archive affichée
     }
   }else{
     // Fichier : ne proposer que les archives où CE fichier a réellement bougé (added/modified —
@@ -2161,6 +2175,14 @@ async function openDownloadDialog(fullPath,isDir){
           opt.value=e.archive; opt.textContent=`${e.date} — ${e.type} — ${e.archive}`;
           sel.appendChild(opt);
         });
+      }
+      if(dlPinned){   // vue épinglée (UI 1.28.1) : le fichier est dans l'archive affichée — présélectionnée, même sans mouvement à cette date
+        if(![...sel.options].some(o=>o.value===dlPinned)){
+          const opt=document.createElement('option');
+          opt.value=dlPinned; opt.textContent=`archive affichée — ${dlPinned}`;
+          sel.appendChild(opt);
+        }
+        sel.value=dlPinned;
       }
     }
   }

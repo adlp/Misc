@@ -6,7 +6,7 @@
 #* See <http://www.gnu.org/licenses/>
 #*/
 
-import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress,threading,unicodedata
+import os,re,sys,io,json,sqlite3,secrets,subprocess,configparser,tarfile,hmac,hashlib,asyncio,contextlib,datetime,urllib.parse,time,ipaddress,threading,unicodedata,stat
 from pathlib import Path
 from typing import Optional, Dict
 from collections import defaultdict, deque
@@ -86,7 +86,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.35.1"
+WWW_VERSION="1.36.0"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -170,6 +170,10 @@ if __name__=='__main__':
     _p.add_argument('--scope-cache-db',help="Chemin du fichier SQLite du cache de réponses filtrées "
                      "par périmètre (Story 1.5, distinct de cache.db/diff.db) — déf. "
                      "BORGHELPERWWW_SCOPE_CACHE_DB, sinon co-localisé avec cache.db/diff.db")
+    _p.add_argument('--pycache-dir',help="Dossier du cache de bytecode de borgHelper (1.36.0) : chaque borgHelper lancé par le serveur "
+                     "y charge son code compilé au lieu de recompiler ses 2,8 Mo à chaque lancement (~0,6-0,8 s) ; créé en mode 700, "
+                     "propriétaire = le compte du serveur ; inutilisable : lancement normal, sans cache — déf. "
+                     "BORGHELPERWWW_PYCACHE_DIR, sinon <dossier de cache>/<préfixe>-pycache à côté de scopecache.db")
     _p.add_argument('--push-db',help="Chemin du fichier SQLite dédié aux abonnements push et clés VAPID "
                      "(Story 2a, spec-notifications-push, AD-6 — jamais scopecache.db, jamais reconstructible) "
                      "— déf. BORGHELPERWWW_PUSH_DB, sinon co-localisé avec cache.db/diff.db")
@@ -204,6 +208,7 @@ if __name__=='__main__':
     if _args.user_header: os.environ['BORGHELPERWWW_USER_HEADER']=_args.user_header
     if _args.require_user is not None: os.environ['BORGHELPERWWW_REQUIRE_USER']=str(_args.require_user)
     if _args.scope_cache_db: os.environ['BORGHELPERWWW_SCOPE_CACHE_DB']=_args.scope_cache_db
+    if _args.pycache_dir: os.environ['BORGHELPERWWW_PYCACHE_DIR']=_args.pycache_dir
     if _args.push_db: os.environ['BORGHELPERWWW_PUSH_DB']=_args.push_db
     if _args.push_prefs: os.environ['BORGHELPERWWW_PUSH_PREFS']=_args.push_prefs
     _SELFTEST_REQUESTED=_args.selftest
@@ -224,7 +229,7 @@ _CONF_KEYS={'cfgfile':'BORGHELPERWWW_CFGFILE','api_key':'BORGHELPERWWW_API_KEY',
             'allow_destructive':'BORGHELPERWWW_ALLOW_DESTRUCTIVE','allow_downloads':'BORGHELPERWWW_ALLOW_DOWNLOADS',
             'restore_root':'BORGHELPERWWW_RESTORE_ROOT',
             'api_prefix':'BORGHELPERWWW_API_PREFIX','groups_header':'BORGHELPERWWW_GROUPS_HEADER',
-            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','push_db':'BORGHELPERWWW_PUSH_DB',
+            'scope_cache_db':'BORGHELPERWWW_SCOPE_CACHE_DB','pycache_dir':'BORGHELPERWWW_PYCACHE_DIR','push_db':'BORGHELPERWWW_PUSH_DB',
             'push_prefs':'BORGHELPERWWW_PUSH_PREFS',
             'user_header':'BORGHELPERWWW_USER_HEADER','require_user':'BORGHELPERWWW_REQUIRE_USER',
             'cfgdir':'BORGHELPERWWW_CFGDIR','master':'BORGHELPERWWW_MASTER'}   # 1.32.0 (story 86) : mode dossier
@@ -2211,6 +2216,10 @@ def _cache_fingerprint(nick: Optional[str]) -> str:
         # checkpoint ; « Index vide » ([WARN], 1.0.179) est mis en cache et doit être renouvelé dès la 1re tranche (CAP-8)
         try: w=os.stat(p+'-wal'); parts.append(f"-wal:{w.st_mtime_ns}:{w.st_size}")
         except OSError: parts.append("-wal:absent")
+    # 1.36.0 (story 121, revue 1) : le borgHelper qui calcule les réponses — une mise à jour qui change une sortie (vue d'une archive
+    # épinglée) ne doit jamais être masquée par une ligne de scopecache.db écrite par l'ancien (persistante : le redémarrage ne la vide pas)
+    try: bs=os.stat(BORGHELPER_BIN); parts.append(f"bh:{BORGHELPER_VERSION}:{bs.st_mtime_ns}:{bs.st_size}")
+    except OSError: parts.append(f"bh:{BORGHELPER_VERSION}:absent")
     return '|'.join(parts)
 
 # 1.29.0 (story 37, A66, décisions de l'utilisateur) : commandes en cache qui lisent un état extérieur aux bases — Report -o
@@ -2389,6 +2398,11 @@ SCOPE_CACHE_DB=os.environ.get('BORGHELPERWWW_SCOPE_CACHE_DB') or \
 # (inchangée : un ancien binaire continue d'ouvrir ce cache tant qu'il n'est pas chiffré — AD-10).
 SCOPE_CACHE_DB_SCHEMA_VERSION=2
 SCOPE_CACHE_DB_BASE_SCHEMA_VERSION=1
+# 1.36.0 (story 121) : dossier du cache de bytecode de borgHelper (lanceur, _launcher_path) — à côté de scopecache.db (dossier de cache et
+# préfixe du maître en mode dossier), réglage dédié --pycache-dir / BORGHELPERWWW_PYCACHE_DIR / pycache_dir (fichier de conf, rc).
+# `~` développé ; abspath seulement pour le défaut (cache_dir relatif) ; une valeur explicite relative est refusée au lancement.
+PYCACHE_DIR=os.path.expanduser(os.environ.get('BORGHELPERWWW_PYCACHE_DIR') or
+                               os.path.abspath(os.path.join(_bh_paths.db.cache_dir,f"{_bh_paths.db.db_prefix}-pycache")))
 
 def ensure_scope_cache_db():
     """Créé/valide le schéma de SCOPE_CACHE_DB — même convention que ensure_cache_db()/
@@ -3221,6 +3235,151 @@ def _capture_fingerprints(nick,cmd=None):
     except OSError: cfg_mtime='absent'
     return {n:f"{_cache_fingerprint(n)}{_external_fingerprint(cmd,n)}|cfgfile:{cfg_mtime}" for n in _nick_list(nick)}   # cmd : 1.29.0
 
+# 1.36.0 (story 121) : lanceur de borgHelper. `python3 borgHelper` COMPILE les 2,8 Mo du script à chaque lancement (le script
+# principal n'a jamais de .pyc : ~0,6-0,8 s sur CHAQUE clic de l'explorateur que le cache de réponses ne sert pas). L'enfant est donc
+# `<python> <lanceur> <borgHelper> <args…>` : le lanceur (petit fichier écrit par CE serveur dans le dossier de cache de bytecode) charge
+# borgHelper par son chemin comme module `__main__` (SourceFileLoader : même code, mêmes `__name__`/`__file__`/sys.argv/sys.path[0] que
+# le script lancé tel quel) avec son .pyc sous PYCACHE_DIR — jamais à côté de borgHelper (/usr/local/bin en production) — puis exécute
+# le corps de `__main__` (`_cli_entry`). Un lanceur FICHIER et non `-c` : `argv.index('-c')` (journal, tests) retrouve toujours la
+# commande de borgHelper. Dossier de cache : créé en 700 par ce serveur, ou EXISTANT mais déjà à ce compte et sans accès pour le groupe
+# ni les autres (un .pyc déposé par un autre compte serait du code exécuté ici : un dossier existant trop ouvert est REFUSÉ, jamais
+# resserré — il pourrait être un dossier partagé, /tmp, /usr/local/bin — ni vidé) ; inutilisable (non inscriptible, autre propriétaire,
+# trop ouvert, chemin relatif, parent absent) : lancement normal, une ligne [WARN] une fois, jamais une erreur. Chaque PARENT du chemin réel
+# doit être à root ou à ce compte et fermé en écriture au groupe et aux autres (bit sticky toléré, comme /tmp) : sinon un compte qui y écrit
+# substituerait le dossier, donc le lanceur ; le dossier (un lstat : vrai dossier, ce compte, mode 700) est revérifié à CHAQUE lancement. Le
+# lanceur lui-même est lu sans suivre de lien (O_NOFOLLOW), fichier ordinaire à ce compte ; les .pyc sont rangés sous un sous-dossier propre à
+# la date (ns), la taille et l'inode de borgHelper (jamais un ancien .pyc pour un fichier remplacé à la même seconde et à la même taille ;
+# les anciens sous-dossiers restent : dossier jetable). Serveur arrêté : le dossier (jetable) peut être supprimé ; supprimé
+# SERVEUR VIVANT entre le choix du lanceur et l'exec de l'enfant, un lancement échoue (code 2 de python : fichier introuvable) — le
+# suivant réécrit le lanceur.
+_LAUNCHER_NAME='borgHelper-launch.py'
+_LAUNCHER_SRC="""# Lanceur de borgHelper écrit par borgHelperWWW (story 121) — ne pas modifier : réécrit par le serveur à sa première préparation si son contenu diffère.
+# Usage : <python> <ce fichier> <chemin de borgHelper> <arguments de borgHelper…>
+import sys,os,builtins,importlib.machinery,importlib.util
+_here=os.path.dirname(os.path.abspath(__file__))
+_bh=sys.argv[1]
+sys.argv=sys.argv[1:]
+if not getattr(sys.flags,'safe_path',False): sys.path[0]=os.path.dirname(os.path.realpath(_bh))   # PYTHONSAFEPATH / -P : aucun dossier de script, comme le script lancé tel quel
+_ld=importlib.machinery.SourceFileLoader('__main__',os.path.abspath(_bh))
+_mod=importlib.util.module_from_spec(importlib.util.spec_from_file_location('__main__',os.path.abspath(_bh),loader=_ld))
+_mod.__spec__=None; _mod.__package__=None; _mod.__dict__['__builtins__']=builtins
+sys.modules['__main__']=_mod
+_pp,_dw=sys.pycache_prefix,sys.dont_write_bytecode   # seulement le temps de charger borgHelper : ses imports gardent leurs .pyc habituels
+_st=os.stat(_bh)   # sous-dossier propre à CE fichier (date en ns, taille, inode) : un remplacement de même seconde et de même taille ne ressert jamais l'ancien .pyc
+sys.pycache_prefix=os.path.join(_here,'pyc','%d-%d-%d'%(_st.st_mtime_ns,_st.st_size,_st.st_ino)); sys.dont_write_bytecode=False   # PYTHONDONTWRITEBYTECODE hérité : sans cache, le gain serait perdu en silence
+try: _code=_ld.get_code('__main__')
+finally: sys.pycache_prefix,sys.dont_write_bytecode=_pp,_dw
+exec(_code,_mod.__dict__)
+"""
+_LAUNCHER_STATE={'path':None,'warned':False,'retry_at':0.0}; _LAUNCHER_LOCK=threading.Lock()
+_LAUNCHER_RETRY=15.0   # s : préparation échouée -> pas de nouvel essai (ni de verrou, ni d'accès disque) avant ce délai
+
+def _launcher_parents_ok(d):
+    """Façon StrictModes d'OpenSSH : chaque parent du chemin RÉEL `d` appartient à root ou à ce compte et n'est pas inscriptible par le groupe ou les
+    autres — sauf bit sticky (comme /tmp : un autre compte n'y renomme ni ne supprime le dossier d'autrui). Sinon un compte qui écrit dans un parent
+    substituerait le dossier de cache, donc le lanceur, donc du code exécuté sous ce compte. Retourne None si tous les parents conviennent, sinon le
+    PREMIER parent fautif `(chemin, mode, uid)` (mode/uid None si illisible : jamais d'exception, ce contrôle est rejoué à chaque lancement)."""
+    p=os.path.dirname(d)
+    while True:
+        try: st=os.lstat(p)
+        except OSError: return (p,None,None)
+        if st.st_uid not in (0,os.geteuid()): return (p,st.st_mode,st.st_uid)
+        if st.st_mode&0o022 and not st.st_mode&stat.S_ISVTX: return (p,st.st_mode,st.st_uid)
+        q=os.path.dirname(p)
+        if q==p: return None
+        p=q
+
+def _launcher_parent_text(bad):
+    """Parent fautif de _launcher_parents_ok -> texte pour le [WARN] : chemin, mode, propriétaire, remède."""
+    p,mode,uid=bad
+    if mode is None: return f"le parent {p} est illisible"
+    try:
+        import pwd
+        who=pwd.getpwuid(uid).pw_name
+    except (ImportError,KeyError): who=str(uid)
+    return (f"le parent {p} (mode {oct(stat.S_IMODE(mode))[2:]}, compte {who}) est d'un autre compte que root ou ce compte, ou inscriptible par le groupe ou les autres "
+            f"— remède : chmod g-w,o-w {p} (ou chown), ou un autre dossier de cache (--pycache-dir / BORGHELPERWWW_PYCACHE_DIR)")
+
+_LAUNCHER_PURGED=set()   # dossiers de cache dont les anciens sous-dossiers de .pyc ont déjà été purgés par ce processus
+
+def _launcher_purge_pyc(d):
+    """Une fois par processus et par dossier de cache : supprime les sous-dossiers `pyc/<mtime_ns>-<taille>-<inode>` des anciennes versions de borgHelper (un
+    par fichier remplacé, sans fin sinon). Seuls les VRAIS sous-dossiers de ce compte au nom exact de la clé sont supprimés, jamais la clé courante."""
+    if d in _LAUNCHER_PURGED: return
+    _LAUNCHER_PURGED.add(d)
+    try:
+        st=os.stat(BORGHELPER_BIN); cur='%d-%d-%d'%(st.st_mtime_ns,st.st_size,st.st_ino)
+        pyc=os.path.join(d,'pyc'); ps=os.lstat(pyc)
+        if not stat.S_ISDIR(ps.st_mode) or ps.st_uid!=os.geteuid(): return
+        for nm in os.listdir(pyc):
+            if nm==cur or not re.fullmatch(r'\d+-\d+-\d+',nm): continue
+            sub=os.path.join(pyc,nm); ss=os.lstat(sub)
+            if stat.S_ISDIR(ss.st_mode) and ss.st_uid==os.geteuid(): shutil.rmtree(sub,ignore_errors=True)
+    except OSError: pass
+
+def _launcher_dir_ok(d):
+    """Dossier de cache (revérifié à CHAQUE lancement, un lstat) : un vrai dossier (pas un lien), de ce compte, fermé au groupe et aux autres."""
+    try: st=os.lstat(d)
+    except OSError: return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid==os.geteuid() and not st.st_mode&0o077
+
+def _launcher_prepare(d):
+    """Dossier de cache `d` (chemin absolu) prêt -> chemin du lanceur, sinon None. Jamais d'exception, jamais de chmod d'un dossier qui existait
+    déjà (fchmod sur un descripteur ouvert sans suivre de lien, de ce seul dossier qu'on vient de créer)."""
+    try:
+        if not os.path.isabs(d): return None
+        d=os.path.realpath(d)
+        if _launcher_parents_ok(d): return None   # un parent fautif (cf. _launcher_path pour le [WARN])
+        try:
+            os.mkdir(d,0o700)   # le parent doit exister
+            fd=os.open(d,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            try: os.fchmod(fd,0o700)   # umask
+            finally: os.close(fd)
+        except FileExistsError: pass   # créé entre-temps (autre worker) ou déjà là : les contrôles suivent
+        if not _launcher_dir_ok(d) or not os.access(d,os.W_OK|os.X_OK): return None
+        _launcher_purge_pyc(d)
+        lp=os.path.join(d,_LAUNCHER_NAME)
+        try:
+            fd=os.open(lp,os.O_RDONLY|os.O_NOFOLLOW)
+            try:
+                fs=os.fstat(fd)
+                same=stat.S_ISREG(fs.st_mode) and fs.st_uid==os.geteuid() and os.read(fd,len(_LAUNCHER_SRC.encode())+16)==_LAUNCHER_SRC.encode()
+            finally: os.close(fd)
+        except OSError: same=False
+        if not same:
+            tmp=f"{lp}.{secrets.token_hex(8)}.tmp"
+            try:
+                fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                with os.fdopen(fd,'w',encoding='utf-8') as f: f.write(_LAUNCHER_SRC)
+                os.replace(tmp,lp)   # remplace aussi un lien : jamais suivi
+            finally:
+                with contextlib.suppress(OSError): os.unlink(tmp)
+        return lp
+    except (OSError,ValueError): return None
+
+def _launcher_path():
+    """Chemin du lanceur (écrit au premier besoin, revérifié présent à chaque lancement) ou None : lancement normal, sans cache.
+    Préparation échouée : pas de nouvel essai avant _LAUNCHER_RETRY s."""
+    lp=_LAUNCHER_STATE['path']
+    if lp and os.path.isfile(lp) and _launcher_dir_ok(os.path.dirname(lp)) and not _launcher_parents_ok(os.path.dirname(lp)): return lp
+    if lp is None and time.monotonic()<_LAUNCHER_STATE['retry_at']: return None
+    with _LAUNCHER_LOCK:
+        lp=_LAUNCHER_STATE['path']
+        if lp and os.path.isfile(lp) and _launcher_dir_ok(os.path.dirname(lp)) and not _launcher_parents_ok(os.path.dirname(lp)): return lp
+        if lp is None and time.monotonic()<_LAUNCHER_STATE['retry_at']: return None
+        lp=_launcher_prepare(PYCACHE_DIR)
+        _LAUNCHER_STATE['path']=lp
+        _LAUNCHER_STATE['retry_at']=0.0 if lp else time.monotonic()+_LAUNCHER_RETRY
+        if lp: _LAUNCHER_STATE['warned']=False   # remis en état : un nouvel échec plus tard sera de nouveau signalé
+        elif not _LAUNCHER_STATE['warned']:
+            _LAUNCHER_STATE['warned']=True
+            try: bad=_launcher_parents_ok(os.path.realpath(PYCACHE_DIR)) if os.path.isabs(PYCACHE_DIR) else None
+            except (OSError,ValueError): bad=None
+            why=(_launcher_parent_text(bad) if bad else "chemin relatif, parent absent, dossier non inscriptible, trop ouvert ou d'un autre compte")
+            print(f"[WARN] cache de bytecode de borgHelper inutilisable ({PYCACHE_DIR} : {why}) — borgHelper est lancé normalement, sans cache "
+                  f"(--pycache-dir / BORGHELPERWWW_PYCACHE_DIR)",file=sys.stderr)
+        return lp
+
 def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passphrase: Optional[str]=None, cfgfile: Optional[str]=None):
     """argv/env communs à tout lancement de borgHelper en sous-processus — factorisé pour être
     partagé entre `_exec_borghelper` (attend le résultat) et `_launch_bkp_detached` (AD-2, ne
@@ -3229,7 +3388,8 @@ def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passph
     if cfgfile is None:
         if DIR_MODE: raise RuntimeError(f"mode dossier : rc du nick non fourni pour borgHelper -c {cmd}")
         cfgfile=CFGFILE
-    argv=[sys.executable,str(BORGHELPER_BIN),'-C',cfgfile,'-c',cmd]
+    lp=_launcher_path()   # 1.36.0 (story 121) : amorceur à bytecode en cache ; None (dossier inutilisable) : lancement normal du script
+    argv=([sys.executable,lp,str(BORGHELPER_BIN)] if lp else [sys.executable,str(BORGHELPER_BIN)])+['-C',cfgfile,'-c',cmd]
     if nick: argv+=['-n',nick]
     argv+=list(extra_args)
     env=os.environ.copy()
@@ -4639,7 +4799,8 @@ def access(request: Request, x_api_key: Optional[str]=Header(default=None)):
             if cfg is not None: out.update(external=is_external(cfg),ops=allowed_ops(cfg,n))
         except SystemExit: out.update(external=None,ops=['read'])   # EXTERNAL invalide : les routes d'action refusent
         except Exception: pass
-        # 1.35.0 (story 118) : Bkp tiré (SSH_REMFO non vide) — l'UI ne sonde (GET /bkp/probe) que ces nicks ; None : rc illisible
+        # 1.35.0 (story 118) : Bkp tiré (SSH_REMFO non vide ; 1.36.0 : ou BKP_PULL = direct, borgHelper >= 1.0.218) — l'UI ne sonde
+        # (GET /bkp/probe) que ces nicks ; None : rc illisible
         try:
             cfg=_cfgread(n)
             out['bkp_pull']=bool(_is_pull(cfg)) if cfg is not None else None
@@ -4830,7 +4991,7 @@ def _restore_cli_commands(nick,bid,ftor,dest,flat,out_text=''):
     if not bid or bid=='last':   # revue 1 (row 18) : « last » = l'archive que Restore a choisie et dite
         m=re.search(r"^Archive sélectionnée (?:depuis l'index|\(dernière\)) : (.+)$",out_text or '',re.M)
         bid=m.group(1) if m else bid   # revue 2 (row 31) : ligne absente -> `bid` gardé (« last » compris), jamais perdu
-    exe=[sys.executable,os.path.realpath(str(BORGHELPER_BIN))]   # revue 1 (row 18) : comme _build_borghelper_argv_env le lance
+    exe=[sys.executable,os.path.realpath(str(BORGHELPER_BIN))]   # revue 1 (row 18) : la vraie CLI (python3 /chemin/borgHelper), jamais le lanceur de bytecode de _build_borghelper_argv_env
     return {k:_restore_cli_line(rc,bn,bid,ftor,dest,flat,fidele=(k=='fidele'),exe=exe) for k in ('sur','fidele')}
 
 def _restore_with_cli(resp,nick,bid,ftor,dest,flat):
@@ -4920,7 +5081,7 @@ def _pull_probe_cached(nick,cfg):
 
 @router.get("/bkp/probe",tags=["mutation"],   # revue 1 row 17 : niveau écriture (comme POST /bkp), lance un ssh sortant
     summary="Bkp tiré : client joignable ? Sonde ssh rapide (ConnectTimeout 3 s), résultat gardé 30 s (« inconnu » sur 255 : 10 min) — nick non tiré : aucune sonde",
-    description="Réponse : `{nick, pull, state, message, code, checked_at, cached, age_s}` ; `pull` false (pas de SSH_REMFO) : "
+    description="Réponse : `{nick, pull, state, message, code, checked_at, cached, age_s}` ; `pull` false (ni SSH_REMFO ni BKP_PULL = direct, ou BKP_PULL refusée) : "
         "aucune sonde, `state` null. `state` : `joignable` (ssh sorti autrement qu'en 255), `absent` (255 sur une erreur réseau : "
         "refus, délai, hôte ou réseau injoignable, nom non résolu, coupure avant l'échange de clés), `inconnu` (autre 255 — "
         "authentification, clé d'hôte — gardé 10 min, sonde sans réponse en 8 s). `message` : dernière ligne de ssh, pour `absent` "
@@ -5546,10 +5707,18 @@ def push_selftest():
     (ensure_push_db()/VAPID) avant que ce flag ne soit lu dans le bloc __main__ ci-dessous — sans
     conséquence (ensure_push_db()/_init_vapid_keys() sont idempotents, jamais destructifs sur un
     fichier existant), mais ce n'est donc pas un self-test qui s'exécute "avant" toute I/O réelle."""
-    global PUSH_DB,PUSH_PREFS_FILE
+    global PUSH_DB,PUSH_PREFS_FILE,PYCACHE_DIR
     import tempfile,shutil,datetime as _dt
     from unittest import mock
     results=[]
+    # 1.36.0 (story 121, revue 1) : tout borgHelper lancé par ce selftest passe par le lanceur — son dossier de cache de bytecode est un dossier
+    # TEMPORAIRE (jamais le vrai, ni lanceur ni .pyc écrits dans le cache du serveur) et l'état du lanceur est remis à zéro ; restauré au `finally` final
+    _pc_saved=(PYCACHE_DIR,dict(_LAUNCHER_STATE)); _pc_tmp=tempfile.mkdtemp(prefix='bhw-pycache-selftest-')
+    PYCACHE_DIR=os.path.join(_pc_tmp,'pycache'); _LAUNCHER_STATE.update(path=None,warned=False,retry_at=0.0)
+    # revue 3 : TMPDIR inscriptible par le groupe/les autres (775 sous umask 002) : le lanceur refuse le cache dessous — message net au début plutôt que des FAIL opaques
+    _tmp_bad=_launcher_parents_ok(os.path.join(os.path.realpath(tempfile.gettempdir()),'x'))
+    if _tmp_bad: print(f"ATTENTION TMPDIR : parents trop ouverts — {_launcher_parent_text(_tmp_bad)} ; les contrôles du lanceur (cache de bytecode) échoueront tant que "
+                       f"TMPDIR n'est pas fermé en écriture au groupe et aux autres (chmod g-w,o-w, ou un autre TMPDIR)")
     def check(name,fn):
         try: ok=bool(fn()); err=''
         except Exception as e: ok=False; err=f" ({type(e).__name__}: {e})"
@@ -5664,6 +5833,235 @@ def push_selftest():
         if bad: print(f"  {bad}")
         return not bad and len(res)==4
     check("borgHelper lancé par WWW (_exec_borghelper, _launch_bkp_detached Bkp et index, _reconcile_run) : BORGHELPERC_NO_CLEANUP_NOTICE=1 dans son environnement (vrai sous-processus, 1.31.18)",_child_no_cleanup_notice)
+    def _launcher_121():
+        """1.36.0 (story 121) : lanceur de borgHelper à bytecode en cache, avec un vrai sous-processus et un faux borgHelper (script Python qui
+        rend ce que le vrai verrait) : (1) l'enfant voit comme un script lancé tel quel : sys.argv[0] = chemin de borgHelper, arguments
+        identiques, __name__ == '__main__', __file__ = chemin absolu, sys.path[0] = dossier réel du script, code de sortie, stdout et stderr
+        rendus ; (2) l'argv de l'enfant (lu dans /proc/<pid>/cmdline) garde le chemin de borgHelper, et argv.index('-c') est celui de borgHelper
+        (journal) ; (3) le .pyc de borgHelper est écrit sous le dossier de cache (mode 700, lanceur 600), jamais à côté du script ; relancé : lu
+        du cache, même sortie ; source modifiée : recompilée ; (4) dossier inutilisable (parent = fichier) : lancement normal, sans cache, sortie
+        identique, aucune erreur, un [WARN] une seule fois ; dossier existant trop ouvert (777, 750) : REFUSÉ, mode inchangé ; dossier en 700 derrière
+        un lien : utilisé ; lanceur qui est un lien : jamais suivi ; échec de préparation : une tentative par délai de reprise ;
+        (5) SIGTERM de groupe au délai : l'enfant du lanceur meurt avec son groupe ; (6) la commande Restore affichée reste la vraie CLI."""
+        import contextlib, stat as _st
+        d=tempfile.mkdtemp(prefix='bh121-'); res={}
+        try:
+            fake=os.path.join(d,'src','borgHelper')
+            os.makedirs(os.path.dirname(fake))
+            src_text=("import sys,os,time\n"
+                      "if __name__=='__main__':\n"
+                      "    mode=sys.argv[sys.argv.index('-c')+1]\n"
+                      "    print(sys.argv[0],sys.argv[1:],__name__,__file__,sys.path[0],sys.modules['__main__'].__file__,sys.pycache_prefix,sys.dont_write_bytecode,type(__builtins__).__name__)\n"
+                      "    sys.stderr.write('err-'+mode+'\\n')\n"
+                      "    if mode=='dort':\n"
+                      "        open(os.path.join(os.path.dirname(__file__),'dort.pid'),'w').write(str(os.getpid())); time.sleep(120)\n"
+                      "    sys.exit(7 if mode=='sept' else 0)\n")
+            with open(fake,'w') as f: f.write(src_text)
+            os.chmod(fake,0o755)
+            os.makedirs(os.path.join(d,'cache')); os.chmod(os.path.join(d,'cache'),0o755)   # le parent du dossier de cache doit exister (mkdir, jamais makedirs) et être fermé au groupe (umask 002 : 775 serait refusé)
+            cache=os.path.join(d,'cache','pyc-test')
+            def build(mode,cfg='/rc'):
+                with mock.patch(f"{__name__}.BORGHELPER_BIN",Path(fake)), mock.patch(f"{__name__}.PYCACHE_DIR",cache), \
+                     mock.patch.dict(_LAUNCHER_STATE,{'path':None,'warned':False,'retry_at':0.0}):
+                    return _build_borghelper_argv_env(mode,'nk',['-f','a b'],cfgfile=cfg)
+            def plain(mode):
+                return subprocess.run([sys.executable,fake,'-C','/rc','-c',mode,'-n','nk','-f','a b'],capture_output=True,text=True,timeout=60)
+            argv,env=build('sept')
+            res['argv : interpréteur, lanceur, borgHelper, puis les arguments de toujours']=(
+                argv[0]==sys.executable and os.path.basename(argv[1])==_LAUNCHER_NAME and argv[2]==fake and argv[3:]==['-C','/rc','-c','sept','-n','nk','-f','a b']
+                and argv[argv.index('-c')+1]=='sept' and _argv_label(argv)=='borgHelper sept',argv)
+            r=_run_group(argv,60,env); p=plain('sept')
+            def norm(t): return t.replace(cache,'<cache>')
+            res['sortie, stderr et code identiques au script lancé tel quel (code 7)']=(
+                (r.returncode,r.stdout,r.stderr)==(p.returncode,p.stdout,p.stderr) and r.returncode==7 and r.stdout.startswith(fake+" ['-C', '/rc', '-c', 'sept'")
+                and f" __main__ {fake} {os.path.dirname(os.path.realpath(fake))} {fake}" in r.stdout,(r.returncode,r.stdout[:300],r.stderr),(p.returncode,p.stdout[:300],p.stderr))
+            pycs=[os.path.join(a,f) for a,_ds,fs in os.walk(cache) for f in fs if f.endswith('.pyc')]
+            nexts=[f for f in os.listdir(os.path.dirname(fake)) if f.endswith('.pyc') or f=='__pycache__']
+            lp=argv[1]
+            res['bytecode sous le dossier de cache (700, lanceur 600), rien à côté du script']=(
+                len(pycs)==1 and pycs[0].startswith(os.path.realpath(cache)+os.sep) and nexts==[]
+                and _st.S_IMODE(os.stat(cache).st_mode)==0o700 and _st.S_IMODE(os.stat(lp).st_mode)==0o600,pycs,nexts)
+            t1=os.stat(pycs[0]).st_mtime_ns if pycs else None
+            r2=_run_group(argv,60,env)
+            res['relancé : même sortie, .pyc réutilisé (non réécrit)']=(r2.stdout==r.stdout and r2.returncode==7 and pycs and os.stat(pycs[0]).st_mtime_ns==t1,)
+            # PYTHONDONTWRITEBYTECODE hérité : levé le temps de charger borgHelper (le .pyc est écrit), restauré pour la suite (sys.dont_write_bytecode,
+            # sys.pycache_prefix, __builtins__ vus par borgHelper identiques à ceux du script lancé tel quel)
+            shutil.rmtree(os.path.join(cache,'pyc'),ignore_errors=True)
+            env_dw=dict(env,PYTHONDONTWRITEBYTECODE='1')
+            rdw=_run_group(argv,60,env_dw)
+            pdw=subprocess.run([sys.executable,fake,'-C','/rc','-c','sept','-n','nk','-f','a b'],capture_output=True,text=True,timeout=60,env=env_dw)
+            pycs_dw=[f for a,_ds,fs in os.walk(cache) for f in fs if f.endswith('.pyc')]
+            res['PYTHONDONTWRITEBYTECODE hérité : .pyc écrit quand même, valeurs vues par borgHelper identiques au script (dont_write_bytecode, pycache_prefix, __builtins__)']=(
+                len(pycs_dw)==1 and (rdw.returncode,rdw.stdout,rdw.stderr)==(pdw.returncode,pdw.stdout,pdw.stderr) and rdw.stdout.rstrip().endswith('None True module'),
+                pycs_dw,rdw.stdout[-120:],pdw.stdout[-120:])
+            n_pyc=lambda: len([1 for a,_ds,fs in os.walk(cache) for f in fs if f.endswith('.pyc')])
+            n0=n_pyc()
+            with open(fake,'w') as f: f.write(src_text.replace("sys.exit(7","sys.exit(9"))
+            os.utime(fake,(time.time()+5,time.time()+5))
+            r3=_run_group(argv,60,env)
+            res['source modifiée : recompilée (nouveau .pyc sous un autre sous-dossier), nouveau comportement']=(r3.returncode==9 and n_pyc()==n0+1,r3.returncode,n0,n_pyc())
+            # remplacement par un NOUVEAU fichier de même taille et de même date (ns) : l'inode change le sous-dossier — jamais l'ancien .pyc (exit 9 resservi)
+            st9=os.stat(fake); tmpf=fake+'.n'
+            with open(tmpf,'w') as f: f.write(src_text.replace("sys.exit(7","sys.exit(8"))
+            os.utime(tmpf,ns=(st9.st_atime_ns,st9.st_mtime_ns)); os.replace(tmpf,fake)
+            r4=_run_group(argv,60,env)
+            res['remplacement de même taille et de même date (ns) par un nouveau fichier : jamais l\'ancien .pyc']=(r4.returncode==8 and os.stat(fake).st_size==st9.st_size and os.stat(fake).st_mtime_ns==st9.st_mtime_ns,r4.returncode)
+            with open(fake,'w') as f: f.write(src_text)
+            # PYTHONSAFEPATH (3.11+) : sys.path comme pour le script lancé tel quel (aucun dossier de script) — la valeur vue est identique avec et sans lanceur
+            if sys.version_info>=(3,11):
+                env_sp=dict(env,PYTHONSAFEPATH='1')
+                rsp=_run_group(argv,60,env_sp)
+                psp=subprocess.run([sys.executable,fake,'-C','/rc','-c','sept','-n','nk','-f','a b'],capture_output=True,text=True,timeout=60,env=env_sp)
+                res['PYTHONSAFEPATH : sys.path[0] identique au script lancé tel quel (le dossier du script n\'y est pas)']=(
+                    (rsp.returncode,rsp.stdout,rsp.stderr)==(psp.returncode,psp.stdout,psp.stderr) and os.path.dirname(os.path.realpath(fake)) not in rsp.stdout.split(' [',1)[1].split(' __main__ ',1)[1].split(' ')[1:2],
+                    rsp.stdout[:200],psp.stdout[:200])
+            # (4) dossier inutilisable : parent = fichier ordinaire -> lancement normal, [WARN] une seule fois
+            blocker=os.path.join(d,'fichier'); open(blocker,'w').close()
+            bad=os.path.join(blocker,'cache')
+            err=io.StringIO(); outs=[]
+            with mock.patch(f"{__name__}.BORGHELPER_BIN",Path(fake)), mock.patch(f"{__name__}.PYCACHE_DIR",bad), \
+                 mock.patch.dict(_LAUNCHER_STATE,{'path':None,'warned':False,'retry_at':0.0}), contextlib.redirect_stderr(err):
+                for _ in range(2):
+                    a2,e2=_build_borghelper_argv_env('sept','nk',['-f','a b'],cfgfile='/rc'); outs.append(a2)
+            rr=_run_group(outs[0],60,env)
+            res['dossier inutilisable : lancement normal (script seul), sortie et code identiques, un seul [WARN]']=(
+                outs[0]==outs[1]==[sys.executable,fake,'-C','/rc','-c','sept','-n','nk','-f','a b'] and (rr.returncode,rr.stdout,rr.stderr)==(p.returncode,p.stdout,p.stderr)
+                and err.getvalue().count('[WARN] cache de bytecode de borgHelper inutilisable')==1,outs,err.getvalue()[:300])
+            # dossier existant trop ouvert (777, 750) : REFUSÉ, jamais resserré (chmod) ni utilisé ; derrière un lien comme en direct
+            loose=os.path.join(d,'ouvert'); os.mkdir(loose); os.chmod(loose,0o777)
+            link=os.path.join(d,'lien'); os.symlink(loose,link)
+            grp=os.path.join(d,'groupe'); os.mkdir(grp); os.chmod(grp,0o750)
+            lp2=_launcher_prepare(link); lp2b=_launcher_prepare(grp)
+            res['dossier existant en 777 (derrière un lien) ou 750 : refusé, mode INCHANGÉ, rien écrit']=(
+                lp2 is None and lp2b is None and _st.S_IMODE(os.stat(loose).st_mode)==0o777 and _st.S_IMODE(os.stat(grp).st_mode)==0o750
+                and os.listdir(loose)==[] and os.listdir(grp)==[],lp2,lp2b)
+            tight=os.path.join(d,'serre'); os.mkdir(tight,0o700); os.chmod(tight,0o700); link2=os.path.join(d,'lien2'); os.symlink(tight,link2)
+            decoy=os.path.join(d,'cible'); open(decoy,'w').write(_LAUNCHER_SRC); os.symlink(decoy,os.path.join(tight,_LAUNCHER_NAME))   # cible de MÊME contenu : suivie, elle serait acceptée
+            lp3=_launcher_prepare(link2)
+            res['dossier existant en 700 (derrière un lien) : utilisé ; lanceur qui est un LIEN : jamais suivi, remplacé par un fichier ordinaire, cible intacte']=(
+                lp3 is not None and os.path.dirname(lp3)==os.path.realpath(tight) and not os.path.islink(lp3) and os.path.isfile(lp3)
+                and open(decoy).read()==_LAUNCHER_SRC and _st.S_IMODE(os.stat(lp3).st_mode)==0o600,lp3)
+            rel=os.path.relpath(os.path.join(d,'relatif-cache'))   # relatif au dossier courant, parent existant : sans le refus du chemin relatif, il serait créé
+            res['chemin relatif ou parent absent : refusé, rien créé']=(not os.path.isabs(rel) and _launcher_prepare(rel) is None and not os.path.exists(os.path.join(d,'relatif-cache'))
+                                                                      and _launcher_prepare(os.path.join(d,'absent','sous')) is None,rel)
+            nd=os.path.join(d,'neuf'); lp5=_launcher_prepare(nd)
+            res['dossier créé par le serveur : 700']=(lp5 is not None and _st.S_IMODE(os.stat(nd).st_mode)==0o700,lp5)
+            # préparation échouée : pas de nouvel essai avant _LAUNCHER_RETRY (un seul [WARN], aucun accès disque entre-temps)
+            calls_=[]
+            with mock.patch(f"{__name__}.PYCACHE_DIR",bad), mock.patch.dict(_LAUNCHER_STATE,{'path':None,'warned':False,'retry_at':0.0}), \
+                 mock.patch(f"{__name__}._launcher_prepare",lambda dd: calls_.append(dd) or None), contextlib.redirect_stderr(io.StringIO()):
+                for _ in range(5): _launcher_path()
+            res['préparation échouée : une seule tentative dans le délai de reprise']=(len(calls_)==1,calls_)
+            # parents du dossier de cache : inscriptible par le groupe ou les autres SANS bit sticky -> refusé (un compte qui y écrit substituerait le lanceur) ;
+            # avec le bit sticky (1777, comme /tmp) ou fermé (755) -> accepté ; propriétaire d'un parent autre que root ou ce compte -> refusé
+            par={}
+            for nm,mode in (('p777',0o777),('p770',0o770),('p1777',0o1777),('p755',0o755)):
+                pd=os.path.join(d,nm); os.mkdir(pd); os.chmod(pd,mode); par[nm]=_launcher_prepare(os.path.join(pd,'c'))
+            pd2=os.path.join(d,'p-autre'); os.mkdir(pd2); os.chmod(pd2,0o755)
+            with mock.patch('os.geteuid',return_value=os.geteuid()+1), mock.patch(f"{__name__}._launcher_dir_ok",return_value=True): par['autre compte']=_launcher_prepare(os.path.join(pd2,'c'))   # dossier écarté : le contrôle des PARENTS seul
+            res['parent inscriptible par le groupe/les autres sans sticky : refusé ; sticky ou fermé : accepté ; parent d\'un autre compte : refusé']=(
+                par['p777'] is None and par['p770'] is None and par['p1777'] is not None and par['p755'] is not None and par['autre compte'] is None,par)
+            # revue 3 (lignes 41, 43, 49) : le parent fautif est RETOURNÉ (chemin, mode, compte) ; le [WARN] le nomme avec son mode et son propriétaire et donne le remède ;
+            # le contrôle des parents est rejoué à CHAQUE lancement (chemin rapide) ; le [WARN] est de nouveau émis après une préparation réussie
+            import pwd as _pwd
+            pw=os.path.join(d,'p-warn'); os.mkdir(pw); os.chmod(pw,0o775)
+            bd_=_launcher_parents_ok(os.path.join(pw,'c')); ok_=_launcher_parents_ok(os.path.join(d,'p755','c'))
+            err=io.StringIO()
+            with mock.patch(f"{__name__}.PYCACHE_DIR",os.path.join(pw,'c')), mock.patch.dict(_LAUNCHER_STATE,{'path':None,'warned':False,'retry_at':0.0}), contextlib.redirect_stderr(err):
+                r_=_launcher_path()
+            w_=err.getvalue(); me_=_pwd.getpwuid(os.geteuid()).pw_name
+            res['parent en 775 : retourné (chemin, mode, compte) ; [WARN] qui nomme le parent, son mode et son compte, avec le remède chmod g-w,o-w ou --pycache-dir']=(
+                bd_ is not None and bd_[0]==pw and _st.S_IMODE(bd_[1])==0o775 and bd_[2]==os.geteuid() and ok_ is None and r_ is None
+                and f"le parent {pw} (mode 775, compte {me_})" in w_ and f"chmod g-w,o-w {pw}" in w_ and '--pycache-dir' in w_ and w_.count('[WARN]')==1,bd_,ok_,w_[:400])
+            lpq=par['p755']; q755=os.path.dirname(os.path.dirname(lpq))
+            with mock.patch(f"{__name__}.PYCACHE_DIR",os.path.dirname(lpq)), mock.patch.dict(_LAUNCHER_STATE,{'path':lpq,'warned':False,'retry_at':0.0}), contextlib.redirect_stderr(io.StringIO()):
+                ok_avant=_launcher_path()==lpq
+                os.chmod(q755,0o775)
+                try: apres=_launcher_path()
+                finally: os.chmod(q755,0o755)
+            res['parent ouvert au groupe APRÈS la préparation : refusé au lancement suivant (contrôle des parents rejoué sur le chemin rapide)']=(ok_avant and apres is None,ok_avant,apres)
+            with mock.patch(f"{__name__}.PYCACHE_DIR",os.path.dirname(lpq)), mock.patch.dict(_LAUNCHER_STATE,{'path':None,'warned':True,'retry_at':0.0}):
+                lpw=_launcher_path(); w_reset=_LAUNCHER_STATE['warned']
+            res['préparation réussie : [WARN] remis à zéro (un échec ultérieur est de nouveau signalé)']=(lpw==lpq and w_reset is False,lpw,w_reset)
+            # revue 3 (ligne 45) : anciens sous-dossiers de .pyc (autres versions de borgHelper) purgés UNE fois par processus ; la clé courante, les noms étrangers et les liens restent
+            pg=os.path.join(d,'purge'); os.mkdir(pg,0o700); pgp=os.path.join(pg,'pyc'); os.mkdir(pgp,0o700)
+            with mock.patch(f"{__name__}.BORGHELPER_BIN",Path(fake)):
+                stf=os.stat(fake); cur_='%d-%d-%d'%(stf.st_mtime_ns,stf.st_size,stf.st_ino)
+                for nm in ('1-2-3',cur_,'garde-moi'): os.mkdir(os.path.join(pgp,nm)); open(os.path.join(pgp,nm,'x.pyc'),'w').close()
+                tgt=os.path.join(d,'cible-purge'); os.mkdir(tgt); open(os.path.join(tgt,'x'),'w').close(); os.symlink(tgt,os.path.join(pgp,'4-5-6'))
+                lpg=_launcher_prepare(pg); apres1=sorted(os.listdir(pgp))
+                os.mkdir(os.path.join(pgp,'7-8-9')); _launcher_prepare(pg); apres2=sorted(os.listdir(pgp))
+            res['anciens sous-dossiers pyc/ purgés une fois par processus (clé courante, noms étrangers, liens et leur cible intacts)']=(
+                lpg is not None and apres1==sorted([cur_,'garde-moi','4-5-6']) and apres2==sorted([cur_,'garde-moi','4-5-6','7-8-9']) and os.path.exists(os.path.join(tgt,'x')),apres1,apres2)
+            # échange du dossier APRÈS la préparation (le lanceur déjà choisi) : un dossier remis à la place, ouvert au groupe, ou un lien -> refusé
+            ex=os.path.join(d,'echange'); lpx=_launcher_prepare(ex)
+            with mock.patch(f"{__name__}.PYCACHE_DIR",ex), mock.patch.dict(_LAUNCHER_STATE,{'path':lpx,'warned':True,'retry_at':0.0}):
+                ok_avant=_launcher_path()==lpx
+                os.rename(ex,ex+'.old'); os.mkdir(ex,0o755); os.chmod(ex,0o755); shutil.copy(lpx+'' if os.path.exists(lpx) else os.path.join(ex+'.old',_LAUNCHER_NAME),os.path.join(ex,_LAUNCHER_NAME))
+                apres=_launcher_path()
+            res['dossier de cache échangé après la préparation (remis à 755) : refusé au lancement suivant, mode inchangé, un lancement ordinaire avant']=(
+                ok_avant and apres is None and _st.S_IMODE(os.stat(ex).st_mode)==0o755,ok_avant,apres)
+            # dossier d'un autre compte (uid simulé : un dossier du compte du test n'est plus « le nôtre ») : refusé, rien écrit dedans
+            other=os.path.join(d,'autre-compte'); os.mkdir(other,0o700)
+            with mock.patch('os.geteuid',return_value=os.geteuid()+1), mock.patch(f"{__name__}._launcher_parents_ok",return_value=None): lp4=_launcher_prepare(other)   # parents écartés : le contrôle du DOSSIER seul
+            res['dossier d\'un autre compte : refusé, rien écrit']=(lp4 is None and os.listdir(other)==[],lp4,os.listdir(other))
+            # lanceur ôté après coup : réécrit au lancement suivant
+            os.unlink(argv[1])
+            with mock.patch.dict(_LAUNCHER_STATE,{'path':argv[1],'warned':False,'retry_at':0.0}), mock.patch(f"{__name__}.PYCACHE_DIR",cache): lp3=_launcher_path()
+            res['lanceur disparu : réécrit']=(lp3==argv[1] and os.path.isfile(lp3),lp3)
+            # (5) SIGTERM du groupe au délai : l'enfant du lanceur meurt, aucun reste
+            argv5,env5=build('dort')
+            pidf=os.path.join(os.path.dirname(fake),'dort.pid')
+            t0=time.monotonic(); timed=False
+            try: _run_group(argv5,8,env5)   # délai large : le démarrage de Python sous charge ne doit pas faire échouer le contrôle
+            except subprocess.TimeoutExpired: timed=True
+            pid5=int(open(pidf).read()) if os.path.exists(pidf) else None
+            alive=bool(pid5) and os.path.exists(f"/proc/{pid5}") and not open(f"/proc/{pid5}/stat").read().rsplit(')',1)[1].split()[0]=='Z'
+            res['délai : SIGTERM au groupe, le borgHelper chargé par le lanceur meurt, pas de reste']=(timed and pid5 is not None and not alive and time.monotonic()-t0<30,timed,pid5,alive)
+            # (2) cmdline d'un enfant vivant : chemin de borgHelper présent, lanceur en tête
+            argv6,env6=build('dort')
+            with contextlib.suppress(OSError): os.unlink(pidf)   # celui du contrôle précédent
+            pr=subprocess.Popen(argv6,env=env6,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+            try:
+                for _ in range(300):   # le pid écrit : le faux borgHelper tourne, donc l'exec du lanceur est fait (cmdline définitive)
+                    if os.path.exists(pidf): break
+                    time.sleep(0.05)
+                with open(f"/proc/{pr.pid}/cmdline",'rb') as f: cl=[x.decode() for x in f.read().split(b'\0')[:-1]]
+                res['cmdline de l\'enfant : interpréteur, lanceur, chemin de borgHelper, arguments']=(cl==argv6,cl)
+            finally:
+                with contextlib.suppress(OSError): os.killpg(pr.pid,15)
+                pr.communicate(timeout=30)
+            # (6) commande Restore affichée : toujours la vraie CLI (jamais le lanceur)
+            with mock.patch(f"{__name__}.BORGHELPER_BIN",Path(fake)), mock.patch(f"{__name__}.PYCACHE_DIR",cache): cli=_restore_cli_commands('nk','b1','etc/x','/dest',False)
+            res['commande Restore affichée : la vraie CLI (python3 /chemin/borgHelper …), jamais le lanceur']=(
+                bool(cli) and all(os.path.realpath(fake) in v and _LAUNCHER_NAME not in v for v in cli.values()),cli)
+        finally:
+            pidf=os.path.join(d,'src','dort.pid')
+            with contextlib.suppress(Exception):
+                pid=int(open(pidf).read())
+                if os.path.exists(f"/proc/{pid}"): os.kill(pid,9)
+            shutil.rmtree(d,ignore_errors=True)
+        bad={k:v for k,v in res.items() if not v[0]}
+        if bad: print(f"  {bad}")
+        return not bad
+    check("borgHelper lancé par WWW via le lanceur à bytecode en cache : mêmes argv/__name__/__file__/sys.path[0]/code/sortie que le script, .pyc sous le dossier de cache jamais à côté, dossier inutilisable ou trop ouvert = lancement normal sans chmod, SIGTERM de groupe, cmdline (1.36.0)",_launcher_121)
+    def _fingerprint_borghelper_121():
+        """1.36.0 (story 121, revue 1) : l'empreinte des caches (scopecache.db, persistante) porte le borgHelper qui calcule les réponses —
+        version importée, date et taille du fichier lancé : une mise à jour de borgHelper (vue d'une archive épinglée corrigée) n'est jamais
+        masquée par une ligne écrite par l'ancien. Même borgHelper : empreinte stable."""
+        d=tempfile.mkdtemp(prefix='bh121f-')
+        try:
+            fk=os.path.join(d,'borgHelper'); open(fk,'w').write('x=1\n')
+            with mock.patch(f"{__name__}.BORGHELPER_BIN",Path(fk)):
+                f0=_cache_fingerprint('qz'); f0b=_cache_fingerprint('qz')
+                with mock.patch(f"{__name__}.BORGHELPER_VERSION",'0.0.0-autre'): f1=_cache_fingerprint('qz')
+                os.utime(fk,(time.time()+7,time.time()+7)); f2=_cache_fingerprint('qz')
+                open(fk,'w').write('x=22\n'); os.utime(fk,(time.time()+7,time.time()+7)); f3=_cache_fingerprint('qz')
+            res=(f0==f0b and len({f0,f1,f2,f3})==4)
+            if not res: print(f"  {f0b==f0} {len({f0,f1,f2,f3})}")
+            return res
+        finally: shutil.rmtree(d,ignore_errors=True)
+    check("empreinte des caches : version de borgHelper, date et taille du fichier lancé (une mise à jour ne ressert pas une réponse de l'ancien) (1.36.0)",_fingerprint_borghelper_121)
     def _own_source_guards():
         """1.31.18 (story 83, D162a) : gardes de source de borgHelper appliquées à CE fichier par le module borgHelper importé —
         mutrun ne juge un mutant de borgHelperWWW que par ce push selftest. Même portée que la garde « compatibilité Python » de
@@ -8695,6 +9093,9 @@ def push_selftest():
                                   'pa':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
                                   'pe':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid','EXTERNAL':'true'},
                                   'pz':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  'pd':{'BKP_PULL':'direct','SSH_REPO':'ssh://borg@depot.invalid:22/srv/x','SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  'pr':{'BKP_PULL':'direct','SSH_REMFO':'8022:localhost:22','SSH_REPO':'ssh://borg@depot.invalid:22/srv/x','SER_LOGIN':'root','SER_NAME':'c.invalid'},
+                                  'pb':{'BKP_PULL':'bidon','SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
                                   '_borgHelperWWW':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'},
                                   '_autre':{'SSH_REMFO':'8022:localhost:22','SER_LOGIN':'root','SER_NAME':'c.invalid'}})
                     calls=[]; slow=[0]
@@ -8710,6 +9111,16 @@ def push_selftest():
                             r=client.get(f"{P}/bkp/probe",params={'nick':n},headers=H)
                             res[f'{n} non tiré : aucune sonde']=(r.status_code==200 and r.json()=={'nick':n,'pull':False,'state':None,'message':None,'code':None,
                                 'checked_at':None,'cached':False,'age_s':None} and calls==[],r.status_code,r.text[:200],calls)
+                        # 1.36.0 (row 14 de la story 119) : Bkp tiré en direct (BKP_PULL = direct, sans SSH_REMFO) = nick tiré, sondé comme par tunnel ;
+                        # BKP_PULL refusée (direct avec SSH_REMFO : conflit ; valeur inconnue) : pas tiré (rien à sonder)
+                        del calls[:]
+                        rd_=client.get(f"{P}/bkp/probe",params={'nick':'pd'},headers=H).json()
+                        res['direct (BKP_PULL = direct) : nick tiré, sondé']=(rd_.get('pull') is True and rd_.get('state')=='absent' and calls==['pd'],rd_,calls)
+                        del calls[:]
+                        for nn_ in ('pr','pb'):
+                            rn_=client.get(f"{P}/bkp/probe",params={'nick':nn_},headers=H).json()
+                            res[f'BKP_PULL refusée ({nn_}) : pas tiré, aucune sonde']=(rn_.get('pull') is False and rn_.get('state') is None and calls==[],rn_,calls)
+                        _PULL_PROBES.clear(); del calls[:]
                         r1=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json()
                         r2=client.get(f"{P}/bkp/probe",params={'nick':'pt'},headers=H).json()
                         res['tiré : sonde, puis gardée']=(r1.get('pull') is True and r1.get('state')=='absent' and r1.get('code')==255
@@ -9124,6 +9535,7 @@ def push_selftest():
             conn.close()
     finally:
         PUSH_DB,PUSH_PREFS_FILE=old_push_db,old_prefs
+        PYCACHE_DIR=_pc_saved[0]; _LAUNCHER_STATE.clear(); _LAUNCHER_STATE.update(_pc_saved[1]); shutil.rmtree(_pc_tmp,ignore_errors=True)
         if old_cleanup_home is None: os.environ.pop('BORGHELPERC_CLEANUP_HOME',None)
         else: os.environ['BORGHELPERC_CLEANUP_HOME']=old_cleanup_home
         _CLEANUP_CACHE.update(t=None,v=None)
@@ -9834,6 +10246,38 @@ def push_selftest():
             if not ok: print(f"  {r.returncode} {r.stderr[-300:]!r} ; témoin {c0}")
             return ok
         check("mode -C : BORGHELPERWWW_CFGFILE vide jamais comblé par le fichier de conf (comme 1.31.19) (1.32.0)",_dm_cfgfile_empty)
+        def _dm_pycache_wiring():
+            """1.36.0 (story 121, revue 1) : câblage du dossier de cache de bytecode — défaut à côté de scopecache.db (mode -C ET mode dossier,
+            dossier et préfixe du maître), BORGHELPERWWW_PYCACHE_DIR, clé `pycache_dir` du fichier de conf et de [_borgHelperWWW] du rc,
+            précédence (environnement > fichier de conf > rc), `~` développé, option --pycache-dir (aide, affectation de l'environnement)."""
+            d=_ref[1]; m=os.path.join(d,'m.rc'); me=os.path.realpath(__file__)
+            show="print('S86JSON:'+json.dumps([w.PYCACHE_DIR,w.SCOPE_CACHE_DB]))\n"
+            base={k:v for k,v in _ref[2].items() if k not in ('BORGHELPERWWW_CFGDIR','BORGHELPERWWW_MASTER','BORGHELPERWWW_PYCACHE_DIR','BORGHELPERWWW_SCOPE_CACHE_DB')}
+            cp_=configparser.ConfigParser(interpolation=None); cp_.read(m,encoding='utf-8'); real_cache=cp_['DEFAULT']['CACHE_DIR']   # le dossier de cache du maître, lu du rc (pas de la formule du code)
+            def beside(c): return (c[0]==os.path.join(real_cache,os.path.basename(c[1]).replace('-scopecache.db','')+'-pycache') and c[1].endswith('-scopecache.db')
+                                   and os.path.dirname(c[1])==real_cache)   # défaut = dossier de cache du rc, préfixe de scopecache.db (sans réglage de scope_cache_db)
+            got={}
+            _r,c=_dm_child({k:v for k,v in _ref[2].items() if k!='BORGHELPERWWW_SCOPE_CACHE_DB'},_DM_LOAD+show); got['défaut, mode dossier (dossier de cache du maître, préfixe de scopecache.db)']=bool(c) and beside(c)
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':m},_DM_LOAD+show); got['défaut, mode -C']=bool(c) and beside(c)
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':m,'BORGHELPERWWW_PYCACHE_DIR':'/e/env'},_DM_LOAD+show); got['environnement']=c is not None and c[0]=='/e/env'
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':m,'BORGHELPERWWW_PYCACHE_DIR':'~/pc-s121'},_DM_LOAD+show)
+            got['~ développé']=c is not None and c[0]==os.path.expanduser('~/pc-s121') and not c[0].startswith('~')
+            conf=_dm_write(os.path.join(d,'www-pc.conf'),f"[borgHelperWWW]\ncfgfile = {m}\npycache_dir = /c/conf\n")
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':m,'BORGHELPERWWW_CONF':conf},_DM_LOAD+show); got['fichier de conf']=c is not None and c[0]=='/c/conf'
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':m,'BORGHELPERWWW_CONF':conf,'BORGHELPERWWW_PYCACHE_DIR':'/e/env'},_DM_LOAD+show)
+            got['environnement > fichier de conf']=c is not None and c[0]=='/e/env'
+            with open(m,encoding='utf-8') as f: txt=f.read()
+            mrc=_dm_write(os.path.join(d,'m-pc.rc'),txt+"\n[_borgHelperWWW]\npycache_dir = /c/rc\n")
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':mrc},_DM_LOAD+show); got['[_borgHelperWWW] du rc']=c is not None and c[0]=='/c/rc'
+            _r,c=_dm_child(base|{'BORGHELPERWWW_CFGFILE':mrc,'BORGHELPERWWW_CONF':conf},_DM_LOAD+show); got['fichier de conf > rc']=c is not None and c[0]=='/c/conf'
+            h=subprocess.run([sys.executable,me,'--help'],capture_output=True,text=True,timeout=120,stdin=subprocess.DEVNULL)
+            with open(me,encoding='utf-8') as f: src=f.read()
+            got['--pycache-dir : aide et affectation de l\'environnement']=('--pycache-dir' in h.stdout and "os.environ['BORGHELPERWWW_PYCACHE_DIR']=_args.pycache_dir" in src
+                                                                            and "'pycache_dir':'BORGHELPERWWW_PYCACHE_DIR'" in src)
+            bad={k:v for k,v in got.items() if not v}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("dossier du cache de bytecode : défaut à côté de scopecache.db (mode -C et mode dossier), variable, fichier de conf, rc, précédence, ~ développé, option --pycache-dir (1.36.0)",_dm_pycache_wiring)
         def _dm_mig_unreadable():
             """Revue 3 (row 50) : préférences illisibles au 1er démarrage en mode dossier -> marqueur de migration NON posé ; fichier
             réparé, 2e démarrage : nick nu du maître rattaché (préfixe:nick), marqueur posé."""

@@ -106,6 +106,14 @@ vie). Réglé depuis la vue 🔔 Notifications de l'UI, **éditable à la main**
 Écritures atomiques sous verrou, mode `0600` ; un fichier corrompu n'est jamais écrasé (les routes
 `/push/*` répondent 500 tant qu'il n'est pas corrigé). À sauvegarder avec `push.db`.
 
+### `<prefixe>-pycache/` — bytecode de borgHelper (borgHelperWWW ≥ 1.36.0)
+
+Dossier : réglage `pycache_dir`/`BORGHELPERWWW_PYCACHE_DIR`/`--pycache-dir`, défaut à côté de `scopecache.db`. Le
+serveur y écrit un petit lanceur (`borgHelper-launch.py`) et y garde le `.pyc` de `borgHelper` (`pyc/…`) : chaque
+borgHelper lancé par le serveur charge son code compilé au lieu de recompiler ses 2,8 Mo (~0,6-0,8 s par commande).
+Créé en mode `0700`, propriétaire = le compte du serveur ; **jetable** (supprimable serveur arrêté ; supprimé serveur vivant, une commande échoue une fois, le lanceur est réécrit ensuite) ; jamais
+de `.pyc` à côté de `borgHelper`. Inutilisable (non inscriptible, autre propriétaire, existant et ouvert au groupe/aux autres — jamais resserré —, parent absent ou inscriptible par d'autres comptes sans sticky — un parent en 775, umask 002, désactive le cache : `[WARN]` avec le parent, son mode et le remède `chmod g-w,o-w` —, relatif) : lancement normal, sans cache.
+
 ## 3. API HTTP (borgHelperWWW)
 
 Toutes les commandes CLI sont exposées **sauf `Mount`/`UMount`** (accès FUSE local, sans objet en

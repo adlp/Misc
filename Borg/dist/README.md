@@ -29,13 +29,22 @@ transformation textuelle, voir plus bas), précédé d'une couche de compatibili
 Copier le fichier généré **à la place** de `borgHelperWWW`, dans le dossier qui contient déjà `borgHelper`,
 `borgHelper.py`, `borgHelperWWW_ui.html`, `borgHelperWWW_sw.js` et `vendor/chartjs/` :
 
-    cp Borg/dist/borgHelperWWW-1.35.0 /opt/borg/borgHelperWWW
+    cp Borg/dist/borgHelperWWW-1.36.0 /opt/borg/borgHelperWWW
 
 La version autonome n'embarque ni l'UI ni le service worker : les fichiers déposés à côté doivent être ceux de la même
 release. **Avec 1.35.0**, déposer aussi `borgHelperWWW_sw.js` 1.5.0 et `borgHelperWWW_ui.html` 1.28.0 (sinon l'ancien
 service worker afficherait « Dernière sauvegarde il y a X » pour un nick qui n'en a aucune, et l'ancienne UI ne griserait
 pas « ▶ Backup » d'un client absent), ainsi que `borgHelper` 1.0.217 (1.35.0 en importe `_is_pull` et `_pull_probe` : avec
 un `borgHelper` plus ancien, le serveur ne démarre pas).
+
+**Avec 1.36.0** : le serveur lance chaque `borgHelper` par un petit lanceur qu'il écrit lui-même (`borgHelper-launch.py`) dans un
+**dossier de cache de bytecode** (option `--pycache-dir` / `BORGHELPERWWW_PYCACHE_DIR` / `pycache_dir`, défaut
+`<dossier de cache>/<préfixe>-pycache`, créé au premier lancement en 700 par le compte du serveur) : rien de plus à déployer, rien
+d'écrit à côté de `borgHelper` (un dossier existant ouvert au groupe ou aux autres, ou dont un parent est inscriptible par le groupe ou les autres sans bit sticky — ex. `CACHE_DIR` en 775 sous umask 002 —, est refusé, jamais resserré : `[WARN]` qui nomme le parent et le remède) ; le lanceur n'utilise que la bibliothèque standard (aucun `site`, vérifié sous `-I -S`). Dossier
+inutilisable : `borgHelper` est lancé normalement, sans cache.
+
+**Versions mélangées** : WWW 1.36.0 / UI 1.28.1 fonctionnent avec un `borgHelper` plus ancien (rien de nouveau n'y est importé), mais la « vue épinglée juste »
+(contenu de l'archive, droits de l'archive, message sans snapshot) exige **borgHelper ≥ 1.0.219** ; avec 1.0.218 l'UI afficherait ces textes sur l'ancienne vue fausse.
 
 Mêmes options CLI, mêmes variables `BORGHELPERWWW_*`, mêmes routes, mêmes codes HTTP, mêmes en-têtes, même journal
 `[req]` que l'original. Les fichiers sont cherchés relativement à l'emplacement du fichier (liens symboliques résolus),

@@ -95,6 +95,17 @@ cfgfile = /etc/borghelperrc-www
 ; doit précéder la résolution du périmètre, donc avant de savoir si l'appelant est restreint).
 ;scope_cache_db = /var/cache/borghelper/borghelperrc-www-scopecache.db
 
+; Dossier du cache de bytecode de borgHelper (1.36.0) — BORGHELPERWWW_PYCACHE_DIR / --pycache-dir. Chaque
+; borgHelper lancé par le serveur y charge son code compilé (un petit lanceur, écrit par le serveur dans ce
+; dossier, charge borgHelper) au lieu de recompiler ses 2,8 Mo à chaque lancement : ~0,6-0,8 s gagnés par
+; commande. Jamais écrit à côté de borgHelper (/usr/local/bin). Défaut : <dossier de cache>/<préfixe>-pycache,
+; à côté de scopecache.db ; créé en mode 700, propriétaire = le compte du serveur (un autre propriétaire, un dossier
+; non inscriptible, un dossier EXISTANT accessible au groupe ou aux autres — jamais resserré —, un parent absent ou inscriptible par d'autres
+; comptes (sans bit sticky), un chemin relatif :
+; borgHelper est lancé normalement, sans cache, une ligne [WARN] au journal). Un parent en 775 (umask 002) désactive donc le cache :
+; le [WARN] le nomme avec son mode et donne le remède (chmod g-w,o-w <parent>, ou un autre dossier ici). `~` est développé.
+;pycache_dir = /var/cache/borghelper/borghelperrc-www-pycache
+
 ; Chemin du fichier SQLite DÉDIÉ aux clés VAPID et abonnements push navigateur (Story 2a,
 ; spec-notifications-push, AD-6 — jamais scopecache.db ci-dessus : celui-ci n'est PAS reconstructible,
 ; une perte est définitive) — BORGHELPERWWW_PUSH_DB / --push-db. Défaut : co-localisé avec

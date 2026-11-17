@@ -1,5 +1,71 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.219, borgHelperWWW 1.36.0, UI 1.28.1 — Exploration d'un nick : lecture rapide, vue d'une archive épinglée juste — 2026-11-18
+
+Story 121 (demande de l'utilisateur du 2026-11-12 : ouvrir un répertoire de l'explorateur prend « un temps monstre », d'autant plus que
+le nick a de fichiers et de sauvegardes ; décision du 2026-11-17 après mesure sur un bac de 108 118 entrées / 48 archives, clair et chiffré).
+Le temps n'était pas dans le stockage mais dans les **plans de requêtes** (une requête par entrée affichée qui balayait tout `diff_index`)
+et dans la **recompilation de borgHelper à chaque lancement** ; la table par répertoire façon System V est écartée (gain de ~0,25 s à la
+racine seulement, base +33-42 %). Détail, mesures et inventaires : TECHNICAL « Exploration rapide de `TreeHist` ».
+
+- **borgHelper — `TreeHist` : événements par entrée sur `idx_diff_nick_path`** (`INDEXED BY`) : sans statistiques SQLite choisissait
+  `idx_diff_nick_date` et chaque entrée affichée balayait tout `diff_index` ((entrées + 1) x lignes). Gros répertoire (3 025 entrées),
+  `-b ALL` : 33,6 s -> 0,34 s (clair), 47,1 s -> 1,11 s (chiffré) — mesure finale, machine chargée ; 420 M -> 1,2 M d'instructions SQLite. Même correctif sur le
+  dernier événement d'un supprimé et sur `FileHist` (jumelle). Sorties inchangées.
+- **borgHelper — dernière archive snapshotée** sans lire tous les snapshots (`_latest_snapshot_archive` : K sauts d'index, une date par
+  archive) pour `TreeHist`, `TreeHist -X` et `TreeFind` : -0,25 à -0,33 s par clic. **Départage à date égale explicite** (nom d'archive le plus
+  petit) : l'ancienne requête le laissait au plan SQLite (même réponse sur toute base réelle, testé).
+- **borgHelper — `_is_index_empty`** : `EXISTS` au lieu de deux `COUNT(*)` (-45 à -55 ms par commande de lecture).
+- **borgHelper — `TreeHist -X`** : droits et propriétaire de tous les enfants en une requête au lieu d'une par entrée (gros répertoire :
+  4,7 s -> 0,29 s).
+- **borgHelper — bug « archive épinglée » corrigé** : « Explorer » d'une archive X (`-b X -B X`) listait le contenu du **dernier** snapshot
+  filtré par la date de X — ajouts postérieurs affichés comme présents (256 sur le bac), suppressions postérieures comme « supprimées »
+  (128). Quand X a son snapshot en base, la vue montre **le contenu de X** (champ `archive` = X, droits et propriétaire de X) ; « supprimée » =
+  dernier événement connu à la date de X est une suppression ; événements de la paire dont X est l'archive récente (`archive_new = X`, plus
+  `_date_of`, qui rendait la date de l'archive suivante pour la plus ancienne). X **sans** snapshot (au-delà d'`IDX_SNAP_KEEP`) — décision de
+  l'utilisateur : aucune liste, aucun borg, message `contenu de X non indexé — snapshots gardés : les N derniers (IDX_SNAP_KEEP) ; LstBkpFls /
+  Restore pour le lire` (texte ; JSON `{"error": …}`) ; X inconnue de l'index (sauvegarde récente avant l'Index, faute de frappe) : `X pas encore indexée —
+  lancez Index (ou attendez l'Index de fin de Bkp)` — aussi pour une archive connue (`archive_stats`, `diff_index`) sans snapshot **plus récente que le dernier
+  snapshot** (ou sans aucun snapshot : l'Index de fin de Bkp ne l'a pas encore listée, ce n'est pas la rétention) ; plus ancienne : message `IDX_SNAP_KEEP` ; snapshot
+  présent mais date introuvable : `date de X inconnue — relancer Index`.
+- **borgHelper — jumelles et plans (revue 1)** : `_snap_notin` (Search, `FileHist`, `DuIdx -b` : `NOT EXISTS` par ligne de snapshot, 24 M -> 96 k
+  instructions) et événements récursifs d'un sous-répertoire sous plage de dates sur `idx_diff_nick_path` ; choix de la dernière archive et
+  listage dans une seule transaction de lecture (`TreeHist`, `TreeFind`) ; sorties inchangées.
+- **borgHelperWWW — cache de réponses** : l'empreinte (donc `scopecache.db`, persistante) porte la version et la date/taille de borgHelper — la
+  vue épinglée fausse de 1.0.218 n'est pas resservie après la mise à jour.
+- **UI 1.28.1** (la vue épinglée juste exige borgHelper >= 1.0.219) : notice « Droits et propriétaire » = ceux de l'archive affichée en vue épinglée, dernier état connu dans les autres vues ; la
+  boîte de téléchargement d'une entrée DU LISTAGE épinglé présélectionne l'archive affichée (jamais pour un résultat de recherche, qui lit le dernier snapshot). Une recherche n'écrase plus une entrée déjà publiée par le listage épinglé (« supprimée à la date de X » restait faussée par le dernier snapshot).
+- **borgHelperWWW — lanceur à bytecode en cache** : chaque borgHelper lancé par le serveur (toutes les commandes, Bkp détaché compris) est
+  chargé par un petit lanceur écrit par le serveur (`borgHelper-launch.py`) avec son `.pyc` dans un dossier de cache dédié au lieu d'être
+  recompilé (-0,6 à -0,8 s par lancement) : mêmes `sys.argv`/`__name__`/`__file__`/code de sortie/stdout/stderr/signaux que le script. Nouvelle
+  option `--pycache-dir` / `BORGHELPERWWW_PYCACHE_DIR` / `pycache_dir` (fichier de conf, rc), défaut `<dossier de cache>/<préfixe>-pycache`
+  (créé en 700, propriétaire = le compte du serveur) ; **jamais de `.pyc` à côté de `borgHelper`** ; dossier inutilisable (non inscriptible, d'un
+  autre compte, existant et ouvert au groupe/aux autres — jamais resserré —, chemin relatif) : lancement normal sans cache et une ligne `[WARN]` ;
+  parents du dossier contrôlés (root ou compte du serveur, fermés en écriture au groupe et aux autres, sticky toléré) et dossier revérifié à chaque lancement ;
+  `.pyc` sous un sous-dossier propre à la date, la taille et l'inode de borgHelper ; lanceur lu sans suivre de lien ; un plantage de borgHelper montre UN cadre de
+  plus (le lanceur) dans les traces, regroupement Sentry changé une fois (accepté) ; **CACHE_DIR inscriptible par le groupe (775, umask 002) = cache `.pyc` désactivé** (règle
+  stricte conservée, décision de l'utilisateur) : le `[WARN]` nomme le parent fautif avec son mode et son compte et donne le remède (`chmod g-w,o-w <parent>` ou `--pycache-dir`),
+  les parents sont recontrôlés à chaque lancement, les anciens sous-dossiers `pyc/<…>` sont supprimés au premier passage, le `[WARN]` est ré-émis après un rétablissement ; `PYTHONDONTWRITEBYTECODE`, `PYTHONSAFEPATH` et `sys.pycache_prefix` hérités traités. La commande Restore affichée reste la vraie CLI. `ps` : `python3 …/borgHelper-launch.py /chemin/borgHelper
+  -C … -c <commande>`.
+- **borgHelperWWW — différés de la story 119 (row 14)** : textes de `/bkp/probe` (« `pull` false … ») et commentaire de `/access` `bkp_pull` à jour
+  (un nick `BKP_PULL = direct` est tiré sans `SSH_REMFO`) ; push selftest : nicks `BKP_PULL = direct`, direct avec `SSH_REMFO` et `BKP_PULL`
+  inconnue.
+- **Docs** : README (`TreeHist` archive épinglée, option `BORGHELPERWWW_PYCACHE_DIR`, lancement de borgHelper, Explorer d'une archive),
+  TECHNICAL, `borghelperwww.conf.example`, `docs/TECHNIQUE.md`, `dist/README.md`.
+- Vérifié (revue 2, ce qui a réellement tourné sur le code final) : `TreeHist` épinglé contre le SQL sur le bac, clair ET chiffré (`work/s121/t6_final.py`,
+  `out/t6_final_apres.txt` : 0 écart — entrées du snapshot X, supprimées à la date de X, événements `archive_new = X` ; le même contrôle sur 1.0.218 :
+  18 écarts) ; contrôles CodecSelfTest `1.0.219` (6) en 3.10 et en 3.14 (avertissements stricts) ; push selftest 180/180 en 3.10, en 3.14 et sur la
+  version autonome sous `-I -S` ; `node borgHelperWWW_ui_test.js` ; mutants : 15 de borgHelper et 21 du lanceur / de l'empreinte / du câblage détectés
+  (`work/s121/out/mut_*final*.txt`, hors propriétaire du fichier lanceur et S_ISREG, intestables sans root). Comparaison de sorties à 1.0.218 (TreeHist, TreeFind, FileHist,
+  Search, DuIdx ; 3.10 et 3.14 ; 432 identiques chacun, 0 différence) faite sur le code de la revue 1 : depuis, seuls les messages de la vue épinglée sans
+  snapshot ont changé dans borgHelper. Les lots ciblés de contrôles (226) n'ont tourné qu'en 3.10 sur le code de la revue 1 ; les runs complets du
+  coordinateur font foi.
+- Vérifié (revue 3, sur le code final) : contrôles CodecSelfTest `1.0.219` (6) en 3.10 et en 3.14 (avertissements stricts), dont la vue épinglée avec une archive `y5` connue
+  par `archive_stats` seulement et plus récente que le dernier snapshot (« pas encore indexée »), une archive `y6` au snapshot sans date (« date de y6 inconnue ») et le nick
+  sans aucun snapshot ; push selftest 180/180 en 3.10, en 3.14 et sur la version autonome sous `-I -S` (parent en 775 : `[WARN]` avec parent, mode, compte et remède ; parents
+  rejoués sur le chemin rapide ; `[WARN]` ré-émis après une préparation réussie ; purge des anciens `pyc/<…>` une seule fois) ; `node borgHelperWWW_ui_test.js` (la recherche
+  n'écrase pas une entrée du listage épinglé : le contrôle échoue avec l'ancienne ligne). Série de mutations : plan `work/mut121_plan.py` mis à jour pour les lignes modifiées, non lancée.
+
 ## borgHelper 1.0.218 — Bkp tiré direct : clé BKP_PULL, le borg du client joint le dépôt sans tunnel — 2026-11-16
 
 Story 119 (chantier « Bkp tiré / client à IP flottante, ProxyJump », étude `work/proxyjump/etude.md` ; décisions de l'utilisateur
