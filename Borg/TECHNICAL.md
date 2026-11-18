@@ -5846,3 +5846,356 @@ Test réel : uvicorn + faux service push local déchiffrant le payload (`http_ec
 manuelle du JSON (`notify_start=true`) prise en compte à chaud (début + fin reçus), `DELETE` nettoie le
 JSON. Affichage navigateur (UI, Service Worker) non vérifié dans cet environnement (aucun navigateur) —
 comportement du SW vérifié sous Node avec `self`/`registration` simulés.
+
+---
+
+## Bkp tiré : garde de la clé du pull et mesures (story 120)
+
+Support technique de [README — Bkp tiré : client à IP flottante, derrière NAT ou
+bastion](README.md#bkp-tiré--client-à-ip-flottante-derrière-nat-ou-bastion). Aucun code de borgHelper n'est concerné (documentation seule,
+aucune version) : ce qui suit décrit ce que borgHelper 1.0.218/1.0.219 envoie au client d'un Bkp tiré, le garde donné en exemple pour
+la clé du pull (jamais livré comme fichier), et les mesures faites sur un banc de test.
+
+### Ce que borgHelper envoie
+
+La commande distante d'un Bkp tiré (`ssh … SER_LOGIN@SER_NAME <commande>`) a toujours la forme :
+
+```
+[IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; ]      SSH_ENV = commande seulement
+[exec env BORG_X=<valeur citée> …  ]                                    voir les cas ci-dessous
+<BORG_EXE> create --comment 'borgHelper run <32 hexa>' [--rsh '<BORG_RSH>']
+    --log-json --json --debug -v --stats --list --filter CE --show-version
+    ::<archive> <BORG_ROOTBKP> <EXCLUDE> [<EXCLUDE_NEXT>]
+```
+
+Chaque valeur est citée par `shlex.quote` (apostrophes ; une apostrophe incluse s'écrit `'"'"'`). `BORG_ROOTBKP`, `EXCLUDE` et
+`EXCLUDE_NEXT` du rc passent tels quels : le shell du client les découpe. `BORG_PASSPHRASE` n'est jamais dans une ligne de commande.
+
+| Forme | Début de la commande reçue | Variables |
+|---|---|---|
+| tunnel, `SSH_REPO_USER`, `sendenv` | `exec env BORG_REPO=ssh://u@127.0.0.1:8022/… BORG_RSH='ssh -o BatchMode=yes …' <exe> create … --rsh 'ssh …' …` | `BORG_REPO`, `BORG_RSH` dans la commande ; passphrase et `BORG_EXIT_CODES` par `SendEnv` |
+| tunnel, `SSH_REPO_USER`, `commande` | `IFS= read …; export …; exec env BORG_EXIT_CODES=legacy BORG_REPO=… BORG_RSH='…' <exe> create … --rsh '…' …` | tout dans la commande, passphrase sur l'entrée de ssh |
+| tunnel, `SSH_REPO` (alias), `sendenv` | `<exe> create --comment '…' …` | tout par `SendEnv` (`AcceptEnv BORG_REPO BORG_PASSPHRASE BORG_EXIT_CODES`) |
+| tunnel, `SSH_REPO`, `commande` | `IFS= read …; export …; exec env BORG_EXIT_CODES=legacy BORG_REPO=ssh://alias/… <exe> create …` | tout dans la commande |
+| `direct`, `BORG_RSH` du rc, `sendenv` / `commande` | `[IFS= read …; export …; ]exec env [BORG_EXIT_CODES=legacy ]BORG_REPO=… BORG_RSH='ssh -p 22' <exe> create --comment '…' --rsh 'ssh -p 22' …` | `BORG_RSH` du rc dans la commande ET en `--rsh` |
+| `direct`, épinglé (`SSH_REPO_HOSTKEY`) | idem avec le `BORG_RSH` construit | |
+| `direct`, sans `BORG_RSH` | `[…]exec env [BORG_EXIT_CODES=legacy ]BORG_REPO=… <exe> create --comment '…' …` | |
+| `BORG_EXE = sudo -n borg` | les mêmes, `… sudo -n borg create …` | déconseillé (voir « Comportements constatés ») ; exécutées au banc avec `BORG_CMD='sudo -n borg'` et un faux `sudo` |
+
+Le `BORG_RSH` construit (1.0.216) est : `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/dev/null -o
+GlobalKnownHostsFile=/dev/null -o HostKeyAlias=borghelper-<nick> -o 'KnownHostsCommand=/bin/sh -c '"'"'for l do echo "$l"; done'"'"'
+sh '"'"'<alias> <type> <clé>'"'"'…' [-o IdentitiesOnly=yes -i <SSH_REPO_KEY>]`. Relevé au banc par un sshd à commande forcée qui
+journalise `SSH_ORIGINAL_COMMAND` (`out/t1_releve.txt`, `t1_releve.json`) : 13 formes.
+
+### Le garde
+
+Liste blanche exacte (décision de l'utilisateur, revue 1) : le script n'accepte que les options, variables et formes de `--rsh` que
+borgHelper envoie ; tout le reste est refusé (code 126). Quatre listes de tête sont éditables (`ENV_OK`, `OPT_FLAGS`, `OPT_ARGS`,
+`RSH_OPTS`) : un `BORG_RSH` du rc avec d'autres `-o`, un `EXCLUDE` avec d'autres options de borg, une autre variable `BORG_*` du rc
+exigent d'y ajouter leur nom — rien d'autre à toucher. Un **plancher en dur** (`FLOOR_ENV`, `FLOOR_OPT`) est refusé quelles que
+soient les listes : les variables qui exécutent une commande, chargent une configuration ou lisent le secret ailleurs
+(`BORG_PASSCOMMAND`, `BORG_NEW_PASSCOMMAND`, `BORG_PASSPHRASE_FD`, `BORG_NEW_PASSPHRASE`, `BORG_PASSPHRASE`, `BORG_LOGGING_CONF`,
+`BORG_REMOTE_PATH` dans le préfixe) et les options `--paths-from-command`, `--content-from-command`, `--paths-from-stdin`,
+`--remote-path` — avec toute leur abréviation, car borg 1.2.6 accepte `--paths-from-comm` ou `--remote-pa` : un mot d'option qui
+est un début d'une option du plancher est refusé même si l'administrateur l'a ajouté à `OPT_FLAGS` ou `OPT_ARGS`. `BORG_CMD` est le
+`BORG_EXE` du rc, en UN mot et chemin absolu (le code compare mot à mot et admet plusieurs mots — `sudo -n borg` a été exécuté au banc,
+avec un faux `sudo` — mais plusieurs mots cassent les lectures locales de S : voir « Comportements constatés »).
+
+```sh
+#!/bin/sh
+# borg-pull-guard — commande forcée de la clé du pull (authorized_keys du compte du pull sur le client C).
+# LISTE BLANCHE EXACTE : n'exécute que le « borg create » que borgHelper 1.0.218/1.0.219 envoie, avec les seules options,
+# variables et formes de --rsh listées ici ; tout le reste est refusé (code 126). Défense en profondeur, pas un bac à sable :
+# le serveur choisit toujours les chemins sauvegardés et le dépôt.
+
+# --- LISTES ÉDITABLES (un BORG_RSH ou un EXCLUDE inhabituel du rc : ajouter ici ses variables/options, rien d'autre) ---
+BORG_CMD='/usr/local/bin/borg'    # = BORG_EXE du rc : UN mot, chemin absolu, le même partout (plusieurs mots : voir la doc)
+ENV_OK=' BORG_REPO BORG_RSH BORG_EXIT_CODES BORG_RELOCATED_REPO_ACCESS_IS_OK BORG_SHOW_SYSINFO '   # préfixe « exec env »
+OPT_FLAGS=' --log-json --json --debug -v --stats --list --show-version --exclude-caches --exclude-nodump --keep-exclude-tags '
+OPT_ARGS=' --exclude --exclude-if-present '      # options suivies d'une valeur (EXCLUDE du rc)
+RSH_OPTS=' BatchMode=yes StrictHostKeyChecking=yes UserKnownHostsFile=/dev/null GlobalKnownHostsFile=/dev/null IdentitiesOnly=yes '
+# PLANCHER EN DUR : refusé quelles que soient les listes ci-dessus (variables et options qui exécutent une commande, chargent une
+# configuration ou lisent le secret ailleurs)
+FLOOR_ENV=' BORG_PASSCOMMAND BORG_NEW_PASSCOMMAND BORG_PASSPHRASE_FD BORG_NEW_PASSPHRASE BORG_PASSPHRASE BORG_LOGGING_CONF BORG_REMOTE_PATH '
+FLOOR_OPT=' --paths-from-command --content-from-command --paths-from-stdin --remote-path '
+# ------------------------------------------------------------------------------------------------------------------
+
+_lc_set=${LC_ALL+x}; _lc=${LC_ALL-}; LC_ALL=C      # locale C pour le garde et ses outils seulement (restaurée avant l'exec)
+sed()  { LC_ALL=C command sed "$@"; }
+grep() { LC_ALL=C command grep "$@"; }
+tr()   { LC_ALL=C command tr "$@"; }
+( set +B ) 2>/dev/null && set +B                    # pas de développement des accolades (bash)
+deny() {
+    # la sonde de borgHelperWWW (commande « true », toutes les 30 s) est refusée en silence
+    [ "$c" = true ] && exit 126
+    echo "borg-pull-guard: refusé ($1)" >&2
+    command -v logger >/dev/null 2>&1 && logger -t borg-pull-guard -p auth.warning "refusé ($1)" 2>/dev/null
+    exit 126
+}
+# --rsh / BORG_RSH : « ssh » suivi de mots EXACTS : -o <option de RSH_OPTS>, -o HostKeyAlias=borghelper-<nom>, -o <KnownHostsCommand
+# de borgHelper>, -i <chemin>, -p <port> ; rien d'autre (ni -E, -F, -J, ni un autre -o)
+inlist() { case $1 in ""|*" "*) return 1;; esac; case $2 in *" $1 "*) return 0;; esac; return 1; }
+rsh_ok() {
+    case $1 in "ssh "*) ;; *) return 1;; esac
+    q="'"; qdq="'\"'\"'"
+    khc="${q}KnownHostsCommand=/bin/sh -c ${qdq}for l do echo \"\\\$l\"; done${qdq} sh( ${qdq}[a-z0-9._-]+ [a-z0-9@._-]+ [A-Za-z0-9+/=]+${qdq})+${q}"
+    case $1 in *KHC*) return 1;; esac
+    r=$(printf '%s' "$1" | sed -E "s#${khc}#KHC#g; s#'(~[A-Za-z0-9_./@+:,=-]*)'#\\1#g") || return 1
+    if printf '%s' "$r" | grep -q '[^]A-Za-z0-9 _./@%+:,=~-]'; then return 1; fi
+    set -- $r
+    shift                                   # « ssh »
+    while [ $# -gt 0 ]; do
+        case $1 in
+        -o) [ $# -ge 2 ] || return 1
+            case $2 in
+            KHC) ;;
+            HostKeyAlias=borghelper-?*) case ${2#HostKeyAlias=borghelper-} in *[!a-z0-9._-]*) return 1;; esac;;
+            *) inlist "$2" "$RSH_OPTS" || return 1;;
+            esac
+            shift 2;;
+        -i) [ $# -ge 2 ] || return 1
+            case $2 in -*) return 1;; esac
+            shift 2;;
+        -p) [ $# -ge 2 ] || return 1
+            case $2 in *[!0-9]*) return 1;; esac
+            shift 2;;
+        *) return 1;;
+        esac
+    done
+    return 0
+}
+c=${SSH_ORIGINAL_COMMAND-}
+[ -n "$c" ] || deny "commande vide"
+# 1. SSH_ENV = commande : passphrase lue sur l'entrée, comme borgHelper l'écrit
+pre='IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; '
+pw=0
+case $c in "$pre"*) c=${c#"$pre"}; pw=1;; esac
+# 2. valeurs BORG_* dans la commande (SSH_REPO_USER, BKP_PULL = direct, SSH_ENV = commande)
+envmode=0
+case $c in "exec env "*) c=${c#"exec env "}; envmode=1;; esac
+# 3. analyse lexicale : une fois ôtés les segments '…' et "…" (sans $, accent grave ni \ ; l'écriture de shlex.quote en fait partie),
+#    il ne reste que des mots sûrs
+t=$(printf '%s' "$c" | tr '\n' '\001' | sed -E "s/'[^']*'|\"[^\"\$\`\\\\]*\"//g")
+if printf '%s' "$t" | grep -q '[^]A-Za-z0-9 _.,:@%+=/*?~{}[-]'; then deny "caractère hors des mots admis"; fi
+# 4. découpage en mots, sans développement (noglob)
+set -f
+( eval "set -- $c" ) 2>/dev/null || deny "syntaxe"
+eval "set -- $c"
+# 5. variables, commande, « create », options — chaque mot doit être sur la liste
+state=env; got=; want=$BORG_CMD; prev=; npos=0
+for w do
+    case $state in
+    env)
+        case $w in BORG_*=*) if [ $envmode = 1 ]; then
+            n=${w%%=*}; case $n in *[!A-Z0-9_]*) deny "variable";; esac
+            case $FLOOR_ENV in *" $n "*) deny "variable $n";; esac
+            case $ENV_OK in *" $n "*) ;; *) deny "variable $n";; esac
+            if [ "$n" = BORG_RSH ]; then rsh_ok "${w#*=}" || deny "BORG_RSH"; fi
+            continue
+        fi;; esac
+        state=cmd;;
+    esac
+    case $state in
+    cmd)
+        case $w in *" "*) deny "commande";; esac
+        got=${got:+$got }$w
+        if [ "$got" = "$want" ]; then state=create
+        else case "$want " in "$got "*) ;; *) deny "commande ($w)";; esac; fi
+        continue;;
+    create)
+        [ "$w" = create ] || deny "sous-commande borg ($w)"
+        state=opts; continue;;
+    opts)
+        case $prev in
+        --rsh)     rsh_ok "$w" || deny "--rsh"; prev=; continue;;
+        --comment) case $w in "borgHelper run "*) v=${w#borgHelper run } ;; *) deny "--comment";; esac
+                   case $v in *[!0-9a-f]*) deny "--comment";; esac
+                   [ ${#v} -eq 32 ] || deny "--comment"; prev=; continue;;
+        --filter)  [ "$w" = CE ] || deny "--filter"; prev=; continue;;
+        -*)        case $w in -*|*::*) deny "valeur de $prev";; esac; prev=; continue;;   # valeur d'une autre option de OPT_ARGS
+        esac
+        case $w in
+        --comment|--rsh|--filter) prev=$w;;
+        --exclude=*|--exclude-if-present=*) inlist "${w%%=*}" "$OPT_ARGS" || deny "option ${w%%=*}";;
+        -*) for f in $FLOOR_OPT; do case $f in "${w%%=*}"*) deny "option ${w%%=*}";; esac; done   # plancher, abréviations comprises
+            if inlist "$w" "$OPT_ARGS"; then prev=$w; elif inlist "$w" "$OPT_FLAGS"; then :; else deny "option $w"; fi;;
+        *)  npos=$((npos+1))
+            if [ $npos = 1 ]; then
+                case $w in ::?*) ;; *) deny "nom d'archive";; esac
+                case $w in *[!A-Za-z0-9._{}:%+@-]*) deny "nom d'archive";; esac
+            else case $w in *::*) deny "chemin";; esac; fi;;
+        esac;;
+    esac
+done
+[ "$state" = opts ] && [ -z "$prev" ] && [ "$npos" -ge 2 ] || deny "pas un borg create complet"
+# 6. environnement reçu par SendEnv : BORG_RSH éventuel vérifié ; il ne reste que BORG_REPO, BORG_PASSPHRASE, BORG_EXIT_CODES, BORG_RSH
+if [ -n "${BORG_RSH+x}" ]; then rsh_ok "$BORG_RSH" || deny "BORG_RSH reçu"; fi
+for v in $(env | sed -n 's/^\(BORG_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case " BORG_REPO BORG_PASSPHRASE BORG_EXIT_CODES BORG_RSH " in *" $v "*) ;; *) unset "$v";; esac
+done
+if [ $pw = 1 ]; then IFS= read -r BORG_PASSPHRASE || exit 2; export BORG_PASSPHRASE; fi
+if [ -n "$_lc_set" ]; then LC_ALL=$_lc; export LC_ALL; else unset LC_ALL; fi   # la locale d'origine, pas celle du garde
+exec env "$@"
+```
+
+Étapes : (1) préfixe de la passphrase (SSH_ENV = commande), relue sur l'entrée APRÈS validation ; (2) préfixe `exec env` ; (3) analyse
+lexicale : ôtés les segments `'…'` et `"…"` (sans `$`, accent grave ni `\` ; l'écriture de `shlex.quote` en fait partie), il ne reste
+que des mots d'un jeu de caractères sûr, sinon refus ; (4) découpage en mots par `eval` sans développement (`set -f`, `set +B` contre
+les accolades de bash), possible parce que (3) a écarté tout ce qui s'exécute ; (5) un automate qui compare chaque mot aux listes :
+variables (nom en `[A-Z0-9_]`, hors plancher, dans `ENV_OK`), commande (`BORG_CMD`), `create`, puis chaque option, chaque valeur
+(`--comment` : `borgHelper run <32 hexa>` ; `--filter` : `CE` ; `--rsh` : `rsh_ok`), le nom d'archive (`::…`, seulement au premier
+positionnel) et au moins un chemin ; un mot qui contient une espace n'est jamais une entrée de liste ; (6) un `BORG_RSH` reçu par
+`SendEnv` est vérifié comme `--rsh`, puis les `BORG_*` reçus sont réduits à `BORG_REPO`, `BORG_PASSPHRASE`, `BORG_EXIT_CODES`, `BORG_RSH`
+(tout autre `BORG_*` reçu est retiré ; le reste de l'environnement est celui de sshd). La locale `C` du garde n'est donnée qu'à ses outils (`sed`, `grep`, `tr`) : celle d'origine de
+l'environnement est restaurée avant l'`exec`. `~` dans un `-i` (clé `SSH_REPO_KEY = ~/…`, que `shlex.quote` met entre apostrophes)
+est admis. La commande `true` (sonde de borgHelperWWW, `GET /bkp/probe`) est refusée en silence : mesuré, la sonde rend `joignable`
+(code 126, ≠ 255) sans une ligne du garde dans le journal ; le sshd de C journalise quand même chaque session.
+
+### Ce que le garde accepte et refuse (mesuré)
+
+Toutes les sorties citées sont dans `work/s120/out/` (fichier `.txt` : sortie et, en dernière ligne, le code de sortie du script ;
+`work/s120/out/scripts/` : les scripts qui les ont produites). Ce dossier est sous `_bmad-output` : **preuves hors dépôt**.
+
+- **Accepte** : les 13 formes ci-dessus, chacune exécutée de bout en bout (vrai borg, archive créée, code 0 ; `t2_forms.txt`), avec
+  `BORG_CMD` = le `BORG_EXE` du rc ; un `--rsh` de la seule forme construite par borgHelper (`-o` fixes de `RSH_OPTS`,
+  `HostKeyAlias=borghelper-<nom>`, `KnownHostsCommand` de borgHelper, `-i <chemin>` y compris `~`, `-p <port>`) ; les options et valeurs
+  de `OPT_FLAGS` / `OPT_ARGS` ; des segments entre apostrophes ou guillemets doubles sûrs, de tout contenu.
+- **Refuse** : 88 cas (78 refus, 10 acceptés), `t2_refus.txt` par un vrai ssh vers un sshd dont c'est la commande forcée (aucun des
+  fichiers pièges créés) et `g_shells.txt` sans sshd, mêmes décisions sous `dash`, `bash`, `bash --posix` et `busybox sh` : commande
+  vide ; toute autre sous-commande de borg ou option globale ; un autre exécutable, ou le nom nu de borg au lieu de son chemin
+  absolu ; les opérateurs et développements du shell hors segments sûrs ; toute option de `borg create` hors liste, y compris par
+  abréviation (borg 1.2.6 accepte `--remote-pa` : code 1, il atteint la lecture des chemins, alors que `--rem` est ambigu, code 2 ;
+  `t8_misc.txt`) ; une option de `ssh` hors liste dans `--rsh` ou `BORG_RSH` (fichiers de configuration, de clés d'hôte ou de
+  journal autres, commandes, saut, `StrictHostKeyChecking` différent, alias de clé d'hôte étranger, jeton interne `KHC` écrit tel
+  quel) ; toute variable hors `ENV_OK` ; un mot à espace ; `::` ailleurs qu'au nom d'archive.
+- **Plancher et listes éditables** (`g_shells.txt`) : chaque option ou variable hors liste est refusée, puis acceptée une fois ajoutée
+  à sa liste (`RSH_OPTS`, `OPT_FLAGS`, `OPT_ARGS`, `ENV_OK`, avec `BORG_KEY_FILE` comme variable d'essai) — sauf le plancher : 18 ajouts
+  refusés malgré la liste, soit les sept variables du plancher, ses quatre options (la forme `--remote-path` aussi en `OPT_ARGS`) et
+  six abréviations (`--paths-from-comm`, `--content-from-c`, `--paths-from-s`, `--remote-pa` dans les deux listes).
+- **Environnement reçu** (`g_shells.txt`) : avec onze `BORG_*` reçus (dont `BORG_LOGGING_CONF`, `BORG_BASE_DIR`, `BORG_SECURITY_DIR`,
+  `BORG_PASSCOMMAND`, `BORG_REMOTE_PATH`, `BORG_KEY_FILE`), borg ne voit que `BORG_EXIT_CODES`, `BORG_PASSPHRASE`, `BORG_REPO` ; sa
+  `LC_ALL` est celle d'origine (absente ou `fr_FR.UTF-8`) ; `/srv/{a,b}` reste UN mot sous les quatre shells. Les huit combinaisons : OK.
+- **Fuzz** : 12 000 commandes obtenues par mutation des 13 commandes réelles (graines 1 à 3, `g_fuzz_1.txt` à `g_fuzz_3.txt`) ; 807
+  acceptées, 0 hors liste blanche selon un modèle indépendant écrit en Python sur l'argv et l'environnement reçus par un borg factice.
+- **Limites du garde** :
+  - il borne la COMMANDE, pas ce qu'elle sauvegarde ni où elle l'écrit : S choisit les chemins, le dépôt (`BORG_REPO` : tout dépôt
+    ssh, ou un chemin local de C), `BORG_EXIT_CODES` et le nom d'archive ; un sshd de C qui tourne en root reste exposé à tout
+    défaut du garde ;
+  - **chemins explicites** : le garde ne développe pas les motifs (`/etc/ss*_config` arrive littéralement à borg, qui n'en trouve pas
+    et avertit : la racine manque, sans refus) — `BORG_ROOTBKP` liste des chemins explicites ; les `*` d'un `EXCLUDE` sont des motifs
+    de borg, pas de shell ;
+  - **`BORG_RSH` du rc** : seuls des `-o Clé=valeur` d'un mot, `-i`, `-p` s'ajoutent (`-J`, `-l`, `-4`, `-C` ou un `-o 'Clé valeur'`
+    ne s'ajoutent à aucune liste) ; la grammaire admet aussi un sous-ensemble des `-o` fixes (sans épinglage), des répétitions et un
+    alias de `KnownHostsCommand` différent de `HostKeyAlias` : même effet que la forme `direct` sans `BORG_RSH` ;
+  - **`BORG_KEY_FILE`** : absente d'`ENV_OK` ; en `SSH_ENV = sendenv` elle est de toute façon retirée (seules quatre variables
+    survivent) ; elle exige `SSH_ENV = commande` ET son ajout à `ENV_OK`. **`BORG_REMOTE_PATH`** est au plancher (comme
+    `--remote-path`) : le garde la refuse toujours, une seule forme de borg du client : `BORG_CMD` ;
+  - **`BORG_CMD`** : UN mot recommandé ; plusieurs mots admis par le code, refusés par les lectures locales de S ;
+  - la dépendance à la forme exacte des commandes de borgHelper : après une mise à jour de borgHelper sur S, refaire le premier test du
+    README ; symptôme d'un refus : Bkp en échec, `borg-pull-guard: refusé (…)` dans la sortie, code 126.
+
+### Comportements mesurés (banc de test)
+
+Banc : trois sshd d'utilisateur sur `127.0.0.1` (S : dépôt et déclencheur, 22120 ; rendez-vous de l'option B, 22122 ; bastion, 22123)
+et un pour C (22121), `-f` dédié, clés d'hôte du banc, PID vérifié à l'arrêt ; un seul compte (`root` et les comptes `bhtrigger`,
+`bhtunnel`, `bhjump`, `bhpull` y sont des clés et des blocs `Match User <compte du banc>` distincts) ; ports 22/2201/8022 du
+README = 22120-22123/2201/8022 ; `~/.ssh` de ce compte jamais lu ni écrit (config ssh par `-F`), `known_hosts` du banc ; borg 1.2.6
+par un wrapper `BORG_EXE` unique (BORG_BASE_DIR du banc, pauses pilotées par fichiers drapeau) ; `sudo` remplacé par un script qui vide
+l'environnement. Sentry neutralisé. Avant/après : `~/.ssh` (listing et empreintes), 36/37 entrées borg, `sshd_config` : identiques.
+Sorties et scripts : voir « Ce que le garde accepte et refuse » (preuves hors dépôt).
+
+| Situation | Résultat (fichier de sortie) |
+|---|---|
+| A nominal | Bkp complet, JSON renvoyé à C, code 0, port 2201 libéré, aucun verrou de dépôt, `bkp_status` `success` (`t3_a`) |
+| A : commande envoyée par le client | ignorée (commande forcée) ; un Bkp part quand même (`t3_a`, A1b) |
+| A : `RemoteForward` d'un autre port que `permitlisten` | `Error: remote port forwarding failed for listen port 2202`, 255, aucun Bkp ; avec `ExitOnForwardFailure no` : Bkp lancé, `[ABSENT]` code 1 (`t3_a`) |
+| `RemoteForward` sans adresse explicite | sshd écoute `127.0.0.1` ET `[::1]` (`t4_c3`) ; avec un autre processus qui tient déjà 2201 sur `127.0.0.1`, le déclencheur ne s'arrête pas : le Bkp part, le pull atteint l'occupant, refus de clé d'hôte, échec code 2 (`t3_a`, A3c) ; avec `127.0.0.1:2201` : 255, aucun Bkp (`t3_a`, A3) |
+| port 2201 pris par un sshd à clé étrangère, sans `ExitOnForwardFailure` | le pull l'atteint : `REMOTE HOST IDENTIFICATION HAS CHANGED`, Bkp en échec (code 2), aucune archive (`t3_a`) |
+| A : `ssh -N` avec la clé du déclencheur (`-R 127.0.0.1:2201`, `localhost:`, `0.0.0.0:`, `[::]:`, `permitlisten="2201"`) | port monté (4/4), aucun Bkp lancé : archives inchangées (`t3_a`, A2c) ; la commande forcée ne tourne que pour une session avec commande (déduit) : sans `ssh -N`, un Bkp part (A1b) |
+| A : 2e déclenchement pendant qu'un Bkp tient le port 2201 | pas mesuré tel quel ; le cas mesuré est un port 2201 déjà pris (autre processus ou autre tunnel) : 255 `remote port forwarding failed for listen port 2201`, aucun Bkp, le premier tunnel reste monté (`t3_a`, A3 ; `t3_b`, B3) — le 2e déclenchement échoue donc de la même façon (déduit) |
+| A/B : client absent | `[ABSENT] … Connection refused`, code 1, `bkp_status` `absent` (`t3_a`, `t3_b`) |
+| B nominal, 3 Bkp à la suite sur le même tunnel | codes 0, 0, 0 (`t3_b`) |
+| B : 2e tunnel sur 2201 / autre port | 255 `remote port forwarding failed` ; le premier reste monté (`t3_b`) |
+| B par un bastion | Bkp complet réussi ; tunnel absent `[ABSENT]` (« Connection closed by UNKNOWN port 65535 ») ; clé de saut : autre port refusé, commande refusée (`t3_bastion`) |
+| clé du tunnel, `Match` (`AllowTcpForwarding remote`, `ForceCommand nologin`) | `-R 2201` monté, `-L` `administratively prohibited`, commande `This account is currently not available.`, autre port refusé (`t3_keys`, V1) |
+| même clé sans `Match` | `-L` vers C accepté, commande exécutée (V2) |
+| même clé avec `permitopen="none"` | clé refusée par OpenSSH 8.9 (V3) |
+| sans `port-forwarding` / sans `permitlisten` | `-R` refusé / tout port accepté (V4, V5) |
+| `ForceCommand nologin` | propre à la clé du tunnel ou du saut : sur le déclencheur il empêcherait le Bkp |
+| clé du pull sans `AllowTcpForwarding remote` dans le `Match` de C | la clé ouvre un `-L` vers l'intérieur de C (la bannière du sshd de C est reçue) ; avec la directive : `administratively prohibited`, et un Bkp complet réussit quand même, donc le pull (`-R` du client) n'est pas gêné (`t7_pullkey`) |
+| clé du pull : `from=` | autre source (`127.0.0.2`) refusée ; journal « not from a permitted host » (`t4_c`) |
+| clé du pull : `permitlisten="8023"` / sans `port-forwarding` / sans `permitlisten` | Bkp en échec `remote port forwarding failed for listen port 8022` / idem / réussi (`t4_c`, `t4_c3`) |
+| `ExitOnForwardFailure` absent de la config du pull | même échec, message « Connection refused » côté borg (`t4_c2`) |
+| `known_hosts_clients` vide / clé étrangère / une seule des deux clés de C | TOFU (ligne écrite) / `Host key verification failed`, échec / réussi (`t4_c`) |
+| sshd de C sans `AcceptEnv` : `SSH_ENV = sendenv` / `commande` | `NoPassphraseFailure`, échec / réussi (`t4_c`) |
+| `AcceptEnv` restreint dans un `Match Address … User …` | seules `BORG_PASSPHRASE`, `BORG_REPO`, `BORG_EXIT_CODES` arrivent (`t1_releve`) ; `SetEnv PATH` dans le même bloc honoré (13 formes, `t2_forms`) |
+| client tué (SIGKILL) pendant le transfert | tout s'arrête en ≤ 2 s (échantillonnage toutes les 2 s), Bkp en échec, ni borg resté, ni verrou, aucune archive (`t3_cut_A_pendant`, `t3_cut_B_pendant`) ; coupé avant le premier octet de borg (pause artificielle de 25 s du wrapper du banc, processus du banc seuls comptés) : borgHelper et le pull disparaissent aussitôt, Bkp en échec (`bkp_status = error`) ; le wrapper de C finit sa pause, lance `borg create`, qui s'arrête en moins de 2 s : aucune archive, aucun verrou (`t3_cut_A_avant`) |
+| ssh du client gelé (veille sans fermeture TCP) pendant le transfert | tout s'arrête à ≈ 150 s (`ClientAlive*` de S et de C), Bkp en échec (`t3_freeze_A`, `t3_freeze_B` : le « borgHelper (S) vivant à +300 s » de ce dernier est un processus défunt, `<defunct>`, non récolté par le script de mesure ; ce même run compte une archive de plus après la coupure, nature non vérifiée — probablement un checkpoint de borg) ; sans `ClientAlive*` sur C, borgHelper et le pull finissent aussi à +151 s mais le `borg create` de C reste vivant (encore là à +450 s) (`t3_freeze_A_nocac`) |
+| tunnel gelé puis Bkp lancé par S | `[ABSENT]` après ≈ 30 s (`t3_stale_bkp`) ; reprise du port par un nouveau tunnel : ≈ 154 s, boucle de reprise toutes les 10 s (`t3_stale`) |
+| option A, client coupé pendant l'Index de fin | sans redirection : Bkp enregistré en échec (`bkp_status = error`) alors que l'archive existe (3/3 ; la notification d'échec en découle : déduit) ; `2>>log` : succès (3/3), `BrokenPipeError` dans le journal à l'impression finale du JSON ; `>>log 2>&1` : succès (3/3), aucune trace ; témoin sans coupure : succès (`t3_index_*`) |
+| `--append-only` | `borg delete` d'un client réussit et l'archive disparaît de la liste ; `prune --keep-last 1` rend 0 mais n'a rien supprimé dans ce scénario (`t5_append`) |
+| dépôt créé par `Init` | répertoire en `drwx------`, `config` en `-rw-------` (`t8_misc`) |
+| `BORG_RSH` en `[DEFAULT]` ou `SSH_REPO` | `Status` n'affiche plus la ligne « Bkp tiré, borg du client » (`t8_misc`, une fois un Bkp fait) |
+| modes 2 et 3 | `BORG_EXE` d'UN mot (chemin absolu) : Bkp complet avec Index sur S, lectures locales réussies, garde de même `BORG_CMD` (`t4_modes`) |
+| `BORG_EXE = sudo -n borg` (garde à `BORG_CMD` de trois mots, faux `sudo`) | Bkp réussi (formes `*_sudo` de `t2_forms`) mais `[WARN] indexation post-backup échouée`, `Index` : `FileNotFoundError` (`t4_modes`) |
+| clé du pull sans `port-forwarding` ni `permitlisten`, Bkp `direct` | réussi (`t6_first`) |
+| premier test du README (`ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -i … <compte>@portable1-pull`) | `borg-pull-guard: refusé (commande vide)`, code 126 ; `known_hosts_clients` vide : `Host key verification failed` ; tunnel absent : connexion refusée (`t6b_firsttest`) |
+| sonde `_pull_probe` de borgHelper | `joignable`, code 126, aucune ligne du garde (le sshd de C journalise la session) (`t6_first`) |
+
+Non vérifié (pas de root au banc) : `sudo` réel et sudoers, `setcap` (et l'héritage des capacités par `ssh`, déduit du noyau), `PermitRootLogin
+forced-commands-only`, `StrictModes` avec de vrais comptes, propriétaire du dépôt avec un compte `borg` distinct, exécution des unités systemd
+(syntaxe : `systemd-analyze verify`), `visudo`/`logrotate`, sshd sur le port 22, OpenSSH autre que 8.9p1, borg autre que 1.2.6.
+
+### Comptes du pull sur le client (modes 1, 2 et 3)
+
+Trois façons de donner à `borg create` le droit de tout lire sur C ; ce qui change par rapport aux étapes 1 à 7 du README :
+
+1. **`root`** (défaut, ci-dessus). Le plus simple, le plus puissant : un défaut du garde donne root sur C.
+2. **Compte dédié `bhpull` + sudo.**
+   - Sur C : `useradd -m -s /bin/sh bhpull` ; `install -d -m 700 -o bhpull -g bhpull /home/bhpull/.ssh` ; la clé du pull va dans
+     `/home/bhpull/.ssh/authorized_keys` (même ligne, même garde) ; la clé du dépôt est CRÉÉE pour `bhpull` :
+     `sudo -u bhpull ssh-keygen -t ed25519 -N '' -C portable1-repo -f /home/bhpull/.ssh/id_borg_repo` ; dans le sshd de C,
+     `Match Address 127.0.0.1,::1 User bhpull` (au lieu de `User root`) ; `PermitRootLogin` inutile.
+   - Rc de S : `SER_LOGIN = bhpull`, `SSH_REPO_KEY = /home/bhpull/.ssh/id_borg_repo`, `BORG_EXE = /usr/local/bin/borg-pull` ;
+     `BORG_CMD='/usr/local/bin/borg-pull'` dans le garde.
+   - **`BORG_EXE` : UN mot, chemin absolu, présent sur S ET sur C** (le cron n'a pas `/usr/local/bin` dans son `PATH`) : plusieurs
+     mots (`sudo -n borg`) cassent les lectures locales de S (voir « Comportements constatés de borgHelper »). Deux scripts de même chemin :
+
+     ```sh
+     #!/bin/sh
+     # sur C : /usr/local/bin/borg-pull  (0755)
+     exec sudo -n /usr/local/bin/borg "$@"
+     ```
+
+     ```sh
+     #!/bin/sh
+     # sur S : /usr/local/bin/borg-pull  (0755)
+     exec /usr/local/bin/borg "$@"
+     ```
+
+   - Sudoers de C (non vérifié : un faux `sudo` à `env_reset` + `env_keep` l'a remplacé au banc) :
+
+     ```
+     Defaults:bhpull env_keep += "BORG_REPO BORG_PASSPHRASE BORG_EXIT_CODES BORG_RELOCATED_REPO_ACCESS_IS_OK"
+     bhpull ALL=(root) NOPASSWD: /usr/local/bin/borg create *
+     ```
+
+     `sudo` retire `BORG_RSH` : `--rsh` (argument de `borg create`) garde l'épinglage de la clé d'hôte (déduit de 1.0.216, mesuré avec
+     un environnement vidé). Sudoers ne borne pas les arguments de borg : `bhpull` vaut root, le garde reste la seule barrière.
+3. **Compte dédié `bhpull` + capacités.** Comme le mode 2, sans sudo :
+   - un exécutable ELF dédié `/usr/local/bin/borg-dac` avec `setcap cap_dac_read_search+ep` (non vérifié) : le borg de paquet (un
+     script Python) ne convient pas, Linux ignore les capacités d'un script ; un binaire autonome peut convenir, sous réserve de son
+     extraction à l'exécution (non vérifié) ;
+   - `BORG_EXE = /usr/local/bin/borg-dac` (sur S, un lien vers `borg`) et `BORG_CMD` identique ;
+   - `ssh`, lancé par borg, n'hérite pas de la capacité (déduit) : la clé `id_borg_repo` doit être lisible par `bhpull` (comme ci-dessus).
+
+Mesuré pour les modes 2 et 3 : un Bkp complet avec Index de fin sur S avec un `BORG_EXE` d'UN mot et le garde de même `BORG_CMD` ;
+sudo et setcap eux-mêmes ne le sont pas.
+
+### Comportements constatés de borgHelper (non corrigés)
+
+- `BORG_EXE` de plusieurs mots : valable dans la commande distante seulement ; les lectures locales (Index, Prune…) lancent la valeur
+  comme UN seul argument (`FileNotFoundError: 'sudo -n borg'`).
+- Option A : un message écrit sur une session fermée pendant l'Index de fin fait enregistrer le Bkp en échec alors que l'archive existe ;
+  avec la sortie redirigée, l'impression finale du JSON lève `BrokenPipeError` (`borgHelper` `backup()`, `print(json.dumps(out…))`),
+  non rattrapée.

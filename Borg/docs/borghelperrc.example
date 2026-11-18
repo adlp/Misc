@@ -102,9 +102,20 @@ BORG_PASSPHRASE = change-moi-une-vraie-passphrase-longue
 ;SSH_REMFO = 8022:localhost:22
 ; Variables BORG_* du borg distant d'un Bkp tiré (borgHelper >= 1.0.213) : sendenv (défaut, ssh -o SendEnv BORG_*,
 ; il faut AcceptEnv BORG_* côté sshd) ou commande (dans la commande distante, passphrase sur l'entrée de ssh ; shell distant
-; POSIX, incompatible avec une clé à commande forcée ; les autres valeurs BORG_* deviennent visibles dans ps :
-; aucun secret dans BORG_RSH & co) :
+; POSIX ; une clé à commande forcée côté client doit accepter ce préfixe (garde donné dans TECHNICAL.md, « Bkp tiré : garde
+; de la clé du pull ») ; les autres valeurs BORG_* deviennent visibles dans ps : aucun secret dans BORG_RSH & co) :
 ;SSH_ENV = commande
+;
+; Client à IP flottante, derrière un NAT ou un bastion (personne ne peut appeler le client : c'est lui qui ouvre la connexion) —
+; deux montages par configuration, voir README « Bkp tiré : client à IP flottante, derrière NAT ou bastion » : (A) le client
+; déclenche son Bkp (clé à commande forcée + tunnel le temps du Bkp), (B) tunnel inverse permanent. Dans ce rc : SER_NAME = alias du
+; ~/.ssh/config de CE serveur (HostName 127.0.0.1, Port <port du client sur le rendez-vous>, HostKeyAlias <client>, clé d'hôte du client
+; pré-enregistrée), SSH_REMFO = 8022:localhost:22, SSH_REPO_USER (+ SSH_REPO_KEY), BORG_ARCHNAME = ::<nom> ({fqdn} d'un portable
+; change avec le réseau). SER_LOGIN = compte du pull sur le client ; SSH_REPO_KEY = chemin de la clé du dépôt SUR LE CLIENT ;
+; en tunnel, ni BORG_RSH ni SSH_REPO dans le rc (ils désactivent la construction en silence ; BKP_PULL = direct exige SSH_REPO).
+; BORG_EXE = UN mot, chemin absolu, le même sur ce serveur et sur le client et dans BORG_CMD du garde (« sudo -n borg » en plusieurs
+; mots casse les lectures locales). Côté client, la clé du pull
+; porte une commande forcée (garde donné dans TECHNICAL.md) et un sshd à AcceptEnv restreint.
 
 ; ── Identification et sélection des archives ───────────────────────────────
 ; Nom court affiché/utilisé (sert aussi à dériver GLOB_ARCH si absent) :

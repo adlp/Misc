@@ -294,6 +294,11 @@ Où tourne le `borg create` d'un Bkp, et comment il joint le dépôt :
 | **tiré, direct** | `BKP_PULL = direct` + `SSH_REPO` | `ssh … SER_LOGIN@SER_NAME`, **sans `-R`** | sur `SER_NAME` | `SSH_REPO`, joint directement par le client |
 
 Dans les trois modes, `BORG_REPO` reste le dépôt vu par CE serveur : lectures, Index de fin, Prune, Report, BkpReconcile.
+
+> **Client à IP flottante, derrière un NAT ou un bastion** (personne ne peut appeler le client) : voir [Bkp tiré : client à IP flottante,
+derrière NAT ou bastion](#bkp-tiré--client-à-ip-flottante-derrière-nat-ou-bastion) — configurations complètes (le client déclenche
+son Bkp, ou tunnel inverse permanent), comptes du client, garde de la clé du pull.
+
 **`SSH_REPO` seul** (sans `SSH_REMFO` ni `BKP_PULL`) ne lance PAS borg sur `SER_NAME` : borg tourne ici avec
 `BORG_REPO=SSH_REPO` (comportement inchangé, à l'identique ; l'ancien exemple de `docs/borghelperrc.example` laissait croire le
 contraire).
@@ -398,9 +403,14 @@ comme toute clé du rc : `ssh_env = commande` est ignorée sans message) :
 Limites de `commande` :
 - shell du compte distant POSIX (`sh`, `bash`, `dash`, `ksh`, `zsh` — pas `csh` ni `fish`) et non restreint (`rbash` interdit
   `exec` : le Bkp échoue) ;
-- incompatible avec une clé à commande forcée (`command="…"` dans `authorized_keys`) : sshd exécute la commande forcée à la place
-  de la commande envoyée, le préfixe n'est pas exécuté et borg ne reçoit rien — rester en `sendenv` (avec `AcceptEnv`) ;
+- une clé à commande forcée (`command="…"` dans `authorized_keys`) : sshd exécute la commande forcée à la place de la commande
+  envoyée. Un `command="borg …"` nu ne reçoit pas le préfixe (borg ne reçoit rien) : rester en `sendenv` (avec `AcceptEnv`). Un garde
+  qui accepte `exec env …` et la lecture de la passphrase sur l'entrée, comme le garde de [TECHNICAL.md](TECHNICAL.md#bkp-tiré--garde-de-la-clé-du-pull-et-mesures-story-120),
+  convient (mesuré) ;
 - `BORG_EXE` en `sudo borg` : `sudo` (env_reset) retire les `BORG_*`, comme en `sendenv` — `commande` ne contourne pas sudo ;
+  `BORG_EXE` de plusieurs mots (`sudo -n borg`) : valable dans la commande distante seulement — les lectures locales du serveur (Index…)
+  le lancent comme UN seul argument (`FileNotFoundError`) : un script d'un mot, chemin absolu, voir
+  [comptes du pull](#comptes-du-pull-sur-le-client) ;
   `BORG_EXE` dont le premier mot contient un `=` : pris par `env` pour une affectation (le Bkp échoue) ;
 - passphrase contenant un saut de ligne, ou non encodable en UTF-8 (octets invalides donnés par `-P` ou
   `BORGHELPERC_RUNTIME_PASSPHRASE`) : refusée (`[ERREUR] <nick>: BORG_PASSPHRASE contient un saut de ligne …` ou
@@ -489,7 +499,10 @@ SSH_REPO_KEY     = /root/.ssh/id_borg_repo
   l'épinglage (mesuré au bac : environnement vidé sauf `PATH`, `LC_ALL`, `BORG_PASSPHRASE`, `BORG_REPO`, archive créée par ssh,
   clé étrangère refusée), mais `env_keep` doit garder `BORG_REPO` (et `BORG_PASSPHRASE`), sinon borg échoue, fermé (« repository
   not specified » — déduit) ; sans variable de langue UTF-8, borg 1.2.6 échoue sur une passphrase non ASCII (UnicodeEncodeError,
-  mesuré — le `env_keep` par défaut de sudo garde les variables de langue). **Commande forcée côté client** (`command="…"` dans `authorized_keys`) : une commande qui exécute
+  mesuré — le `env_keep` par défaut de sudo garde les variables de langue). `BORG_EXE` de plusieurs mots : voir [les trois comptes du pull](#comptes-du-pull-sur-le-client)
+  (un script d'un mot, chemin absolu, sur les deux machines). **Commande forcée côté client** (`command="…"` dans `authorized_keys`) : un garde
+  qui accepte `exec env …` et les valeurs entre apostrophes est donné et mesuré dans
+  [TECHNICAL.md](TECHNICAL.md#bkp-tiré--garde-de-la-clé-du-pull-et-mesures-story-120) (mise en place : [client à IP flottante](#bkp-tiré--client-à-ip-flottante-derrière-nat-ou-bastion)) ; une commande qui exécute
   `SSH_ORIGINAL_COMMAND` par un shell garde tout ; (déduit, non mesuré :) un garde qui ne relance que la partie `borg …` perd le préfixe (`BORG_REPO`
   et `BORG_RSH` ne viennent plus que de `SendEnv`) mais garde `--rsh` : l'épinglage tient, `BORG_REPO` doit alors arriver par
   `AcceptEnv` ; un garde qui refuse `exec env`, les apostrophes ou `$` refuse la commande (Bkp en échec).
@@ -601,6 +614,461 @@ alerte, notification « sauvegarde en retard », Sentry `overdue`) alerte s'il d
   bannir le serveur par le client (fail2ban, `PerSourcePenalties`), et les Bkp suivants verraient ce bannissement comme un client
   absent. Avec `--workers N`, sondes et résultats gardés sont propres à chaque processus (jusqu'à N sondes par nick et par période,
   badge qui peut différer d'une relecture à l'autre). Voir [Endpoints](#endpoints).
+
+### Bkp tiré : client à IP flottante, derrière NAT ou bastion
+
+Un client dont l'adresse change (portable, poste derrière une box ou un NAT) ne peut pas être appelé par le serveur, alors que le
+Bkp tiré ouvre un `ssh` DU serveur VERS le client : c'est le client qui doit ouvrir la connexion. Deux montages, sans rien d'autre
+à installer que borgHelper ≥ 1.0.218 ; le Bkp reste lancé et suivi par le serveur (`bkp_status`, notifications, Sentry, Index de fin) :
+
+| | **A — le client déclenche** | **B — tunnel inverse permanent** |
+|---|---|---|
+| Convient à | portable, poste rarement en ligne | poste toujours allumé, derrière un NAT ou à IP changeante |
+| Sur le client | un minuteur systemd lance un `ssh` le temps du Bkp | un `ssh -N` permanent (unité systemd `Restart=always`) |
+| Qui lance le Bkp | le client (le serveur ne le lance pas : étape 7) | le serveur : cron de borgHelper, bouton ▶ Backup |
+| Rendez-vous | port du client sur S, ouvert le temps du Bkp | port du client sur S ou sur un bastion B, ouvert en permanence |
+
+Un VPN (WireGuard, Tailscale) rend ces montages inutiles. `BKP_PULL = direct` (voir [trois
+modes](#bkp-tiré--trois-modes-bkp_pull-10218)) ne supprime que le tunnel `8022` du pull : un client à IP flottante garde le
+rendez-vous (port `2201`) de l'option A ou B.
+
+Les configurations ont été mesurées sur un banc de test (OpenSSH 8.9p1, borg 1.2.6, borgHelper 1.0.219). Le garde, les formes de
+commande, les mesures, leurs limites et leurs preuves (hors dépôt, sous `_bmad-output`) sont dans
+[TECHNICAL.md](TECHNICAL.md#bkp-tiré--garde-de-la-clé-du-pull-et-mesures-story-120). Ce que le banc n'a pas pu mesurer (pas de root)
+est marqué « non vérifié » ; « déduit » = tiré du code ou de la documentation, non mesuré.
+
+**Noms de l'exemple** : S = `bksrv.example.org`, le serveur qui exécute borgHelper et borgHelperWWW (compte `root`, dépôts sous
+`/srv/borg`) ; C = le client `portable1` ; B = `bastion.example.org` (variante bastion). Port du client sur le rendez-vous :
+**2201** (un par client) ; port du tunnel du pull sur C : **8022** (`SSH_REMFO = 8022:localhost:22`). Chemin de borg, le MÊME
+partout (S, C, commande `serve`, rc, garde, scripts) : `/usr/local/bin/borg` — à remplacer partout par `command -v borg` ; si borg
+n'est pas au même endroit sur S et sur C, créer un lien (`ln -s "$(command -v borg)" /usr/local/bin/borg`) sur la machine qui diffère. Aucune
+clé réelle : `ssh-ed25519 AAAA…`.
+
+#### Prérequis
+
+- S : borgHelper ≥ 1.0.218, OpenSSH ≥ 7.8 (`permitlisten`), borg à `/usr/local/bin/borg`.
+- C : OpenSSH ≥ 8.5 (`KnownHostsCommand` du `BORG_RSH` construit), borg 1.2 ou plus à `/usr/local/bin/borg` (version compatible avec
+  le `borg serve` de S), accès `root`, systemd pour les unités (sinon cron ou autre superviseur).
+- B (variante bastion) : OpenSSH ≥ 7.8. Option A : `sudo` sur S.
+
+#### 1. Comptes et clés
+
+Une clé par rôle, jamais réutilisée ; seules les parties publiques (`.pub`) changent de machine.
+
+| Clé | Créée sur | Autorisée sur | Permet |
+|---|---|---|---|
+| `id_bh_pull` (`SSH_KEY`) | S | C, commande forcée = le garde | lancer `borg create` sur C et ouvrir `-R 8022` |
+| `id_borg_repo` (`SSH_REPO_KEY`) | C | S, commande forcée `borg serve` | écrire dans UN dépôt |
+| `id_trigger` (A) | C | S, compte `bhtrigger`, commande forcée | lancer le Bkp de CE nick, ouvrir `-R 2201` |
+| `id_tunnel` (B) | C | S ou B, compte `bhtunnel` sans shell | ouvrir `-R 2201` |
+| `id_bh_jump` (B par un bastion) | S | B, compte `bhjump` sans shell | joindre le seul port du tunnel |
+
+```sh
+# sur S
+install -d -m 700 /root/.ssh
+ssh-keygen -t ed25519 -N '' -C bksrv-pull -f /root/.ssh/id_bh_pull
+ssh-keygen -t ed25519 -N '' -C bksrv-jump -f /root/.ssh/id_bh_jump          # variante bastion seulement
+useradd -m -s /bin/sh bhtrigger                                              # option A : shell /bin/sh OBLIGATOIRE
+useradd -m -s /usr/sbin/nologin bhtunnel                                     # option B (sur S, ou sur B pour un bastion)
+# sur B (variante bastion) : useradd -m -s /usr/sbin/nologin bhtunnel ; useradd -m -s /usr/sbin/nologin bhjump
+# sur C
+install -d -m 700 /etc/borghelper /root/.ssh
+ssh-keygen -t ed25519 -N '' -C portable1-repo    -f /root/.ssh/id_borg_repo
+ssh-keygen -t ed25519 -N '' -C portable1-trigger -f /etc/borghelper/id_trigger   # option A
+ssh-keygen -t ed25519 -N '' -C portable1-tunnel  -f /etc/borghelper/id_tunnel    # option B
+```
+
+Sur S (et B), pour chaque compte créé (`bhtrigger` : sshd lance la commande forcée par son shell, un compte en `nologin` ne
+déclenche rien) :
+`install -d -m 700 -o <compte> -g <compte> /home/<compte>/.ssh && install -m 600 -o <compte> -g <compte> /dev/null /home/<compte>/.ssh/authorized_keys`
+(non vérifié : le banc n'a qu'un compte et tourne avec `StrictModes no`).
+
+#### 2. Dépôt
+
+`borg create` du client écrit par `borg serve` ; `Init`, `Index`, `Prune` et son `compact` agissent en local sur S, en `root`. Les
+deux doivent être le MÊME propriétaire : borg crée le dépôt en `0700` (mesuré), un autre compte n'y entre plus. Retenu : dépôt à
+`root`, `borg serve` sous `root` par une clé à commande forcée (mesuré avec un compte unique ; `PermitRootLogin forced-commands-only`
+sur S : non vérifié).
+
+```sh
+install -d -m 700 /srv/borg && /usr/local/bin/borg init -e repokey /srv/borg/portable1    # ou borgHelper -c Init -n portable1 (étape 4)
+```
+
+`borg init` demande la passphrase : celle qui sera le `BORG_PASSPHRASE` du rc (étape 4).
+
+`/root/.ssh/authorized_keys` de S, avec la clé `id_borg_repo.pub` de C :
+
+```
+from="127.0.0.1,::1",restrict,command="/usr/local/bin/borg serve --restrict-to-repository /srv/borg/portable1 --append-only" ssh-ed25519 AAAA… portable1-repo
+```
+
+et dans `/etc/ssh/sshd_config` de S `PermitRootLogin forced-commands-only` (effet GLOBAL : plus d'autre accès root par mot de passe
+ni par clé sans commande forcée), puis `sshd -t && systemctl reload ssh`.
+
+- `from="127.0.0.1,::1"` convient au tunnel (le borg de C arrive par le tunnel `8022`, donc depuis S). Pour `BKP_PULL = direct`, le
+  borg de C joint S directement : retirer `from=` (l'adresse de C est flottante) et s'en tenir à `--restrict-to-repository`.
+- `--append-only` n'interdit pas `borg delete` à un client (mesuré) : surveiller les archives (`Report`, `MAX_AGE_BKP`).
+- Un compte `borg` distinct de `root` : NON TRAITÉ. Symptôme attendu (déduit) : après un `Init`, un `Index` ou un `compact` lancés en
+  `root`, le Bkp du client échoue sur un refus d'accès ; remède probable : `chown -R borg: /srv/borg/portable1`.
+
+#### 3. Côté client C
+
+**Le garde** : copier le script de [TECHNICAL.md](TECHNICAL.md#bkp-tiré--garde-de-la-clé-du-pull-et-mesures-story-120) dans
+`/usr/local/sbin/borg-pull-guard` (`root:root`, `0755`), `BORG_CMD` = `/usr/local/bin/borg` = `BORG_EXE` du rc (étape 4). Il
+n'exécute que le `borg create` de borgHelper, avec une liste blanche d'options ; `BORG_ROOTBKP` doit lister des chemins EXPLICITES
+(le garde ne développe pas les motifs `*`). Un `EXCLUDE` ou un `BORG_RSH` inhabituel du rc se déclare dans les listes en tête du
+script (TECHNICAL.md). Après une mise à jour de borgHelper sur S, refaire le premier test (étape 6).
+
+`/root/.ssh/authorized_keys` de C — la clé `id_bh_pull.pub` de S ; le sshd de C voit `127.0.0.1` comme source (le pull arrive par le
+tunnel) :
+
+```
+from="127.0.0.1,::1",restrict,port-forwarding,permitlisten="8022",command="/usr/local/sbin/borg-pull-guard" ssh-ed25519 AAAA… bksrv-pull
+```
+
+Nick en `BKP_PULL = direct` (pas de `-R 8022`) : même ligne sans `port-forwarding` ni `permitlisten`.
+
+`/etc/ssh/sshd_config` de C : directives globales AVANT tout `Match` existant, bloc `Match` en FIN de fichier ; puis
+`sshd -t && systemctl reload ssh` (`sshd` sur certaines distributions) :
+
+```
+PermitRootLogin forced-commands-only
+ClientAliveInterval 30
+ClientAliveCountMax 4
+# fin du fichier
+Match Address 127.0.0.1,::1 User root
+    AllowTcpForwarding remote
+    AcceptEnv BORG_PASSPHRASE BORG_REPO BORG_EXIT_CODES
+    # SetEnv PATH=/usr/local/bin:/usr/bin:/bin    # si les sessions de sshd ne trouvent pas ssh ou env
+```
+
+- `PermitRootLogin forced-commands-only` : global, coupe aussi les accès root par mot de passe ou par clé sans commande forcée (non
+  vérifié : pas de root au banc).
+- `AcceptEnv` ne sert qu'avec `SSH_ENV = sendenv` (défaut). Avec `SSH_ENV = commande`, tout passe par la commande distante :
+  `AcceptEnv` est inutile. Après un changement d'emplacement du dépôt, ajouter le temps du premier Bkp
+  `BORG_RELOCATED_REPO_ACCESS_IS_OK` (migration : [Bkp tiré : `BORG_REPO` et `BORG_RSH` du client
+  construits](#bkp-tiré--borg_repo-et-borg_rsh-du-client-construits-ssh_repo_user-10216)).
+- Les deux autres directives (`ClientAlive*`, `AllowTcpForwarding remote`) ferment des défauts mesurés : voir TECHNICAL.md.
+
+**Clés d'hôte de C pour S** (relevées ici, enregistrées sur S à l'étape 4, avant le premier Bkp). Sur C :
+`for f in /etc/ssh/ssh_host_*_key.pub; do echo "portable1 $(cut -d' ' -f1,2 "$f")"; done`, et noter les empreintes
+(`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`).
+
+#### 4. Côté serveur S
+
+`/root/.borghelperrc` :
+
+```ini
+[portable1]
+; lectures, Index, Prune : le dépôt local de S
+BORG_REPO          = /srv/borg/portable1
+BORG_PASSPHRASE    = …
+; chemin de borg : le MÊME sur S et sur C, identique à BORG_CMD du garde
+BORG_EXE           = /usr/local/bin/borg
+; alias de /root/.ssh/config (ci-dessous) : jamais un nom DNS
+SER_NAME           = portable1-pull
+; compte du pull SUR LE CLIENT (root, ou bhpull : « Comptes du pull »)
+SER_LOGIN          = root
+SSH_KEY            = /root/.ssh/id_bh_pull
+; tunnel du pull : le borg du client rejoint le dépôt par 127.0.0.1:8022
+SSH_REMFO          = 8022:localhost:22
+; compte du dépôt sur S et clé privée SUR LE CLIENT (lue par le ssh du borg de C)
+SSH_REPO_USER      = root
+SSH_REPO_KEY       = /root/.ssh/id_borg_repo
+; nom d'archive fixe : le {fqdn} d'un portable change avec le réseau
+BORG_ARCHNAME      = ::portable1-root
+GLOB_ARCH          = portable1-root-*
+; chemins EXPLICITES (pas de motif *) ; le shell distant découpe ces valeurs
+BORG_ROOTBKP       = /etc /home /root
+EXCLUDE            = --exclude-caches --exclude-if-present .nobackup --exclude 'sh:/home/*/.cache'
+; alerte de retard (heures) : seul signal d'un client parti longtemps
+MAX_AGE_BKP        = 48
+```
+
+- **Tunnel : ne pas poser `BORG_RSH` ni `SSH_REPO`, dans la section ou dans `[DEFAULT]`** : ils désactivent EN SILENCE la
+  construction de `BORG_REPO`/`BORG_RSH` du client (mesuré : `Status` n'affiche plus la ligne « Bkp tiré, borg du client »). Avec
+  `BORG_RSH` seul, le borg du client reçoit le chemin local de S (déduit : il échoue) ; avec `SSH_REPO`, il reçoit sa valeur.
+- `BKP_PULL = direct` : `SSH_REPO` obligatoire, `SSH_REMFO` interdite (voir [trois modes](#bkp-tiré--trois-modes-bkp_pull-10218)).
+- `BORG_KEY_FILE` du rc s'applique aussi au borg du client ; le garde la refuse tant qu'elle n'est pas ajoutée à `ENV_OK`, et elle
+  exige `SSH_ENV = commande`. `BORG_REMOTE_PATH` : le garde la refuse toujours (comme `--remote-path` ; une seule forme de borg
+  du client : `BORG_CMD`) — voir TECHNICAL.md.
+- Clé d'hôte du sshd qui reçoit le tunnel `8022` : S lui-même -> lue dans `/etc/ssh/ssh_host_*_key.pub` ; sinon
+  `SSH_REPO_HOSTKEY = ssh-ed25519 AAAA…, ecdsa-sha2-nistp256 AAAA…`.
+
+`/root/.ssh/config` de S (lu par le ssh du pull ; borgHelper pose déjà `BatchMode`, `ConnectTimeout=30` et `ServerAlive*`) :
+
+```
+Host portable1-pull
+    HostName 127.0.0.1
+    Port 2201
+    HostKeyAlias portable1
+    UserKnownHostsFile /root/.ssh/known_hosts_clients
+    IdentitiesOnly yes
+    ExitOnForwardFailure yes
+```
+
+**`/root/.ssh/known_hosts_clients` : à remplir avant le premier Bkp** avec les lignes relevées sur C (étape 3), empreintes comparées
+(`ssh-keygen -lf /root/.ssh/known_hosts_clients` sur S). Vide, la première clé vue sur le port 2201 serait acceptée (borgHelper
+impose `StrictHostKeyChecking=accept-new`) ; une clé étrangère enregistrée fait échouer le Bkp. Une seule des clés de C suffit.
+
+`borgHelperWWW` lance borgHelper sous SON compte. Pour ces nicks il doit tourner en `root` (dépôt `0700`, `SSH_KEY` et
+`known_hosts_clients` sous `/root/.ssh`) ; un compte de service est NON TRAITÉ — symptôme attendu (déduit) : Index de fin et lectures
+refusés sur le dépôt.
+
+`/etc/ssh/sshd_config` de S : `ClientAliveInterval 30`, `ClientAliveCountMax 4`, `GatewayPorts no` (défaut). Un sshd de S exposé :
+`PasswordAuthentication no`, `bhtrigger` / `bhtunnel` ajoutés à un éventuel `AllowUsers`, port ouvert au pare-feu.
+
+#### 5. Option A ou B
+
+##### Option A — le client déclenche son Bkp
+
+Sur S, `/etc/ssh/sshd_config` (bloc `Match` en fin de fichier ; `sshd -t && systemctl reload ssh`) :
+
+```
+Match User bhtrigger
+    AllowTcpForwarding remote
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTTY no
+```
+
+`/home/bhtrigger/.ssh/authorized_keys` — une ligne par client, avec `id_trigger.pub` :
+
+```
+restrict,port-forwarding,permitlisten="2201",command="sudo -n -H /usr/local/bin/borgHelper -C /root/.borghelperrc -c Bkp -n portable1 >>/home/bhtrigger/trigger.log 2>&1" ssh-ed25519 AAAA… portable1-trigger
+```
+
+`visudo -f /etc/sudoers.d/bhtrigger` (non vérifié : pas de `sudo` réel au banc ; si `requiretty` : ajouter
+`Defaults:bhtrigger !requiretty`) :
+
+```
+bhtrigger ALL=(root) NOPASSWD: /usr/local/bin/borgHelper -C /root/.borghelperrc -c Bkp -n portable1
+```
+
+`/etc/logrotate.d/borghelper-trigger` (non vérifié) :
+
+```
+/home/bhtrigger/trigger.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    su bhtrigger bhtrigger
+}
+```
+
+- `-H` et `-C` explicite : le rc et `CACHE_DIR` par défaut dépendent du dossier personnel. Le `PATH` de `sudo` doit trouver `ssh` (non
+  vérifié).
+- **Garder les deux redirections `>>… 2>&1`** : une sortie laissée sur la session fermée par une coupure pendant l'Index de fin fait
+  enregistrer le Bkp en échec alors que l'archive existe ; avec `2>>` seul, l'impression finale lève un `BrokenPipeError`
+  (détails et mesures : TECHNICAL.md). Le client ne voit que le code de sortie ; le détail est dans `trigger.log`.
+- Toute connexion de cette clé lance le Bkp de CE nick ; la commande envoyée par le client est ignorée.
+
+Sur C, `/etc/borghelper/ssh_config` :
+
+```
+Host bksrv-trigger
+    HostName bksrv.example.org
+    User bhtrigger
+    IdentityFile /etc/borghelper/id_trigger
+    IdentitiesOnly yes
+    RemoteForward 127.0.0.1:2201 127.0.0.1:22
+    ExitOnForwardFailure yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+    BatchMode yes
+    RequestTTY no
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /etc/borghelper/known_hosts
+```
+
+`/etc/borghelper/known_hosts` : une ligne `bksrv.example.org ssh-ed25519 AAAA…` (`ssh-keyscan -t ed25519 bksrv.example.org`), gardée si
+son empreinte (`ssh-keygen -lf <fichier>`) est celle de `/etc/ssh/ssh_host_ed25519_key.pub` lue sur S.
+
+- **Garder l'adresse explicite de `RemoteForward 127.0.0.1:2201`** : sans elle, sshd écoute en IPv4 ET IPv6 et
+  `ExitOnForwardFailure` ne voit pas un port IPv4 déjà pris (TECHNICAL.md).
+- C doit joindre S directement ; derrière un bastion, option B (variante bastion).
+
+Unités sur C (`systemctl daemon-reload` ; ne PAS activer le minuteur avant l'étape 7) :
+
+```ini
+# /etc/systemd/system/borghelper-trigger.service
+[Unit]
+Description=Demande de sauvegarde borgHelper à bksrv
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh -F /etc/borghelper/ssh_config bksrv-trigger
+```
+
+```ini
+# /etc/systemd/system/borghelper-trigger.timer
+[Unit]
+Description=Sauvegarde borgHelper quotidienne (déclenchée par le client)
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`Persistent=true` ne rattrape qu'un minuteur manqué machine éteinte : un portable réveillé sans réseau voit son déclenchement échouer
+(code 255) et attend le lendemain. Pour réessayer : `Restart=on-failure`, `RestartSec=15min`, `RestartPreventExitStatus=1 2` dans
+`[Service]` (non vérifié ; syntaxe vérifiée par `systemd-analyze verify`).
+
+##### Option B — tunnel inverse permanent
+
+Sur S (ou B pour un bastion), `/etc/ssh/sshd_config` (`Match` en fin de fichier, `ClientAlive*` et `GatewayPorts no` comme à l'étape 4 ;
+`sshd -t && systemctl reload ssh`) :
+
+```
+Match User bhtunnel
+    AllowTcpForwarding remote
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTTY no
+    ForceCommand /usr/sbin/nologin
+```
+
+`/home/bhtunnel/.ssh/authorized_keys` : `restrict,port-forwarding,permitlisten="2201" ssh-ed25519 AAAA… portable1-tunnel` (`id_tunnel.pub`).
+
+Sur C, `/etc/borghelper/ssh_config` (même `known_hosts` que l'option A) :
+
+```
+Host bksrv-tunnel
+    HostName bksrv.example.org
+    User bhtunnel
+    IdentityFile /etc/borghelper/id_tunnel
+    IdentitiesOnly yes
+    RemoteForward 127.0.0.1:2201 127.0.0.1:22
+    ExitOnForwardFailure yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+    BatchMode yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /etc/borghelper/known_hosts
+```
+
+```ini
+# /etc/systemd/system/borghelper-tunnel.service   (systemctl daemon-reload ; systemctl start borghelper-tunnel.service)
+[Unit]
+Description=Tunnel inverse vers bksrv (sauvegarde borgHelper)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -NT -F /etc/borghelper/ssh_config bksrv-tunnel
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Un tunnel mort sans fermeture TCP (veille, changement d'IP) garde le port 2201 sur S un peu plus de 2 min : le nouveau tunnel échoue
+puis repart tout seul (`Restart=always`) ; un Bkp lancé par S entre-temps finit `[ABSENT]` après 30 s.
+
+**Variante : rendez-vous sur un bastion B** (S ne joint pas C, mais joint B). Quatre changements :
+
+1. Sur B : le bloc sshd `bhtunnel` ci-dessus (avec `ClientAlive*`, `GatewayPorts no`) et un compte `bhjump` ; `sshd -t && systemctl reload ssh` :
+
+   ```
+   Match User bhjump
+       AllowTcpForwarding local
+       AllowAgentForwarding no
+       X11Forwarding no
+       PermitTTY no
+       ForceCommand /usr/sbin/nologin
+   ```
+
+   `/home/bhjump/.ssh/authorized_keys` : `restrict,port-forwarding,permitopen="127.0.0.1:2201" ssh-ed25519 AAAA… bksrv-jump` (`id_bh_jump.pub` de S).
+2. Sur C, le tunnel aboutit sur B : `HostName bastion.example.org` dans `/etc/borghelper/ssh_config`, et la clé d'hôte de B dans
+   `/etc/borghelper/known_hosts` (`bastion.example.org ssh-ed25519 AAAA…`, empreinte comparée comme pour S). Un bastion par client.
+3. Sur S, `/root/.ssh/config` — le `Host bastion…` est indispensable (le ssh du saut ne reçoit ni `BatchMode`, ni la clé de la
+   ligne de commande) :
+
+   ```
+   Host bastion.example.org
+       User bhjump
+       IdentityFile /root/.ssh/id_bh_jump
+       IdentitiesOnly yes
+       HostKeyAlias bastion.example.org
+       UserKnownHostsFile /root/.ssh/known_hosts_bastion
+       StrictHostKeyChecking yes
+       BatchMode yes
+       ConnectTimeout 10
+
+   Host portable1-pull
+       HostName 127.0.0.1
+       Port 2201
+       ProxyJump bastion.example.org
+       HostKeyAlias portable1
+       UserKnownHostsFile /root/.ssh/known_hosts_clients
+       IdentitiesOnly yes
+       ExitOnForwardFailure yes
+   ```
+
+4. `/root/.ssh/known_hosts_bastion` : `bastion.example.org ssh-ed25519 AAAA…` (relevé sur B, empreinte comparée).
+
+**Plusieurs clients** : une ligne par client, avec son port (2201, 2202…) et son nick, dans CHACUN de ces fichiers :
+`authorized_keys` de `bhtrigger` ou `bhtunnel` (`permitlisten`), sudoers (option A), `/root/.ssh/config` de S (un `Host <client>-pull`,
+son `Port`, son `HostKeyAlias`), `known_hosts_clients`, et un `[nick]` du rc. Une même clé jamais sur deux lignes.
+
+#### 6. Premier test
+
+1. Option B : `systemctl start borghelper-tunnel.service` sur C. Option A : sur C, `ssh -N -F /etc/borghelper/ssh_config bksrv-trigger`
+   (avec `-N`, aucun Bkp ne part) ; l'arrêter (Ctrl-C) avant le point 3. Sur S : `ss -ltn 'sport = :2201'` liste `127.0.0.1:2201`.
+2. Sur S :
+   `ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -i /root/.ssh/id_bh_pull <SER_LOGIN>@portable1-pull`
+   doit répondre **`borg-pull-guard: refusé (commande vide)`, code 126** : tunnel, clé d'hôte (`known_hosts_clients` rempli — sinon
+   `Host key verification failed`), `from=` et garde sont en place. Autre message : « Dépannage ».
+3. Option B : `borgHelper -c Bkp -n portable1` sur S. Option A : `systemctl start borghelper-trigger.service` sur C (le service, pas
+   le minuteur). Puis sur S `borgHelper -c Status -n portable1` (`BORG_REPO` et `BORG_RSH` tels que le borg du client les reçoit) et
+   `borgHelper -c Report`.
+
+#### 7. Activation
+
+- Option B : `systemctl enable --now borghelper-tunnel.service` sur C ; le Bkp part du cron de S ou du bouton ▶ Backup. Un client
+  absent donne `[ABSENT]` (code 1, ni échec ni notification de fin) ; `Bkp -n ALL` rend le pire des codes du lot.
+- Option A : `systemctl enable --now borghelper-trigger.timer` sur C. **Ne pas mettre ce nick dans le cron de S** (`-n a,b` sans lui) :
+  sans tunnel il finirait toujours `[ABSENT]`, code 1. Le bouton ▶ Backup de borgHelperWWW reste grisé hors d'un Bkp. Le garde
+  refuse en silence la sonde de borgHelperWWW (commande `true`) : aucune ligne du garde dans `journalctl -t borg-pull-guard`.
+- `MAX_AGE_BKP` reste l'alerte d'un client absent trop longtemps.
+
+#### Comptes du pull sur le client
+
+Trois façons de donner à `borg create` le droit de tout lire sur C : **1. `root`** (défaut, ci-dessus : le plus simple, le plus puissant,
+un défaut du garde donne root sur C) ; **2. compte dédié `bhpull` + sudo** ; **3. compte dédié `bhpull` + capacités** (non vérifié).
+Les modes 2 et 3 changent le compte, la clé du dépôt, le `Match` de C, le rc de S et `BORG_EXE` (un mot, chemin absolu, présent sur
+S ET sur C : plusieurs mots cassent les lectures locales du serveur) : la liste complète, les scripts et le sudoers sont dans
+[TECHNICAL.md](TECHNICAL.md#comptes-du-pull-sur-le-client-modes-1-2-et-3).
+
+#### Dépannage
+
+| Symptôme | Machine | Où regarder | Message attendu et cause |
+|---|---|---|---|
+| `[ABSENT] … Connection refused`, code 1 | S | `ss -ltn 'sport = :2201'` ; sur C `journalctl -u borghelper-tunnel` | rien n'écoute 2201 : tunnel non monté (B) ou client hors ligne (A) |
+| `[ABSENT] … Connection closed by UNKNOWN port 65535` (bastion) | S, B | `ss -ltn` sur B ; `journalctl -u borghelper-tunnel` sur C | tunnel absent sur le bastion |
+| `[ABSENT] … timed out` (après 30 s) | S, C | idem | tunnel mort sans fermeture TCP : attendre ≈ 3 min (`ClientAlive*` ≈ 150 s, puis la reprise de l'unité : `RestartSec=30`) |
+| `Error: remote port forwarding failed for listen port 2201` (255) | C | `journalctl -u borghelper-trigger` ou `-tunnel` | port déjà tenu (tunnel précédent non libéré, autre client, 2e déclenchement pendant un Bkp) ou `permitlisten` différent |
+| `Error: remote port forwarding failed for listen port 8022`, Bkp en échec | S (sortie du Bkp) | `authorized_keys` de la clé du pull sur C | `permitlisten="8022"` absent ou autre, `port-forwarding` manquant, 8022 déjà pris sur C |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED`, `Host key verification failed.` | S | `known_hosts_clients` | clé d'hôte de C changée, ou autre processus sur 2201 |
+| `borg-pull-guard: refusé (commande (…))`, code 126 | C | `journalctl -t borg-pull-guard` | `BORG_CMD` du garde ≠ `BORG_EXE` du rc |
+| `borg-pull-guard: refusé (…)` autre | C | idem, sortie du Bkp sur S | option, variable ou forme hors des listes : `EXCLUDE`/`BORG_RSH` du rc, borgHelper mis à jour : TECHNICAL.md |
+| `Permission denied (publickey)` | C | journal de sshd : « not from a permitted host » = `from=` | clé ou source refusée |
+| `NoPassphraseFailure` / « Enter passphrase for key » | C | `sshd_config` : `AcceptEnv` | `AcceptEnv BORG_PASSPHRASE …` absent (ou `SSH_ENV = commande`) |
+| option A : le déclencheur ne lance rien | S | `/home/bhtrigger/trigger.log`, sudoers, shell de `bhtrigger` | compte en `nologin`, sudoers absent ou autre ligne |
+| `[WARN] indexation post-backup échouée … No such file` ; `Index` : `FileNotFoundError` | S | `BORG_EXE` du rc | `BORG_EXE` de plusieurs mots |
+| Bkp en échec, `Status` sans ligne « Bkp tiré, borg du client » | S | rc, `[DEFAULT]` compris | `BORG_RSH` ou `SSH_REPO` posé : construction désactivée |
+| Bkp en échec, accès refusé au dépôt | S | propriétaire de `/srv/borg/portable1` | voir étape 2 (déduit) |
+| refus du garde à intervalle régulier | C | `journalctl -t borg-pull-guard` | pas la sonde de borgHelperWWW (refusée en silence) : un autre appelant |
+
+Limites du garde, points non vérifiés et preuves : [TECHNICAL.md](TECHNICAL.md#bkp-tiré--garde-de-la-clé-du-pull-et-mesures-story-120).
 
 ### Dépôts borg externes (1.0.142)
 
@@ -857,7 +1325,9 @@ borgHelper -c Bkp -n mon-serveur -I     # backup seul, sans indexation
 
 Nécessite : `EXCLUDE`, `SER_LOGIN`, `SER_NAME`.  
 Code retour 0 si succès ou warnings, 2 si erreur borg, 1 si le client d'un Bkp tiré est absent (`[ABSENT]`, 1.0.217 — voir
-[Bkp tiré : client absent](#bkp-tiré--client-absent-10217)).
+[Bkp tiré : client absent](#bkp-tiré--client-absent-10217)).  
+Client à IP flottante ou derrière NAT : [Bkp tiré : client à IP flottante, derrière NAT ou
+bastion](#bkp-tiré--client-à-ip-flottante-derrière-nat-ou-bastion).
 
 Plusieurs nicks (`-n ALL`, `-n a,b` ; 1.0.167) : un Bkp après l'autre, dans l'ordre du fichier de conf pour `-n ALL`,
 dans l'ordre donné pour une liste (dépôts externes écartés) ; un nick en échec n'arrête pas les suivants ; Ctrl-C arrête tout. Code retour : le pire des
