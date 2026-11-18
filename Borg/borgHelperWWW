@@ -66,6 +66,7 @@ def _push_deps_hint(err):
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _open_db, _db_open_fail, glob_args, _pid_stat,
+                         _borg_literal,   # story 98 : nom d'archive littéral dans `dépôt::archive` (/download/file, /download/tar) — source unique
                          _restore_cli_line,_RESTORE_FIDELE_CMD,   # 1.34.2 (story 114) : commandes CLI équivalentes de POST /restore
                          _close_quiet,   # 1.31.17 (story 81) : fermeture garantie des ensure_*
                          _db_busy,   # 1.31.19 (story 84) : verrou passager du contrôle de schéma
@@ -86,7 +87,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.36.0"
+WWW_VERSION="1.36.1"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -4597,7 +4598,7 @@ def download_file(nick: str, path: str, request: Request, bid: Optional[str]=Non
     archive=bid or _latest_archive(cfg,env)
     borg_exe=cfg.get('BORG_EXE','borg')
     # 1.30.2 (A83) : code de borg lu — introuvable (ou hors périmètre, leurre) 404, échec 502, échec en cours : flux coupé
-    body=_borg_stream(request,[borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{archive}",target],env,'borg extract',
+    body=_borg_stream(request,[borg_exe,'extract','--stdout',f"{cfg['BORG_REPO']}::{_borg_literal(archive)}",target],env,'borg extract',
                       decoy=None if target==path else target,path=path,missing=f"{path} introuvable dans l'archive {archive}")
     return _ClosingStreamingResponse(body,media_type='application/octet-stream',
         headers={'Content-Disposition':f'attachment; filename="{_safe_filename(path)}"'})
@@ -4616,7 +4617,7 @@ def download_tar(nick: str, request: Request, prefix: Optional[str]=None, bid: O
     env=_borg_env(cfg)
     archive=bid or _latest_archive(cfg,env)
     borg_exe=cfg.get('BORG_EXE','borg')
-    cmd=[borg_exe,'export-tar',f"{cfg['BORG_REPO']}::{archive}",'-']
+    cmd=[borg_exe,'export-tar',f"{cfg['BORG_REPO']}::{_borg_literal(archive)}",'-']
     if target: cmd.append(target)
     # 1.30.2 (A83) : code de borg lu — échec avant le 1er octet 502, en cours : flux coupé ; préfixe absent : tar vide (inchangé)
     body=_borg_stream(request,cmd,env,'borg export-tar',decoy=None if target==prefix else target,path=prefix)
@@ -8125,6 +8126,48 @@ def push_selftest():
                     if bad: print(f"  {bad}")
                     return not bad
                 check("/download/* : codes de sortie hérités demandés à borg (BORG_EXIT_CODES=legacy) — serveur en codes modernes, borg 1.4 = borg 1.2 : 404 introuvable, 502 erreur, avertissement gardé (D142)",_download_codes14_e2e)
+                def _download_literal_names_e2e():
+                    """Story 98 (reports 93) : nom d'archive littéral dans l'emplacement `dépôt::archive` de borg extract / export-tar —
+                    borg 1.2 y remplace les marqueurs {…} (`{hostname}-x` visait l'archive réelle, `a{x}` : « Invalid placeholder »).
+                    Bout en bout par la vraie application, borg factice qui consigne son argv : bid `{hostname}-x` et `a{x}` ->
+                    `/r::{{hostname}}-x` et `/r::a{{x}}` (/download/file et /download/tar) ; sans bid, dernière archive de borg list
+                    (`z{q}`) -> `/r::z{{q}}`. Attentes en dur."""
+                    log=os.path.join(tmpdir,'lit98.log'); fb=os.path.join(tmpdir,'lit98.py')
+                    with open(fb+'.tmp','w') as f:
+                        f.write(f"#!{sys.executable}\nimport sys\nsub=sys.argv[1]\n"
+                                "if sub=='list': sys.stdout.write('a0\\nz{q}\\n'); sys.exit(0)\n"
+                                f"open({log!r},'a').write(' '.join(sys.argv[1:])+chr(10)); sys.stdout.write('c98'); sys.exit(0)\n")
+                    os.chmod(fb+'.tmp',0o700); os.replace(fb+'.tmp',fb)
+                    async def call(route,qs):
+                        msgs=[]; got=[False]
+                        async def receive():
+                            if got[0]: await asyncio.sleep(3600)
+                            got[0]=True; return {'type':'http.request','body':b'','more_body':False}
+                        async def send(m): msgs.append(m)
+                        scope={'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':'GET','scheme':'http','path':f"{API_PREFIX}{route}",
+                               'raw_path':f"{API_PREFIX}{route}".encode(),'query_string':qs.encode(),'root_path':'',
+                               'headers':[(b'host',b'test'),(b'x-api-key',API_KEY.encode())],'client':('127.0.0.1',1),'server':('test',80)}
+                        await asyncio.wait_for(app(scope,receive,send),60)
+                        st=[x['status'] for x in msgs if x['type']=='http.response.start']
+                        return (st[0] if len(st)==1 else st),b''.join(x.get('body',b'') for x in msgs if x['type']=='http.response.body')
+                    if os.path.exists(log): os.unlink(log)
+                    res={}
+                    for lbl,route,qs,want in (('file {hostname}','/download/file','nick=zz&bid='+urllib.parse.quote('{hostname}-x')+'&path=x','extract --stdout /r::{{hostname}}-x x'),
+                                              ('file a{x}','/download/file','nick=zz&bid='+urllib.parse.quote('a{x}')+'&path=x','extract --stdout /r::a{{x}} x'),
+                                              ('tar a{x}','/download/tar','nick=zz&bid='+urllib.parse.quote('a{x}')+'&prefix=x','export-tar /r::a{{x}} - x'),
+                                              ('file dernière','/download/file','nick=zz&path=x','extract --stdout /r::z{{q}} x'),
+                                              ('tar dernière','/download/tar','nick=zz&prefix=x','export-tar /r::z{{q}} - x')):
+                        with mock.patch(f"{__name__}._borg_cfg",lambda n,p: {'BORG_REPO':'/r','BORG_EXE':fb}), \
+                             mock.patch(f"{__name__}.require_path_in_scope",lambda *a: True), \
+                             mock.patch(f"{__name__}.require_downloads_allowed",lambda: None):
+                            st,body=asyncio.run(call(route,qs))
+                        seen=open(log).read().split('\n')[:-1] if os.path.exists(log) else []
+                        if os.path.exists(log): os.unlink(log)
+                        res[lbl]=(st==200 and body==b'c98' and seen==[want],st,body[:80],seen)
+                    bad={k:v for k,v in res.items() if not v[0]}
+                    if bad: print(f"  {bad}")
+                    return not bad
+                check("/download/file et /download/tar : nom d'archive littéral dans l'emplacement borg (accolades doublées, `{hostname}-x`, `a{x}`, dernière archive) (story 98)",_download_literal_names_e2e)
                 def _download_client_gone_e2e():
                     """1.31.6 (story 60 ; mesuré sur serveur réel : borg arrêté 28 s, 58 s après l'abandon, ou jamais avant l'arrêt du
                     serveur — le corps, annulé pendant un envoi dans la tâche interne du middleware, attendait le ramasse-miettes) :

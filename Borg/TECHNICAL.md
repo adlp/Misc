@@ -42,6 +42,15 @@ sur 1.0.205). `BorgHelper.delbkp` refuse aussi un nom vide ou blanc avant tout v
 entier ; bibliothèque), ainsi qu'un nom non chaîne ou à caractère de contrôle (`_has_control_char`, aussi dans
 `_cli_required`) ; le nom passé à `borg delete` est rendu littéral par `_borg_literal` (accolades doublées : borg 1.2 remplace
 les marqueurs `{…}` de l'emplacement — `::{user:.0}` visait le dépôt entier ; `{{` redevient `{`, mesuré sur borg 1.2.6).
+Story 98 (1.0.220) : même règle pour **chaque** site qui compose `::<archive>` ou donne une archive à borg — `mount`, `diffbkp` et
+`_run_diff` de l'Index (emplacement ET `ARCHIVE2` de `borg diff`, mesuré : `ARCHIVE2` est lui aussi remplacé), `list`/`info` des
+snapshots (`_indexsnap_incremental`, complet) et des statistiques ; `borgHelperWWW` importe `_borg_literal` de borgHelper (`/download/file`,
+`/download/tar` : source unique, pas de copie). Les noms viennent soit de l'utilisateur (`-b`), soit de `borg list` : un
+nom réel à accolades (`a{x}`) était lui aussi illisible. `delbkp` : `borg delete` d'une archive absente rend **code 0** et
+`Archive <nom> not found (1/1).` (mesuré 1.2.6 ; les autres commandes : `does not exist`, code 2) — `_borg_says_archive_absent`
+cherche l'une ou l'autre ligne avec le NOM exact (jamais `Repository … does not exist`) -> `[ERREUR] <nick> : archive absente du
+dépôt : <nom>`, code 1, SANS `borg compact` mais AVEC le rapprochement des bases (`_cleanup_index_after_prune`, protégé comme après un
+`borg delete` réussi : une archive supprimée hors borgHelper, encore dans les bases, en est retirée — décision de l'utilisateur).
 Login : `-r` vide ou blanc refusé. Exemples des fiches : `_help_example_error` appelle `_cli_required(…, fs=False)` (sans le contrôle de
 `-k`, qui dépend de la machine).
 getopt en échec : commande lue par `_cli_guess_cmd` (dernier `-c`, options courtes groupées `-dcstats`/`-dc stats`) —
@@ -334,30 +343,40 @@ concluait à une interruption — **tout** Index ayant traité au moins une pair
 jamais `archive_stats`/`indexsnap`/`DIFF_KEEP`. Événement dédié `monitor_stop` pour l'arrêt normal ;
 `interrupted_event` ne signale plus qu'une vraie opération prioritaire (vérifié : Index avec paires →
 code 0, pas de `index_pending` ; verrou prioritaire posé pendant les diffs → arrêt + `index_pending`).  
-`get_repo_stats()` lit la dernière ligne par nick (`ORDER BY id DESC LIMIT 1`, jamais un `SELECT` nu sans
-ordre — `updated_at` est à résolution seconde et peut collisionner entre deux événements rapprochés).  
+`get_repo_stats()` lit la dernière mesure par nick (`ORDER BY updated_at DESC, id DESC LIMIT 1` depuis story 106 ; jamais un
+`SELECT` nu sans ordre — `updated_at` est à résolution seconde et peut collisionner entre deux événements rapprochés : l'`id`
+départage). Avant, `ORDER BY id DESC` seul : une ligne recopiée tard par la migration vers `history.db` (écrite par un ancien
+binaire après `done`) a un id plus grand qu'une mesure plus récente, et Report affichait une taille ancienne (report 87a) — même
+ordre que Storage (`get_storage_measures`). Tri par texte sûr : `updated_at` de `repo_stats` n'a qu'un format (`datetime('now')`,
+UTC naïf `YYYY-MM-DD HH:MM:SS`, à l'écriture comme à la copie de migration) ; l'ISO avec `T` est celui de `bkp_status`, une autre
+table. Index `(nick, id)` inchangé : l'ordre par date trie les lignes du nick (bornées par la rétention).  
 Purge par ancienneté à chaque écriture (même transaction que l'`INSERT`) : lignes plus vieilles que
 `STATS_RETENTION_MONTHS` (`.borghelperrc`, 13 mois par défaut, surchargeable par nick) — **sauf la plus récente d'entre
-elles** (plus grand `id`, 1.0.192, story 67) : `DELETE … WHERE nick=? AND updated_at < borne AND id <> (SELECT id … même
-condition ORDER BY id DESC LIMIT 1)`, une seule instruction (un seul `'now'`). Juste après une écriture, au plus une
+elles** (1.0.192, story 67 ; la plus récente par `updated_at`, `id` en départage depuis story 106) : `DELETE … WHERE nick=? AND
+updated_at < borne AND id <> (SELECT id … même condition ORDER BY updated_at DESC, id DESC LIMIT 1)`, une seule instruction (un seul `'now'`). Juste après une écriture, au plus une
 mesure hors fenêtre par nick ; une rétention abaissée (ou le temps qui passe) peut en laisser plusieurs jusqu'à l'écriture
-suivante — `RepoHistory -j` rend alors la plus grande `id` avant la borne. C'est la mesure de base (`baseline`) qui chiffre
+suivante — `RepoHistory -j` rend alors la plus récente par date avant la borne (la même que celle que la purge garde). C'est la mesure de base (`baseline`) qui chiffre
 le gain d'un Prune ouvrant la fenêtre.  
-Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg (dernière ligne, tout `op`
-confondu).  
+Utilisée par `Report -o` pour alimenter la colonne `taille` sans appel borg (dernière mesure par date, tout `op`
+confondu).
+**Limite (story 106)** : le tri par date dépend de l'horloge système. Une ligne écrite avec une horloge en avance reste « la dernière »
+(et n'est jamais purgée : elle n'est pas `< borne`) tant que le temps ne l'a pas rattrapée ; avec une horloge en retard, la nouvelle
+mesure est ignorée par `get_repo_stats` (Report `-o` affiche alors la valeur figée ; `_refresh_repo_point`, qui la compare, écrit une ligne
+`index` à chaque Index). Même limite que Storage ; l'ancien tri par id n'en dépendait pas. Non filtré (ignorer les lignes `updated_at >
+datetime('now')` serait un choix à valider).  
 Seules des valeurs brutes renvoyées par borg sont persistées — aucune métrique dérivée (dédup, gain
 Prune) : ces calculs se font à la lecture (graphiques `borgHelperWWW`, hors périmètre de ce schéma).
 
 **Exposition JSON (Story 2, spec-charts-evolution-sauvegardes).** `RepoHistory -j` (commande CLI) /
 `GET /repohistory?nick=<nick>` (route `borgHelperWWW`, RBAC niveau lecture) exposent l'historique
-complet, colonnes brutes, ordonné par `id` croissant : `{'borghelper_version','nick','rows':[{'id',
+complet, colonnes brutes, ordonné par `updated_at` croissant, `id` en départage (story 106 ; avant : `id`) : `{'borghelper_version','nick','rows':[{'id',
 'op','unique_csize','total_size','total_csize','updated_at'},...]}`. Gabarit exact de `IdxTop -j` :
 lecture bornée à `STATS_RETENTION_MONTHS` (1.0.127) : borne `SELECT datetime('now','-N months')` calculée une fois
-(1.0.192), puis deux requêtes — `rows` : `SELECT id,op,… FROM repo_stats WHERE nick=? AND updated_at >= ? ORDER BY id` ;
-`baseline` : `… AND updated_at < ? ORDER BY id DESC LIMIT 1` —, un seul nick à la fois (`nick=a,b`
+(1.0.192), puis deux requêtes — `rows` : `SELECT id,op,… FROM repo_stats WHERE nick=? AND updated_at >= ? ORDER BY updated_at, id` ;
+`baseline` : `… AND updated_at < ? ORDER BY updated_at DESC, id DESC LIMIT 1` (story 106 ; avant : `ORDER BY id DESC`) —, un seul nick à la fois (`nick=a,b`
 ou `ALL` sur plusieurs nicks rejeté en erreur d'arguments, code 2 depuis 1.0.206), `{'error':...}` (jamais une exception) si
-`diff.db` n'existe pas encore. Depuis 1.0.192 (story 67) : clé `baseline` en plus, hors `rows` — ligne de plus grande
-`id` avant la borne (même forme qu'une ligne, `null` sinon) ; `rows` (`>=`) et `baseline` (`<`) comparent la même borne :
+`diff.db` n'existe pas encore. Depuis 1.0.192 (story 67) : clé `baseline` en plus, hors `rows` — ligne la plus récente
+(`updated_at`, `id` en départage depuis story 106) avant la borne (même forme qu'une ligne, `null` sinon) ; `rows` (`>=`) et `baseline` (`<`) comparent la même borne :
 jamais une même ligne dans les deux. `updated_at` est en UTC (`datetime('now')`), `archive_date` en heure locale (borg) : l'UI
 (1.24.0) lit chacun explicitement. `archive_stats` a son pendant symétrique : `ArchiveHistory -j` /
 `GET /archivehistory?nick=<nick>`, même `SELECT` que `prep_report_from_db()` (`archive,archive_date,
@@ -517,7 +536,7 @@ erDiagram
 | `archive_snapshot` | `idx_snap_nick_archive` | `(nick, archive)` | suppressions Prune |
 | `archive_stats` | `idx_astats_nick` | `(nick)` | Report -o, suppressions Prune |
 | `diff_excluded_stats` | `idx_exclu_nick_arch` | `(nick, archive_new)` | consultation stats exclus |
-| `repo_stats` | `idx_rstats_nick` | `(nick, id)` | get_repo_stats (dernière ligne par nick), purge par ancienneté |
+| `repo_stats` | `idx_rstats_nick` | `(nick, id)` | get_repo_stats (dernière mesure par nick, par date), purge par ancienneté |
 
 ---
 
@@ -1591,6 +1610,8 @@ Les deux          → DELETE WHERE nick=? AND (NOT (includes) OR (excludes))
 ```
 
 **Exclus (1.0.154) :** `BEGIN IMMEDIATE`, puis agrégat (clair : SQL ; chiffré : lignes réellement supprimées par id, même paire, type et chemin stocké qu'à la sélection) et `DELETE`, puis l'agrégat est ajouté à `diff_excluded_stats` par upsert qui additionne (`ON CONFLICT … DO UPDATE SET file_count=file_count+excluded.file_count, …`). Les stats (`_diff_stats_for_nick`, IdxTop) ne bougent donc pas (sauf `modified` à taille après nulle : taille avant comptée ; 1.0.211 : lignes écartées par les comptes par inode rangées sous `… hardlink`, hors comptes ; marque `approx` calculée sur les seules lignes indexées), DiffTop affiche les exclus d'une paire vidée, et une paire vidée garde des exclus : la révision des paires vides de 1.0.153 (`_recheck_zero_pairs`, paires à 0 entrée **sans exclu**) ne la reprend pas. Limite (bases d'avant 1.0.116, story 80 D203, mesurée en 1.0.202) : une paire écrite sans tailles par un Bkp d'avant 1.0.116 (lignes de `borg create --list`) puis vidée par `IdxPurge -x` a des exclus de `total_size` 0 — lus par `_diff_stats_for_nick` (moitié « taille » des `modifications` de Report et ArchiveHistory), IdxTop et DiffTop ; jamais refaite par `_recheck_zero_pairs` (exclus présents), et la refaire ferait revenir les entrées purgées par `-x`. 1.0.162 : un `removed` sans taille (répertoire ancien ou synthétique) est rangé sous `removed directory` (`_XCT`), pour que les comptes de Report (fichiers ordinaires) restent inchangés par la purge ; les exclus écrits avant 1.0.162 gardent leur `removed`.
+
+**Conseil Index (story 112, décision de l'utilisateur Q88-1 = B ; revue 1) :** `_hl_stale_pairs(conn,nick)` rend l'ensemble des paires qui ont une valeur gardée (`diff_pair_hl`) dont l'empreinte (`_hl_fps`, la comparaison de `_hl_get`, limitée aux archives nouvelles gardées) n'est plus la bonne — paire sans valeur ou valeur d'une paire disparue : pas comptée. `_idxpurge` le lit AVANT la purge (hors verrou d'écriture, après le retour de `-D`) et APRÈS `conn.commit()` (jamais sous le verrou ; toute exception du compte : pas de conseil, la purge est faite). Si l'ensemble d'après contient une paire absente de celui d'avant, dernière ligne (après le compactage) `  <nick>: lancer Index pour recalculer les comptes (borgHelper -c Index -n <nick>)`, une par nick ; vaut aussi pour une purge de snapshots seule (génération des sentinelles). Jamais en `-D`, jamais quand il n'y a rien à purger, jamais avec `advise=False` (`idxpurge(..., advise=False)` : purge interne du fantôme de `_shadow_swap`). IdxPurge ne relance pas la passe de calcul (décision 7). borgHelperWWW : `POST /idxpurge` (admin) relaie le `stderr` tel quel.
 
 **Purge snapshots intégrée :** en fin d'opération (même s'il n'y avait rien à purger dans `diff_index`), `IdxPurge` appelle `_snapurge_check`/`_snapurge_exec` et supprime les snapshots (`archive_snapshot` + `archive_snapshot_indexed` + `snap_excluded_stats`) dont l'archive dépasse `IDX_SNAP_KEEP`. Un seul commit SQLite et un seul VACUUM pour les deux opérations.
 
@@ -5245,7 +5266,7 @@ Lecture seule : `history.db` (`repo_stats`) et `df` pour un dépôt local ; jama
   `.` ; `/~u/x` -> `~u/x` ; `posixpath.normpath`) ; `local|<chemin réel>`. Tiré de l'accès, jamais de `STORAGE`.
 - `BorgHelperDB.get_storage_measures(nick)` -> (première, dernière) `(unique_csize, updated_at)` par `updated_at`, `id` en
   départage (une ligne recopiée tard par la migration a un id plus grand qu'une mesure plus récente ; `get_repo_stats` lit
-  encore par id : report différé) ; `history.db` ouverte par son chemin (`_open_db(role='read')` : jamais créée, jamais migrée),
+  désormais de même, story 106) ; `history.db` ouverte par son chemin (`_open_db(role='read')` : jamais créée, jamais migrée),
   délai de verrou 2 s ; table/base absente : `(None, None)` ; autre `sqlite3.Error` : levée. `storage_unmigrated(nick)` : la
   `diff.db` porte encore `repo_stats` (mesures d'avant 1.0.139) ; illisible : `sqlite3.Error` levée.
 - `_storage_aggregate(repos)` : entrées par dépôt -> stockages triés. Même `repo_id` : nicks réunis, dernière mesure de plus grand

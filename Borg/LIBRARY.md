@@ -893,7 +893,7 @@ sys.exit(0)
 | `listperms(nick, bid, ftor, debug)` | Liste droits fichiers sans restaurer |
 | `list_backups(nick, debug)` | Liste les archives |
 | `list_files(nick, bid, debug, as_json)` | Liste fichiers d'une archive — `as_json` : `{nick,archive,files:[chemin,...]}` |
-| `delbkp(nick, bid, debug)` | Supprime une archive : opération prioritaire (un Index se met en pause, 1.0.142), `borg delete` + compact, puis rapprochement des bases comme `prune` (1.0.145) ; termine par `sys.exit` ; 1.0.176 : `borg delete` en code 1 (avertissement) -> suite complète, `SystemExit(0)` |
+| `delbkp(nick, bid, debug)` | Supprime une archive : opération prioritaire (un Index se met en pause, 1.0.142), `borg delete` + compact, puis rapprochement des bases comme `prune` (1.0.145) ; termine par `sys.exit` ; 1.0.176 : `borg delete` en code 1 (avertissement) -> suite complète, `SystemExit(0)` ; 1.0.220 (story 98) : archive absente du dépôt (`Archive <nom> not found` / `does not exist`) -> `[ERREUR] <nick> : archive absente du dépôt : <nom>`, `SystemExit(1)`, pas de compact mais rapprochement des bases ; nom littéral (`_borg_literal`) |
 | `mount(nick, bid, debug)` | Monte via FUSE |
 | `umount(nick, debug)` | Démonte |
 | `key(nicks, debug)` | Exporte la clef ; 1.0.172 : rend le pire code des nicks (2 si dépôt absent ou borg en échec, message sur stderr ; avant : rien, 0) |

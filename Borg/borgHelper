@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.219"
+Version="1.0.220"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -1853,6 +1853,21 @@ def _hl_get(conn,nick,archives=None,pair=None,news=()):
     for (o,n),v in out.items(): v['snap_miss']=o not in sent or n not in sent
     return out,{'nick_h':nick_h}
 
+def _hl_stale_pairs(conn,nick):
+    """Story 112 (décision de l'utilisateur Q88-1 = B) : {(ancienne, nouvelle)} des paires dont la correction par inode GARDÉE
+    (diff_pair_hl) n'a plus l'empreinte de maintenant — la même comparaison que _hl_get (celle qu'un Index refait). Paire sans
+    valeur gardée : pas comptée (rien de gardé qui soit devenu périmé) ; valeur d'une paire disparue (absente de
+    diff_indexed_pairs) : pas comptée (l'Index la retire, ne la refait pas). Table absente : vide. Lecture seule ; empreintes des
+    seules archives nouvelles qui ont une valeur gardée."""
+    try: have={(r[0],r[1]):tuple(r[2:]) for r in conn.execute(
+        "SELECT archive_old,archive_new,pair_id,entry_count,snap_old,snap_new FROM diff_pair_hl WHERE nick=?",(nick,))}
+    except sqlite3.Error as e:
+        if not _sqlite_missing(e): raise
+        return set()
+    if not have: return set()
+    fps=_hl_fps(conn,nick,archives=sorted({n for _o,n in have}))
+    return {k for k,v in have.items() if k in fps and fps[k]!=v}
+
 def _hl_marks_drop(conn):
     """Revue 88-3 row 44 : transaction finale de DbEncrypt/DbDecrypt — marqueurs de réparation des liens retirés (le prochain
     Index simple revérifie les liens dans le nouveau mode : un cycle déchiffrement/chiffrement par un binaire plus ancien ne
@@ -2182,6 +2197,19 @@ def _borg_literal(name):
     str.format_map) — accolades doublées, « {{ » redevient « { » (mesuré sur borg 1.2.6 : `borg info ::srv-{{x}}` -> « Archive
     srv-{x} does not exist » ; `::{user:.0}` -> le dépôt entier)."""
     return name.replace('{','{{').replace('}','}}')
+
+def _borg_says_archive_absent(rb,name):
+    """1.0.220 (story 98, Q98-1) : vrai si borg dit l'archive `name` absente du dépôt — « Archive <nom> not found (1/1). » (borg
+    delete 1.2.6 : avertissement, code 0 — mesuré) ou « Archive <nom> does not exist » (autres commandes, code 2). Le NOM exact est
+    exigé dans la ligne (jamais « Repository … does not exist ») ; lignes de texte et enregistrements --log-json (message)."""
+    pre=f"Archive {name} "
+    for i in rb.get('stderr',[]):
+        m=i.get('message') if isinstance(i,dict) else i
+        if not isinstance(m,str): continue
+        for l in m.split('\n'):
+            l=l.strip()
+            if l.startswith(pre) and (l[len(pre):].startswith('not found') or l[len(pre):].startswith('does not exist')): return True
+    return False
 
 def _has_control_char(s):
     """Vrai si `s` contient un caractère de contrôle (C0 : saut de ligne, retour chariot, tabulation, NUL… ; DEL)."""
@@ -4000,6 +4028,7 @@ _HELP={
         long=("Purge rétroactive des entrées diff_index + anciens snapshots + VACUUM.",
               "Sans -x : tout ce que les filtres IDX_EXCLUDE/IDX_INCLUDE actuels auraient exclu.",
               "Snapshots : purgés au-delà de IDX_SNAP_KEEP (défaut = somme des KEEP_*, sinon 10).",
+              "Dernière ligne « lancer Index pour recalculer les comptes » : la purge a rendu périmés des comptes gardés.",
               "Démarche : IdxTop -> modifier IDX_EXCLUDE -> IdxPurge (sans -x)."),danger=True),
     'borgcleanup':_H('BorgCleanup',4,"Restes de dépôts borg disparus et de nicks retirés : aperçu, -y retire",
         "-c BorgCleanup [-D] [-y] [--keys] [--history]",
@@ -7558,7 +7587,7 @@ class BorgHelperDB:
 
     def store_repo_stats(self,nick,op,unique_csize,total_size,total_csize,db_path=None):
         """Ajoute une mesure repo_stats (Bkp/Prune/Index) puis purge les mesures d'avant STATS_RETENTION_MONTHS.
-        1.0.192 (story 67, D034) : la purge épargne la plus récente d'avant la fenêtre (plus grand id) — mesure de base
+        1.0.192 (story 67, D034) : la purge épargne la plus récente d'avant la fenêtre (story 106 : par updated_at, id en départage) — mesure de base
         que RepoHistory -j rend à part (`baseline`) pour chiffrer le gain d'un premier Prune ; jamais plus d'une par nick."""
         db_path=self._hist(nick,db_path,create=True)
         months=self._stats_retention_months(nick)
@@ -7569,7 +7598,7 @@ class BorgHelperDB:
                              (nick,op,unique_csize,total_size,total_csize))
                 # un seul 'now' pour la purge et la base épargnée (même instruction) ; cette base est celle que lit repo_history
                 old=f"nick=? AND updated_at < datetime('now','-{int(months)} months')"
-                conn.execute(f"DELETE FROM repo_stats WHERE {old} AND id <> (SELECT id FROM repo_stats WHERE {old} ORDER BY id DESC LIMIT 1)",
+                conn.execute(f"DELETE FROM repo_stats WHERE {old} AND id <> (SELECT id FROM repo_stats WHERE {old} ORDER BY updated_at DESC, id DESC LIMIT 1)",
                              (nick,nick))
                 conn.commit(); return True
             finally: conn.close()
@@ -7577,12 +7606,16 @@ class BorgHelperDB:
         except sqlite3.Error as e: printer(f"SQLite error ({db_path}): {e}"); return False
 
     def get_repo_stats(self,nick,db_path=None):
+        """Dernière mesure de taille du dépôt du nick. Story 106 (report 87a) : par updated_at, id en départage (comme Storage,
+        get_storage_measures) — une ligne recopiée tard par la migration vers history.db (écrite par un ancien binaire après `done`)
+        a un id plus grand qu'une mesure plus récente. Format de updated_at unique (`datetime('now')` UTC naïf, à l'écriture comme
+        à la copie de migration) : le tri par texte est chronologique."""
         db_path=self._hist(nick,db_path)
         if db_path is None: return {}
         conn=None
         try:
             conn=_open_db(db_path,nick=None,role='read')
-            row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=? ORDER BY id DESC LIMIT 1",(nick,)).fetchone()
+            row=conn.execute("SELECT unique_csize,total_size,total_csize FROM repo_stats WHERE nick=? ORDER BY updated_at DESC, id DESC LIMIT 1",(nick,)).fetchone()
             conn.close()
             return {'unique_csize':row[0],'total_size':row[1],'total_csize':row[2]} if row else {}
         except sqlite3.Error as e: _reader_sqlite_err(e,db_path); return {}   # 1.0.175 (A72)
@@ -9705,7 +9738,9 @@ class BorgHelper:
         if not cfg.get('MOUNTPOINT'): printer(f"{nick}: MOUNTPOINT absent de la configuration — Mount impossible"); sys.exit(3)
         if self.borg.repoLocalAbsent(nick): self._borg_stop(nick)   # 1.0.172 (A60) : « ⚠ dépôt absent », code 2
         if bid is None or bid=='last': bid=self._lastbkp_or_stop(nick,debug=debug)[0]
-        repo=cfg['BORG_REPO']+"::"+bid
+        # 1.0.220 (story 98) : nom d'archive littéral — borg remplace les marqueurs {…} de l'emplacement (`{hostname}-x` montait
+        # l'archive réelle p-…-x, `a{x}` : « Invalid placeholder »)
+        repo=cfg['BORG_REPO']+"::"+_borg_literal(bid)
         if bid=="ALL": repo=cfg['BORG_REPO']
         if os.path.exists(cfg['MOUNTPOINT']) and os.path.isdir(cfg['MOUNTPOINT']) and len(os.listdir(cfg['MOUNTPOINT']))==0:
             if not mountedornot(cfg['MOUNTPOINT'],debug=debug):
@@ -9914,7 +9949,7 @@ class BorgHelper:
             except RuntimeError as e: self._borg_stop(nick,'borg list',e,as_json=as_json)
             archives=rb['stdout'][0]['archives']
             date_new=next((a['start'] for a in archives if a['name']==bideux),None)
-            rb2=self.borg.boex(nick,['diff','--json-lines',f"{cfg['BORG_REPO']}::{bidun}",bideux],debug=debug,retjson=False)
+            rb2=self.borg.boex(nick,['diff','--json-lines',f"{cfg['BORG_REPO']}::{_borg_literal(bidun)}",_borg_literal(bideux)],debug=debug,retjson=False)   # 1.0.220 (story 98) : noms littéraux (les deux : borg remplace aussi les marqueurs de ARCHIVE2)
             # 1.0.176 (A77) : code 1 = avertissement, diff gardé (avant : « a échoué », code 1) ; code 1 SANS sortie (borg diff tué par
             # SIGTERM sort ainsi, mesuré 1.2.6) : échec, jamais une paire vide enregistrée (revue)
             if not _borg_ok(rb2) or (rb2['exitcode']==1 and not any(str(l).strip() for l in rb2['stdout'])):
@@ -10457,6 +10492,15 @@ class BorgHelper:
             # revue 3 (mesuré, borg 1.2.6) : borg remplace les marqueurs {…} de l'emplacement — « {user:.0} » ou « {now:%n} » donnaient
             # `::` (dépôt entier) ; accolades doublées : nom toujours littéral (« {{ » -> « { », format_map de replace_placeholders)
             rb=self.borg.boex(nick,['delete','::'+_borg_literal(bid)],debug=debug)
+            # 1.0.220 (story 98, Q98-1, décision de l'utilisateur) : archive absente du dépôt (borg delete 1.2.6 : « Archive X not found
+            # (1/1). », code 0 — mesuré ; « does not exist » aussi reconnu) -> [ERREUR] dite, code 1, pas de `borg compact` ; rapprochement
+            # des bases gardé (revue 1, décision de l'utilisateur : archive supprimée hors borgHelper, encore dans les bases, retirée)
+            if not rb.get('killed') and _borg_says_archive_absent(rb,bid):
+                printer(f"[ERREUR] {nick} : archive absente du dépôt : {bid}")
+                try: self._cleanup_index_after_prune(nick,debug=debug)
+                except (Exception,SystemExit) as e:   # jamais un changement du code 1 dit ci-dessus
+                    printer(f"[WARN] {nick}: rapprochement des bases reporté au prochain Index ({_etxt(e)})")
+                sys.exit(1)
             if not _borg_ok(rb):   # 1.0.172 : message lisible (plus de dict brut), code de borg inchangé
                 printer(self._borg_fail_msg(nick,'borg delete',_rb_errmsg(rb,'borg delete'))); sys.exit(_exit_code(rb['exitcode']))
             _borg_warn(nick,'borg delete',rb)   # 1.0.176 (A77) : code 1 -> archive supprimée, suite faite (avant : « a échoué », ni compact ni rapprochement)
@@ -10946,7 +10990,7 @@ class BorgHelper:
                 # chemin absent : code 0, aucune ligne)
                 try:
                     rb=self.borg.boex(nick,
-                        ['list','--format',_SNAP_LIST_FMT,f'::{archive_name}']
+                        ['list','--format',_SNAP_LIST_FMT,f'::{_borg_literal(archive_name)}']   # 1.0.220 (story 98) : nom littéral
                         +['pf:'+p for p in changed],
                         debug=debug,retjson=False)
                 except OSError as e:   # E2BIG malgré la borne, borg introuvable… : snapshot complet
@@ -11119,7 +11163,7 @@ class BorgHelper:
                     print(f"{nick}: {nfiles} fichiers dans le snapshot {archive_name}{suffix}")
             else:
                 # Fallback : borg list complet
-                rb2=self.borg.boex(nick,['list','--format',_SNAP_LIST_FMT,f"::{archive_name}"],debug=debug,retjson=False)
+                rb2=self.borg.boex(nick,['list','--format',_SNAP_LIST_FMT,f"::{_borg_literal(archive_name)}"],debug=debug,retjson=False)
                 if rb2.get('killed'): return 'killed'
                 # 1.0.175 (A70) : forme commune, plus de stderr brut (trace, bandeau) ; 1.0.176 (A77) : code 1 gardé, sauf sans sortie (revue :
                 # snapshot de 0 fichier enregistré pour un borg tué)
@@ -11656,7 +11700,7 @@ class BorgHelper:
         def _run_diff(pair):
             a_old,a_new,date_new=pair
             print(f"  {nick}: {a_old} → {a_new}",flush=True)
-            cmd=[borg_exe,'diff','--json-lines',f"{cfg['BORG_REPO']}::{a_old}",a_new]
+            cmd=[borg_exe,'diff','--json-lines',f"{cfg['BORG_REPO']}::{_borg_literal(a_old)}",_borg_literal(a_new)]   # 1.0.220 (story 98) : noms littéraux (« a{x} » : « Invalid placeholder »)
             if interrupted_event.is_set():   # 1.0.179 (A91, revue) : arrêt déjà demandé — jamais lancé (paire jamais gardée)
                 return (a_old,a_new,date_new,[],{},False)
             ps=subprocess.Popen(cmd,encoding='utf-8',env=diff_env,cwd=os.getcwd(),
@@ -11879,7 +11923,7 @@ class BorgHelper:
             try:
                 for a in todo:
                     if stop(): break
-                    rbi=self.borg.boex(nick,['info','--json',f"::{a['name']}"],debug=debug)
+                    rbi=self.borg.boex(nick,['info','--json',f"::{_borg_literal(a['name'])}"],debug=debug)
                     if rbi.get('killed'):
                         self.borg._stop=prev
                         if n: print(f"{nick}: statistiques de {n} archive(s) enregistrées (graphiques)")
@@ -12250,7 +12294,7 @@ class BorgHelper:
         if (cfg.get('IDX_INCLUDE') or '').strip() or (cfg.get('IDX_EXCLUDE') or '').strip():
             # Décision story 6. Index filtre déjà IDX_* à l'écriture : rattrape les lignes d'avant un changement de motif.
             printer(f"{nick}: purge IDX_INCLUDE/IDX_EXCLUDE du fantôme avant la bascule")
-            self.idxpurge(nick,debug=debug,db_path=sp)
+            self.idxpurge(nick,debug=debug,db_path=sp,advise=False)   # story 112 : pas de conseil Index dans une reconstruction
             cp=self._index_checkpoint(nick,deadline)
             if cp: return cp if cp=='interrupted' else 0
         if not _check_disk_space(sp,_SWAP_SPACE_MARGIN): return _later("espace disque insuffisant pour le WAL de la bascule")
@@ -13038,8 +13082,8 @@ class BorgHelper:
         ordre chronologique), gabarit exact de idxtop() -j (borgHelper:3819-3844) — jamais de valeur
         dérivée calculée ici (Boundaries).
 
-        1.0.192 (story 67, D034) : + `baseline` = dernière mesure d'avant la fenêtre STATS_RETENTION_MONTHS (plus
-        grand id, même forme qu'une ligne de `rows`, `null` s'il n'y en a pas), hors `rows` — l'UI en tire le gain
+        1.0.192 (story 67, D034) : + `baseline` = dernière mesure d'avant la fenêtre STATS_RETENTION_MONTHS (la plus
+        récente par updated_at, id en départage — story 106 ; même forme qu'une ligne de `rows`, `null` s'il n'y en a pas), hors `rows` — l'UI en tire le gain
         d'un premier Prune et ne la dessine jamais ; la purge à l'écriture (store_repo_stats) la garde."""
         db_path=self.db.get_diff_db(nick)
         # history.db présente : les mesures se lisent même si diff.db (jetable, 1.0.139) a été supprimée
@@ -13081,8 +13125,8 @@ class BorgHelper:
                     cut=conn.execute(f"SELECT datetime('now','-{int(months)} months')").fetchone()[0]
                     sel="SELECT id,op,unique_csize,total_size,total_csize,updated_at FROM repo_stats WHERE nick=? "
                     row=lambda r: {'id':r[0],'op':r[1],'unique_csize':r[2],'total_size':r[3],'total_csize':r[4],'updated_at':r[5]}
-                    rows=[row(r) for r in conn.execute(sel+"AND updated_at >= ? ORDER BY id",(nick,cut)).fetchall()]
-                    b=conn.execute(sel+"AND updated_at < ? ORDER BY id DESC LIMIT 1",(nick,cut)).fetchone()
+                    rows=[row(r) for r in conn.execute(sel+"AND updated_at >= ? ORDER BY updated_at, id",(nick,cut)).fetchall()]
+                    b=conn.execute(sel+"AND updated_at < ? ORDER BY updated_at DESC, id DESC LIMIT 1",(nick,cut)).fetchone()
                     baseline=row(b) if b else None
                 finally: conn.close()
             except sqlite3.Error as e:
@@ -14230,14 +14274,15 @@ class BorgHelper:
         conn.execute(f"DELETE FROM snap_excluded_stats WHERE nick=? AND archive IN ({ph})",[nick]+to_delete)
         self.db._cleanup_snapshot_file_orphans(nick,conn)
 
-    def idxpurge(self,nick,pattern=None,dryrun=False,debug=0,db_path=None):
+    def idxpurge(self,nick,pattern=None,dryrun=False,debug=0,db_path=None,advise=True):
         """IdxPurge (voir README). 1.0.207 (revue 85) : rend 1 si IDX_SNAP_KEEP/KEEP_* est invalide ([ERREUR] dit, purge des
-        snapshots sautée, diff_index purgé quand même), sinon None."""
+        snapshots sautée, diff_index purgé quand même), sinon None. Story 112 : advise=False (purge interne d'une reconstruction,
+        _shadow_swap) : jamais la ligne qui conseille Index."""
         bad=[]
-        self._idxpurge(nick,pattern,dryrun,debug,db_path,bad)
+        self._idxpurge(nick,pattern,dryrun,debug,db_path,bad,advise)
         return 1 if bad else None
 
-    def _idxpurge(self,nick,pattern,dryrun,debug,db_path,bad):
+    def _idxpurge(self,nick,pattern,dryrun,debug,db_path,bad,advise=True):
         if db_path is None: db_path=self.db.get_diff_db(nick)   # db_path : fantôme avant bascule (1.0.143)
         if _db_absent(db_path):   # 1.0.170 (story 33) : fichier 0 octet laissé par l'O_CREAT d'un lecteur = absent
             printer(f"  {nick}: diff.db absent"); return
@@ -14356,6 +14401,12 @@ class BorgHelper:
             if dryrun:
                 printer(f"  {nick}: dry-run — aucune modification")
                 conn.close(); return
+            # Story 112 (décision de l'utilisateur Q88-1 = B) : paires à valeur gardée DÉJÀ périmées avant la purge (lecture avant
+            # le verrou d'écriture) ; le conseil Index ne vient que des paires que CETTE purge rend périmées. Erreur : pas de conseil
+            stale_before=None
+            if advise:
+                try: stale_before=_hl_stale_pairs(conn,nick)
+                except Exception: stale_before=None
             if count:
                 # Agrégat des exclus et DELETE sous le même verrou d'écriture (revue story 17) : un Index ou un autre IdxPurge
                 # concurrent ne fait ni compter une ligne non supprimée, ni supprimer une ligne non comptée.
@@ -14403,13 +14454,21 @@ class BorgHelper:
                     WHERE nick=?""",(nick,))
             if snap_del:
                 self._snapurge_exec(nick,conn,snap_del)
-            conn.commit(); conn.close()
+            conn.commit()
+            # Compte APRÈS le commit (jamais sous le verrou d'écriture, jamais de purge perdue par une erreur du compte) : la passe de
+            # calcul n'est PAS relancée ici (décision 7) ; erreur quelconque du compte : pas de conseil, la purge est faite
+            stale_new=False
+            if stale_before is not None:
+                try: stale_new=bool(_hl_stale_pairs(conn,nick)-stale_before)
+                except Exception: stale_new=False
+            conn.close()
             if count: printer(f"  {nick}: {count:,} entrées diff supprimées")
             if snap_del: printer(f"  {nick}: {snap_count:,} entrées snapshot supprimées ({len(snap_del)} archives)")
             # 1.0.211 (décision 7 de l'utilisateur, revue 88 row 57) : aucune passe de calcul ici — les corrections gardées des paires
             # touchées sont périmées (empreinte : lignes de la paire, génération des sentinelles) ; les lecteurs calculent à la volée
             # sans écrire (décision 6) jusqu'au prochain Index, qui les refait
             self._vacuum_db(db_path,verbose=True,nick=nick)
+            if stale_new: printer(f"  {nick}: lancer Index pour recalculer les comptes (borgHelper -c Index -n {nick})")   # dernière ligne (story 112)
         except DbCodecError as e:
             _codec_fail(nick,e,conn); return
         except sqlite3.Error as e:
@@ -16257,6 +16316,25 @@ def codec_selftest(pattern=None,list_only=False):
             c.commit(); c.close()
             return bhrs.get_repo_stats('t2',db_path=p)['unique_csize']==2
         check("repo_stats : même updated_at (résolution seconde) -> get_repo_stats renvoie le plus grand id",_rs_tie_check)
+        def _rs_date_order_check():
+            # story 106 (report 87a) : ligne recopiée tard (id plus grand) mais plus ancienne -> la plus récente par date l'emporte
+            p=_rs_path('dateord'); bhrs.ensure_history_db(p)
+            c=_open_db(p,nick='d6',role='write')
+            for v,at in ((10,'2026-03-01 12:00:00'),(20,'2026-01-01 12:00:00')):   # id 1 = récente, id 2 = ancienne
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('d6','bkp',?,?,?,?)",(v,v,v,at))
+            c.commit(); c.close()
+            got=bhrs.get_repo_stats('d6',db_path=p)
+            # purge (13 mois par défaut) : la base épargnée est la plus récente d'avant la fenêtre par date
+            c=_open_db(p,nick='d7',role='write')
+            for v,m in ((7,14),(8,20),(9,16)):   # ids 3,4,5, hors fenêtre (13 mois) ; la plus récente par date = 7 (id le plus petit)
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) VALUES ('d7','bkp',?,?,?,datetime('now',?))",(v,v,v,f'-{m} months'))
+            c.commit(); c.close()
+            bhrs.store_repo_stats('d7','bkp',6,6,6,db_path=p)
+            c=_open_db(p,nick='d7',role='read')
+            vals=sorted(r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='d7'").fetchall())
+            c.close()
+            return got=={'unique_csize':10,'total_size':10,'total_csize':10} and vals==[6,7]
+        check("repo_stats : get_repo_stats et purge par date (updated_at), id et date en ordre inverse (story 106)",_rs_date_order_check)
         def _rs_purge_default_check():
             p=_rs_path('purge'); bhrs.ensure_history_db(p)
             c=_open_db(p,nick='p1',role='write')
@@ -16295,14 +16373,14 @@ def codec_selftest(pattern=None,list_only=False):
             # 1.0.161 (story 24) : CACHE_DIR explicite — _cli_rh_multi_rejected lance _cli_main dans ce processus ; sans lui,
             # BorgHelper() créait ~/.cache/borghelper (vu par strace et par le crochet d'audit)
             f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(rh_dir,'cache')}\n\n")
-            for nk in ('rhA','rhB','rhEmpty','rhOld','rhBase','rhBase2'):
+            for nk in ('rhA','rhB','rhEmpty','rhOld','rhBase','rhBase2','rhBase3'):
                 # dates fixes des fixtures rhA/rhB (2026) : rétention très longue, sinon le bornage des
-                # séries (1.0.127, 13 mois par défaut) les ferait disparaître avec le temps. rhOld : défaut. rhBase/rhBase2 : 1 mois.
-                ret="" if nk=='rhOld' else ("STATS_RETENTION_MONTHS=1\n" if nk in ('rhBase','rhBase2') else "STATS_RETENTION_MONTHS=1200\n")
+                # séries (1.0.127, 13 mois par défaut) les ferait disparaître avec le temps. rhOld : défaut. rhBase/rhBase2/rhBase3 : 1 mois.
+                ret="" if nk=='rhOld' else ("STATS_RETENTION_MONTHS=1\n" if nk in ('rhBase','rhBase2','rhBase3') else "STATS_RETENTION_MONTHS=1200\n")
                 f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw-{nk}\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\n{ret}\n")
         os.chmod(rh_rc,0o600)
         bh_rh=BorgHelper(cfgfile=rh_rc,cache_dir=os.path.join(rh_dir,'cache'))
-        for nk in ('rhA','rhB','rhEmpty','rhOld','rhBase','rhBase2'):
+        for nk in ('rhA','rhB','rhEmpty','rhOld','rhBase','rhBase2','rhBase3'):
             bh_rh.db.ensure_diff_db(bh_rh.db.get_diff_db(nk))
         bh_rh.db.store_repo_stats('rhA','bkp',100,200,300)
         bh_rh.db.store_repo_stats('rhA','prune',90,190,290)
@@ -16351,7 +16429,8 @@ def codec_selftest(pattern=None,list_only=False):
         check("RepoHistory -j : baseline = dernière mesure d'avant STATS_RETENTION_MONTHS (gardée par la purge), hors rows ; null sinon",_rh_baseline)
         def _rh_baseline_unpurged():
             """1.0.192 (story 67, revue) : plusieurs mesures d'avant la fenêtre pas encore purgées (rétention abaissée, aucune écriture
-            depuis) -> baseline = la plus grande id avant la borne (-2 mois), jamais la plus ancienne ; la ligne de la fenêtre dans rows.
+            depuis) -> baseline = la plus récente par date avant la borne (-2 mois ; story 106 : plus « la plus grande id »,
+            ici ids et dates vont dans le même ordre), jamais la plus ancienne ; la ligne de la fenêtre dans rows.
             Insertion directe dans history.db : ni store_repo_stats, ni purge."""
             h=bh_rh.db.get_history_db('rhBase2'); bh_rh.db.ensure_history_db(h); c=sqlite3.connect(h)
             for m,v in (('-3 months',301),('-2 months',201),('-1 days',11)):
@@ -16363,6 +16442,26 @@ def codec_selftest(pattern=None,list_only=False):
             if not all(res.values()): print(f"    {res} v={v}")
             return all(res.values())
         check("RepoHistory -j : baseline = plus grande id avant la borne quand plusieurs mesures anciennes restent (rétention abaissée)",_rh_baseline_unpurged)
+        def _rh_baseline_by_date():
+            """Story 106 : baseline = la plus récente par updated_at avant la borne, id en départage — ids et dates en ordre inverse
+            (la plus récente a le plus petit id, comme une ligne recopiée tard par la migration) ; la purge garde la même ligne ;
+            deux lignes anciennes à même updated_at : la plus grande id (baseline et ligne gardée) ; rows triées par date, id en départage."""
+            h=bh_rh.db.get_history_db('rhBase3'); bh_rh.db.ensure_history_db(h); c=sqlite3.connect(h)
+            at=c.execute("SELECT datetime('now','-2 months')").fetchone()[0]   # une seule valeur : égalité exacte
+            # ids 1..: 201 (at), 301, 401, 202 (at, plus grande id des deux à `at`), 501 (plus ancienne, plus grande id de toutes), puis
+            # deux lignes dans la fenêtre dont la plus récente (11) a le plus petit id
+            for v,when in ((201,at),(301,'-3 months'),(401,'-4 months'),(202,at),(501,'-5 months'),(11,'-1 days'),(12,'-3 days')):
+                c.execute("INSERT INTO repo_stats (nick,op,unique_csize,total_size,total_csize,updated_at) "
+                          "VALUES ('rhBase3','bkp',?,?,?,CASE WHEN ? LIKE '-%' THEN datetime('now',?) ELSE ? END)",(v,v,v,when,when,when))
+            c.commit(); c.close()
+            v=_rh_run(bh_rh.repo_history,'rhBase3',as_json=True); b=v['baseline']
+            bh_rh.db.store_repo_stats('rhBase3','bkp',7,7,7)
+            c=sqlite3.connect(h); left=sorted(r[0] for r in c.execute("SELECT unique_csize FROM repo_stats WHERE nick='rhBase3'")); c.close()
+            res={'baseline':isinstance(b,dict) and b['unique_csize']==202,'rows':[r['unique_csize'] for r in v['rows']]==[12,11],
+                 'purge':left==[7,11,12,202]}
+            if not all(res.values()): print(f"    {res} left={left} v={v}")
+            return all(res.values())
+        check("RepoHistory -j : baseline et purge par updated_at (id en départage), jamais par id seul (story 106)",_rh_baseline_by_date)
         def _rh_arch_populated():
             v=_rh_run(bh_rh.archive_history,'rhA',as_json=True); rows=v['rows']
             return (len(rows)==2 and rows[0]['archive']=='A1' and rows[1]['archive']=='A2'
@@ -21550,6 +21649,9 @@ def codec_selftest(pattern=None,list_only=False):
                 # change ; après IdxPurge : valeur gardée de X seule périmée, rien écrit, _hl_get = _hl_adjust de la paire = calcul
                 # complet (toutes les paires), différent de la valeur d'avant, lecteurs sans écriture, comptes inchangés ; puis la passe
                 # de l'Index refait X seule, mêmes comptes
+                # story 112 : IdxPurge finit par la ligne qui conseille Index, seulement si des valeurs gardées sont devenues périmées
+                adv=f"  {nk}: lancer Index pour recalculer les comptes (borgHelper -c Index -n {nk})"
+                last=lambda o: (o.rstrip().splitlines() or [''])[-1]
                 strip=lambda v: {k:x for k,x in (v or {}).items() if k!='snap_miss'}
                 def hlx():
                     c=_open_db(dbp,nick=nk)
@@ -21559,10 +21661,10 @@ def codec_selftest(pattern=None,list_only=False):
                 pgB=_q_run(bhq.idxpurge,nk,'p/n',False)
                 kB=kept(); frB=fresh(); stB=noapx(bhq.db._diff_stats_for_nick(nk)); sB=state(nk); hB=hlx(); kB2=kept()
                 pB=_hl_store_pass(dbp,nk); frC=fresh(); stC=noapx(bhq.db._diff_stats_for_nick(nk)); sC=state(nk); hC=hlx()
-                p62=(frA[0]==frA[1] and hA[0]==hA[1]==hA[2] and '1 entrées diff supprimées' in pgB and kB==kA and frB[1]-frB[0]=={(X1,X2)}
+                p62=(frA[0]==frA[1] and hA[0]==hA[1]==hA[2] and '1 entrées diff supprimées' in pgB and last(pgB)==adv and pgB.count(adv)==1 and kB==kA and frB[1]-frB[0]=={(X1,X2)}
                      and hB[0]==hB[1]==hB[2] and hB[1]!=hA[1] and kB2==kB and stB==stA and sB==sA and pB==(1,0) and frC[0]==frC[1]
                      and {k for k in frC[2] if frC[2][k]!=frB[2].get(k)}=={(X1,X2)} and hC==hB and stC==stA and sC==sA)
-                if not p62: print(f"  purge partielle {nk} : gardées {len(frA[0])}/{len(frA[1])} ; avant {hA} ; purge {pgB[-120:]!r} sans écriture "
+                if not p62: print(f"  purge partielle {nk} : conseil {last(pgB)!r} ; gardées {len(frA[0])}/{len(frA[1])} ; avant {hA} ; purge {pgB[-120:]!r} sans écriture "
                                   f"{kB==kA} ; périmées {sorted(frB[1]-frB[0])} ; après (lu, paire, complet) {hB} ; lecteurs sans écriture {kB2==kB} ; "
                                   f"comptes {stB==stA} {sB==sA} {sA['x']} -> {sB['x']} ; passe {pB} refaites "
                                   f"{sorted(k for k in frC[2] if frC[2][k]!=frB[2].get(k))} {hC==hB} ; comptes {stC==stA} {sC==sA}")
@@ -21578,10 +21680,10 @@ def codec_selftest(pattern=None,list_only=False):
                 fly=bool(stale) and all({k:v for k,v in g57[q].items() if k!='snap_miss'}==a57[q] for q in stale)
                 p57s=_hl_store_pass(dbp,nk); fr3=fresh()
                 st3=noapx(bhq.db._diff_stats_for_nick(nk)); s3=state(nk)
-                p57=(fr0[0]==fr0[1] and len(fr0[1])==7 and kp1==kp0 and stale=={(X1,X2),(Z1,Z2)} and fly and kp2==kp1
+                p57=(fr0[0]==fr0[1] and len(fr0[1])==7 and last(pg)==adv and pg.count(adv)==1 and kp1==kp0 and stale=={(X1,X2),(Z1,Z2)} and fly and kp2==kp1
                      and p57s==(2,0) and fr3[0]==fr3[1]==fr1[1] and {k for k in fr3[2] if fr3[2][k]!=fr1[2].get(k)}=={(X1,X2),(Z1,Z2)}
                      and st3==st1 and s3==s1)
-                if not p57: print(f"  décision 7 {nk} : gardées avant purge {len(fr0[0])}/{len(fr0[1])} ; purge sans écriture {kp1==kp0} ; "
+                if not p57: print(f"  décision 7 {nk} : conseil {last(pg)!r} ; gardées avant purge {len(fr0[0])}/{len(fr0[1])} ; purge sans écriture {kp1==kp0} ; "
                                   f"périmées {sorted(stale)} ; à la volée {fly} ; lecteurs sans écriture {kp2==kp1} ; passe {p57s} ; "
                                   f"refaites {sorted(k for k in fr3[2] if fr3[2][k]!=fr1[2].get(k))} {len(fr3[0])}/{len(fr3[1])} ; comptes {st3==st1} {s3==s1}")
                 dtx=_q_run(bhq.difftop,nk,f"{X1},{X2}")
@@ -21638,12 +21740,41 @@ def codec_selftest(pattern=None,list_only=False):
                     e40=(_q_run(bhq.difftop,nk,f"{X1},{X2}"),_q_run(bhq.idxtop,nk))
                     sql(nk,("UPDATE snapshot_file SET mode='-rw-r--r--' WHERE nick=?",(nk,)))
                     n40=(_q_run(bhq.difftop,nk,f"{X1},{X2}"),_q_run(bhq.idxtop,nk))
+                # story 112 (revue 1) : conseil seulement si CETTE purge rend périmée une valeur gardée. Pas de conseil : (a) -D et
+                # (b) rien à purger, alors qu'une valeur gardée est DÉJÀ périmée ; (c) purge qui ne touche que des paires déjà
+                # périmées ou sans valeur gardée ; (d) advise=False (purge interne d'une reconstruction) alors qu'une valeur le serait ;
+                # (e) paire disparue : pas comptée. Conseil : (f) purge des snapshots seule (IDX_SNAP_KEEP, rien dans diff_index).
+                def stp():
+                    c=_open_db(dbp,nick=nk)
+                    try: return _hl_stale_pairs(c,nk)
+                    finally: c.close()
+                build(nk,enc_); _hl_store_pass(dbp,nk); kd0=kept()
+                sql(nk,("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nk,X1)))   # paire X : valeur gardée périmée
+                sd0=stp(); od=_q_run(bhq.idxpurge,nk,'p',True); kd1=kept(); sd1=stp()
+                on=_q_run(bhq.idxpurge,nk,'zz-rien',False); sd2=stp()
+                sql(nk,("DELETE FROM diff_pair_hl WHERE nick=? AND archive_new<>?",(nk,X2)))   # Z, V, W : plus de valeur gardée
+                oc=_q_run(bhq.idxpurge,nk,'p',False)   # touche X (déjà périmée) et Z (sans valeur gardée)
+                build(nk,enc_); _hl_store_pass(dbp,nk)
+                sql(nk,("DELETE FROM archive_snapshot_indexed WHERE nick=? AND archive=?",(nk,X2)))   # X puis Z : périmées par la purge
+                ot=_q_run(bhq.idxpurge,nk,'p',False,advise=False)
+                build(nk,enc_); _hl_store_pass(dbp,nk); sql(nk,("DELETE FROM diff_indexed_pairs WHERE nick=? AND archive_new=?",(nk,Z2)))
+                sg=stp()   # Z2 : valeur gardée sans paire
+                build(nk,enc_); _hl_store_pass(dbp,nk); _q_rc('IDX_SNAP_KEEP=4')
+                try: os_=_q_run(bhq.idxpurge,nk,'zz-rien',False)
+                finally: _q_rc()
+                r3['112']=((sd0=={(X1,X2)} and adv not in od and 'dry-run' in od and kd1==kd0 and sd1==sd0
+                            and adv not in on and 'aucune entrée' in on and sd2==sd0
+                            and adv not in oc and 'entrées diff supprimées' in oc and adv not in ot and 'entrées diff supprimées' in ot
+                            and sg==set()
+                            and last(os_)==adv and 'snapshot(s) ancien(s)' in os_ and 'entrées diff supprimées' not in os_)
+                           or (sd0,adv in od,kd1==kd0,sd1,adv in on,sd2,oc[-100:],ot[-100:],sg,os_[-200:]))
                 inc40=lambda t: ((re.search(r'^Inchangés: (~?)\d',t[0],re.M) or [None,None])[1],(re.search(rf'^  {X2} : (~?)\d',t[1],re.M) or [None,None])[1])
                 r3['40']=(inc40(e40),inc40(n40),'[ERREUR] SQLite error' in e40[0]+e40[1]); _SQLITE_ERR_SEEN.discard(dbp)
                 r3_ok=(r3['32'][3] is True and str(r3['32'][4]).startswith('~') and r3['37'][0]==3 and r3['37'][3] is True
                        and r3['38'][3] is True and str(r3['38'][4]).startswith('~') and r3['33']==(True,False,True) and r3['36'] is True
-                       and r3['34'] is True and r3['35'] is True and r3['40']==(('~','~'),('',''),True))
+                       and r3['34'] is True and r3['35'] is True and r3['40']==(('~','~'),('',''),True) and r3['112'] is True)
                 if not r3_ok: print(f"  revue 88-3 {nk} : {r3}")
+                if r3['112'] is not True: print(f"  story 112 (conseil Index d'IdxPurge) {nk} : {r3['112']}")
                 base={'y':Y,'z':Z,'v':V,'w':WI,'fig':True}
                 one=(e0=={**base,'x':('10','10','47%nb',(3,7,2,False)),'ah':False} and eW==('~8','~8','~11%nb',True,True)
                      and eN=={**base,'w':eN['w'],'x':('~10','~10','~47%nb',(3,7,2,True)),'ah':True}
@@ -34051,10 +34182,13 @@ print(json.dumps(dict(pw=pw)))
                 o,n=c.execute("SELECT archive_old,archive_new FROM diff_indexed_pairs LIMIT 1").fetchone()
                 c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,change_type,path) VALUES(?,?,?,?,?)",
                           (nick,o,n,'modified',f"{ctx['src'].lstrip('/')}/f2.txt")); c.commit(); c.close()
-                planted.append(n_f2(sp)); return orig(nick,debug,cfg,sp,archives,plan)
+                planted.append(n_f2(sp)); _hl_store_pass(sp,nick); return orig(nick,debug,cfg,sp,archives,plan)
             b._shadow_swap=wrap
             out=_q_run(b.index,'rbx',rebuild=True); after=n_f2(live)
-            ok=before==0 and planted==[1] and after==0 and 'nouvelle base en service' in out
+            # story 112 : la purge interne du fantôme (advise=False) ne conseille jamais Index, même si elle rend périmée une valeur
+            # gardée (la valeur est refaite sur la ligne plantée juste avant : la purge de cette ligne la rend périmée)
+            ok=(before==0 and planted==[1] and after==0 and 'nouvelle base en service' in out and 'purge IDX_INCLUDE/IDX_EXCLUDE du fantôme' in out
+                and 'lancer Index pour recalculer' not in out)
             if not ok: print(f"  IDX_EXCLUDE : servie {before}, plantée {planted}, après {after}, {out[-300:]!r}")
             return ok
         def _rb_kill():
@@ -36002,7 +36136,10 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
             de t-2 : « ~8 », « ~52%nb » (par nom : 2 ajoutés, 6 modifiés, 3 supprimés). Le snapshot garde le nom principal de
             chaque second nom (linktarget, complet et incrémental). Décision 7 (row 57), avant les retraits : IdxPurge -x de m
             (1 ligne) laisse la valeur gardée de t-1,t-2 telle quelle, périmée (empreinte), lecteurs à la volée aux mêmes
-            comptes ; un Index sans archive nouvelle la refait (empreinte de maintenant), mêmes comptes."""
+            comptes ; un Index sans archive nouvelle la refait (empreinte de maintenant), mêmes comptes. Story 112 : la ligne « lancer
+            Index pour recalculer les comptes (borgHelper -c Index -n hl) » finit cet IdxPurge (valeur gardée rendue périmée), absente de
+            l'Index qui suit ; absente en -D, quand rien n'est à purger et pour une purge qui ne touche qu'une paire déjà périmée (les
+            snapshots retirés l'ont rendue périmée : vérifié), rien changé."""
             d=os.path.join(tmp,'liens-reel'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
             os.makedirs(os.path.join(src,'d_to_f'))
             env=_rb_env(bb,BORG_PASSPHRASE='pw-hl'); borg=shutil.which('borg')
@@ -36075,11 +36212,25 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
             # mêmes comptes ; puis Index (sans archive nouvelle) la refait
             cpg,opg=cli('IdxPurge','-n','hl','-x',src.lstrip('/')+'/m'); h1=hlv(); ep=state()
             cix,oix=cli('Index','-n','hl'); h2=hlv(); ei=state()
-            p57=((cpg,cix)==(0,0) and '1 entrées diff supprimées' in opg and h0[0] is not None and h0[0]==h0[1] and h1[0]==h0[0]
+            adv='  hl: lancer Index pour recalculer les comptes (borgHelper -c Index -n hl)'   # story 112 : dernière ligne d'IdxPurge, valeur gardée rendue périmée
+            p57=((cpg,cix)==(0,0) and '1 entrées diff supprimées' in opg and opg.rstrip().splitlines()[-1]==adv and adv not in oix
+                 and h0[0] is not None and h0[0]==h0[1] and h1[0]==h0[0]
                  and h1[1]!=h1[0] and h2[0]==h2[1]==h1[1] and ep==e0 and ei==e0)
             drop('t-1'); e1=state(); drop('t-2'); e2=state()
+            # story 112 (revue 1) : les snapshots retirés ont rendu périmée la valeur gardée de t-1,t-2 (vérifié) ; -D, rien à purger et
+            # une purge qui ne touche que cette paire déjà périmée : aucun conseil (il ne vient que d'une valeur rendue périmée PAR la purge)
+            def kept_hl():   # (nombre de valeurs gardées, somme des pair_id, paires périmées)
+                c=sqlite3.connect(os.path.join(d,'cache','rc-hl-diff.db'))
+                try: return (*c.execute("SELECT COUNT(*),COALESCE(SUM(pair_id),0) FROM diff_pair_hl WHERE nick='hl'").fetchone(),
+                             sorted(_hl_stale_pairs(c,'hl')))
+                finally: c.close()
+            kh0=kept_hl(); cdr,odr=cli('IdxPurge','-n','hl','-D','-x',src.lstrip('/')+'/n'); kh1=kept_hl()
+            cnn,onn=cli('IdxPurge','-n','hl','-x','zz-rien'); kh2=kept_hl()
+            cnk,onk=cli('IdxPurge','-n','hl','-x',src.lstrip('/')+'/k1'); kh3=kept_hl()
+            p112=((cdr,cnk,cnn)==(0,0,0) and kh0[0]>0 and ('t-1','t-2') in kh0[2] and kh1==kh0 and 'dry-run' in odr and adv not in odr
+                  and kh2==kh0 and adv not in onn and '1 entrées diff supprimées' in onk and adv not in onk and kh3==kh0)
             z=(0,0,0,0,0)
-            ok=((c1,c2)==(0,0) and (n1,n2)==(16,16) and r2.get('k2' if r1.get('k2')=='h' else 'k1')=='h' and p57
+            ok=((c1,c2)==(0,0) and p112 and (n1,n2)==(16,16) and r2.get('k2' if r1.get('k2')=='h' else 'k1')=='h' and p57
                 and e0=={'codes':z,'inch':(ex[0],ex[0]),'report':([ex[1]],[ex[1]]),'ah':ex[2]}
                 and e1['codes']==z and e1['inch']==(ex[3],ex[3]) and e1['report']==([ex[4]],[ex[4]])
                 and e2['codes']==z and e2['inch']==('~8','~8') and e2['report']==(['~52%nb'],['~52%nb']))
@@ -36088,7 +36239,8 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
                 print(f"  liens réels ({ver}) : Index {(c1,c2)} nfiles {(n1,n2)} rôles t-1 {r1} t-2 {r2} attendu {ex} ; exact {e0} ; "
                       f"sans snapshot t-1 {e1} ; sans les deux {e2} ; Index {o2[-200:]!r} ; décision 7 {p57} : codes {(cpg,cix)} "
                       f"gardée/maintenant avant {h0} après IdxPurge {h1} après Index {h2} ; comptes {ep==e0} {ei==e0} {ep} ; "
-                      f"IdxPurge {opg[-200:]!r} Index {oix[-200:]!r}")
+                      f"IdxPurge {opg[-200:]!r} Index {oix[-200:]!r} ; story 112 (conseil Index d'IdxPurge) {p112} : codes {(cdr,cnk,cnn)} gardées/périmées {kh0} {kh1} {kh2} {kh3} "
+                      f"-D {odr[-200:]!r} déjà périmée {onk[-200:]!r} rien {onn[-120:]!r}")
             return ok
         _rbc("Liens physiques sur vrai borg : comptes par inode (paires, nouveau nom, nom secondaire ou maître supprimé, type), snapshot absent -> « ~ »",_hardlinks_real_borg)
         def _report_files_real_borg():
@@ -36695,6 +36847,114 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
             if not ok: print(f"  code {c} ; archives {(count('m1'),count('m2'))} ; stderr {e[-300:]!r}")
             return ok
         _rbc("multi-nicks : Bkp, Ctrl-C pendant le premier nick, aucun suivant (vrai borg)",_mb_ctrlc)
+        def _archive_names_real_borg():
+            """1.0.220 (story 98, reports 93) : vrai borg, journal des argv du wrapper. Archives : `a{x}` (nom à accolades LITTÉRALES, créé
+            par `borg create ::a{{x}}`), `b{y}`, et `<hôte>-ns-1` (l'archive que borg désigne par `{hostname}-ns-1`). Attendu :
+            Restore / Mount / DiffBkp -b '{hostname}-ns-1' -> « Archive … does not exist », code 2, rien restauré ni calculé, l'archive
+            réelle jamais visée (Restore -L, Restore -w, Mount, DiffBkp) ; `a{x}` trouvée par Restore (-w et -L), DiffBkp (paire
+            enregistrée sous son vrai nom), Index : argv du journal (`diff --json-lines …::a{{x}} b{{y}}`, `list --format …
+            ::c{{z}}` snapshot complet de la dernière archive, puis, après `d{{w}}` : `list --format … ::d{{w}} pf:…` incrémental ; `Index -t` après `e{{v}}` : `info --json ::e{{v}}`) ET bases
+            (paires, archive_stats). DelBkp d'une archive absente (`absente`, ou `{hostname}-ns-1` sans archive de ce nom littéral) :
+            [ERREUR] « archive absente du dépôt : <nom> », code 1, AUCUN borg compact, mais bases rapprochées : une archive `p{q}` supprimée
+            hors borgHelper (borg brut) est retirée des bases ; archive présente (`a{x}`) : supprimée, code 0, compact lancé ; la redemander :
+            code 1. Chaque Mount est suivi d'un démontage (un mutant ou l'ancien code montent réellement l'archive)."""
+            d=os.path.join(tmp,'noms-reel'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo'); log=os.path.join(d,'borg.log')
+            dest=os.path.join(d,'dest'); os.makedirs(src); env=_rb_env(bb,BORG_PASSPHRASE='pw-98'); borg=shutil.which('borg')
+            def bg(*a):
+                r=_rb_run([borg,*a],120,env=env)
+                if r.returncode not in (0,1): raise RuntimeError(f"borg {a[0]} (code {r.returncode}) : {r.stderr[-300:]}")
+            def wr(q,t):
+                with open(os.path.join(src,q),'w') as f: f.write(t)
+            w=os.path.join(d,'borgw'); _rb_wrapper(w,bb,f"echo \"$*\" >> {shlex.quote(log)}\n"); rc=os.path.join(d,'rc')
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nMOUNTPOINT={os.path.join(d,'mnt')}\n\n[nm]\nBORG_REPO={repo}\nBORG_PASSPHRASE=pw-98\nSER_NAME=nm\n"
+                        f"SER_LOGIN=x\nGLOB_ARCH=*\nBORG_ARCHNAME=a\nBORG_ROOTBKP={src}\nDB_ENCRYPT=false\nIDX_WORKERS=1\nBORG_EXE={w}\n"
+                        f"BORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n")
+            os.chmod(rc,0o600); os.makedirs(os.path.join(d,'mnt'))
+            me=os.path.realpath(__file__); cenv=_rb_cli_env(bb)
+            def cli(*a):
+                p=_rb_run([me,'-C',rc,'-c',*a],300,env=cenv); return p.returncode,p.stdout+p.stderr
+            def logged():
+                try:
+                    with open(log) as f: ls=f.read().splitlines()
+                except OSError: ls=[]
+                if os.path.exists(log): os.unlink(log)
+                return ls
+            def names(): return [l.split(' ')[0] for l in _rb_run([borg,'list','--short',repo],60,env=env).stdout.splitlines()]
+            bg('init','-e','repokey',repo)
+            wr('f','un'); bg('create','--timestamp','2026-09-01T10:00:00',f'{repo}::a{{{{x}}}}',src)
+            wr('f','deux'); bg('create','--timestamp','2026-09-02T10:00:00',f'{repo}::b{{{{y}}}}',src)
+            wr('f','trois'); bg('create','--timestamp','2026-09-03T10:00:00',f'{repo}::{{hostname}}-ns-1',src)
+            wr('f','quatre'); bg('create','--timestamp','2026-09-04T10:00:00',f'{repo}::c{{{{z}}}}',src)   # dernière archive : à accolades (snapshot complet)
+            hn=[n for n in names() if n.endswith('-ns-1')][0]; res={}; rel=os.path.relpath(os.path.join(src,'f'),'/'); mnt=os.path.join(d,'mnt')
+            def db_rows(sql):
+                cn=sqlite3.connect(BorgHelper(cfgfile=rc,cache_dir=os.path.join(d,'cache')).db.get_diff_db('nm'))
+                try: return cn.execute(sql).fetchall()
+                finally: cn.close()
+            def unmount():   # un Mount qui aboutit (ancien code, mutant) laisse un démon FUSE détaché : démonté ici, quoi qu'il arrive
+                if os.path.ismount(mnt): cli('UMount','-n','nm')
+                if os.path.ismount(mnt):
+                    for fu in ('fusermount','fusermount3'):
+                        if shutil.which(fu): _rb_run([shutil.which(fu),'-u',mnt],60,env=env); break
+            c0,o0=cli('Index','-n','nm'); lg0=logged()
+            res['Index : sans « Invalid placeholder », code 0']=(c0==0 and 'Invalid placeholder' not in o0,c0,o0[-200:])
+            res['Index : borg diff des paires voisines, noms doublés (emplacement et ARCHIVE2)']=(
+                any(l==f'diff --json-lines {repo}::a{{{{x}}}} b{{{{y}}}}' for l in lg0) and any(l==f'diff --json-lines {repo}::b{{{{y}}}} {hn}' for l in lg0),lg0[:6])
+            res['Index : snapshot complet de la dernière archive à accolades (list --format … ::c{{z}})']=(
+                any(l.startswith('list --format') and l.endswith('::c{{z}}') for l in lg0),[l for l in lg0 if l.startswith('list')])
+            prs=db_rows("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick='nm'"); sts={r[0] for r in db_rows("SELECT archive FROM archive_stats WHERE nick='nm'")}
+            res['Index : paires (a{x},b{y}) et (hôte,c{z}) en base, statistiques de a{x}, b{y}, c{z}']=(('a{x}','b{y}') in prs and (hn,'c{z}') in prs and {'a{x}','b{y}','c{z}'}<=sts,prs,sts)
+            wr('f','cinq'); bg('create','--timestamp','2026-09-05T10:00:00',f'{repo}::d{{{{w}}}}',src)
+            c1,o1=cli('Index','-n','nm'); lg1=logged()
+            res['Index (2e) : snapshot incrémental de d{w} (list --format … ::d{{w}} pf:…), paire (c{z},d{w})']=(
+                c1==0 and any(l.startswith('list --format') and '::d{{w}} pf:' in l for l in lg1)
+                and ('c{z}','d{w}') in db_rows("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick='nm'"),c1,o1[-160:],lg1[:6])
+            wr('f','cinq-bis'); bg('create','--timestamp','2026-09-05T12:00:00',f'{repo}::e{{{{v}}}}',src)
+            c2,o2=cli('Index','-n','nm','-t','600'); lg2=logged()   # tranche : un `borg info ::<archive>` par archive sans statistiques
+            res['Index -t (3e) : borg info ::e{{v}}, statistiques et paire (d{w},e{v})']=(
+                c2==0 and 'info --json ::e{{v}}' in lg2 and 'e{v}' in {r[0] for r in db_rows("SELECT archive FROM archive_stats WHERE nick='nm'")}
+                and ('d{w}','e{v}') in db_rows("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick='nm'"),c2,o2[-160:],lg2[:8])
+            for lab,args in (('Restore -w',('Restore','-n','nm','-b','{hostname}-ns-1','-f',rel,'-w',dest)),('Restore -L',('Restore','-n','nm','-b','{hostname}-ns-1','-f',rel,'-L')),
+                             ('Restore --fidele',('Restore','-n','nm','-b','{hostname}-ns-1','-f',rel,'-w',dest,'--fidele')),
+                             ('Mount',('Mount','-n','nm','-b','{hostname}-ns-1')),('DiffBkp',('DiffBkp','-n','nm','-b','{hostname}-ns-1,b{y}'))):
+                try: c,o=cli(*args)
+                finally: unmount()
+                lg=' '.join(logged())
+                res[f'{lab} {{hostname}} : code 2, « does not exist », argv doublé']=(c==2 and 'does not exist' in o and '{{hostname}}-ns-1' in lg,c,o[-160:],lg[-160:])
+            res['Restore {hostname} : rien restauré ni monté']=(not os.path.exists(dest) and not os.listdir(mnt),)
+            pairs=db_rows("SELECT archive_old,archive_new FROM diff_indexed_pairs WHERE nick='nm'")
+            res['DiffBkp {hostname} : aucune paire enregistrée sous ce nom']=(not any('{hostname}' in x for p_ in pairs for x in p_),pairs)
+            c,o=cli('Restore','-n','nm','-b','a{x}','-f',rel,'-w',dest); lg=' '.join(logged())
+            got=open(os.path.join(dest,rel)).read() if os.path.isfile(os.path.join(dest,rel)) else None
+            res['Restore a{x} : trouvée, contenu de a{x}']=(c==0 and got=='un' and '::a{{x}}' in lg,c,got,o[-160:])
+            c,o=cli('Restore','-n','nm','-b','a{x}','-f',rel,'-L'); logged()
+            res['Restore a{x} -L : liste']=(c==0 and rel in o,c,o[-160:])
+            # paire NON consécutive (jamais calculée par l'Index) : calculée en direct par DiffBkp
+            c,o=cli('DiffBkp','-n','nm','-b','a{x},c{z}','-j'); lg=' '.join(logged())
+            res['DiffBkp a{x},c{z} : paire calculée, argv doublé (emplacement et ARCHIVE2)']=(c==0 and 'Invalid placeholder' not in o and '::a{{x}}' in lg.replace(repo,'') and 'c{{z}}' in lg,c,o[-200:],lg[-200:])
+            rb=_rb_run([borg,'diff','--json-lines',f'{repo}::a{{{{x}}}}','c{{z}}'],60,env=env)
+            res['DiffBkp a{x},c{z} : même diff que borg avec les noms littéraux']=(rb.returncode in (0,1) and ('modified' in o)==('modified' in rb.stdout),o[-120:],rb.stdout[-120:])
+            c,o=cli('DelBkp','-n','nm','-b','absente'); lg=logged()
+            res['DelBkp absente : [ERREUR], code 1, aucun compact']=(c==1 and '[ERREUR] nm : archive absente du dépôt : absente' in o and not any(l.startswith('compact') for l in lg),c,o[-200:],lg)
+            c,o=cli('DelBkp','-n','nm','-b','{hostname}-ns-1'); lg=logged()
+            res['DelBkp {hostname}-ns-1 : absente (nom littéral), code 1, archive réelle gardée, aucun compact']=(
+                c==1 and '[ERREUR] nm : archive absente du dépôt : {hostname}-ns-1' in o and hn in names() and not any(l.startswith('compact') for l in lg),c,o[-200:],lg)
+            # archive supprimée HORS borgHelper : encore dans les bases, DelBkp la dit absente (code 1, pas de compact) ET la retire des bases
+            wr('f','six'); bg('create','--timestamp','2026-09-06T10:00:00',f'{repo}::p{{{{q}}}}',src); cli('Index','-n','nm'); logged()
+            had=[r[0] for r in db_rows("SELECT archive FROM archive_stats WHERE nick='nm'")]
+            bg('delete',f'{repo}::p{{{{q}}}}')
+            c,o=cli('DelBkp','-n','nm','-b','p{q}'); lg=logged()
+            gone=[r[0] for r in db_rows("SELECT archive FROM archive_stats WHERE nick='nm'")]; gp=db_rows("SELECT 1 FROM diff_indexed_pairs WHERE nick='nm' AND (archive_old='p{q}' OR archive_new='p{q}')")
+            res['DelBkp p{q} supprimée hors borgHelper : code 1, aucun compact, archive fantôme retirée des bases (stats, paires)']=(
+                'p{q}' in had and c==1 and 'archive absente du dépôt : p{q}' in o and not any(l.startswith('compact') for l in lg) and 'p{q}' not in gone and not gp,c,o[-200:],had,gone,gp,lg)
+            c,o=cli('DelBkp','-n','nm','-b','a{x}'); lg=logged()
+            res['DelBkp a{x} : supprimée, code 0, compact lancé']=(c==0 and 'a{x}' not in names() and any(l.startswith('compact') for l in lg),c,o[-200:],lg)
+            c,o=cli('DelBkp','-n','nm','-b','a{x}'); lg=logged()
+            res['DelBkp a{x} redemandée : code 1, aucun compact']=(c==1 and 'archive absente du dépôt : a{x}' in o and not any(l.startswith('compact') for l in lg),c,o[-200:])
+            ko=[k for k,v in res.items() if not v[0]]
+            if ko: print(f"  noms d'archive : {[(k,res[k][1:]) for k in ko]}")
+            return not ko
+        _rbc("noms d'archive sur vrai borg : marqueurs {…} littéraux (Restore, Mount, DiffBkp, Index), `a{x}` joignable, DelBkp d'une archive absente : code 1 sans compact (story 98)",_archive_names_real_borg)
         def _diff_type_change_split():
             """1.0.163 (story 26, A38) : parse_diff_entries_json — lignes mesurées sur borg 1.2.6 (m25b, m26b)."""
             L=lambda path,*ch: json.dumps({'path':path,'changes':list(ch)})

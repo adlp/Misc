@@ -1616,7 +1616,7 @@ n'ayant rien relevé (archives rapprochées avant 1.0.187 : `—`).
 
 **Mode offline** (`-o`) — rapport sans appel borg, depuis `diff.db` uniquement :
 - `nfiles` et tailles par archive disponibles si `archive_stats` est peuplée (après `Bkp` ou `Index`)
-- `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp` ou `Prune` réel — dernière ligne historique, quel que soit son type)
+- `taille` (taille dédupliquée du dépôt entier) disponible si `repo_stats` est peuplée (après `Bkp` ou `Prune` réel — dernière mesure par date `updated_at`, `id` en départage, quel que soit son type)
 - `reste` (espace disponible) alimenté via `df` local — non disponible pour les dépôts distants SSH
 - `recuperable` toujours indisponible hors ligne (nécessite `borg prune --dry-run`)
 - Combinable avec `-j`, `-l`, `-N <n>`
@@ -1773,7 +1773,11 @@ tar intermédiaire, mémoire bornée quelle que soit la taille des fichiers), ch
   borg ; seconde lecture des liens physiques où borg réémet le second nom en lien vers le premier (sauté) : listé sauté
   (`lien physique : premier nom indisponible`) ;
 - nom d'archive passé à borg tel quel (accolades doublées : `{…}` n'est jamais un marqueur de borg ; `-L` compris), `-b` vide
-  refusé (code 2).
+  refusé (code 2). Même règle (1.0.220) pour **tout** nom d'archive donné à borg — `Mount`, `DiffBkp`, `Index` (paires, snapshots,
+  statistiques), et `borgHelperWWW` `/download/file`, `/download/tar` : `-b '{hostname}-x'` sans archive de
+  ce nom littéral -> « Archive … does not exist », code 2, rien restauré, monté ni calculé (avant : `Mount` montait, `DiffBkp`
+  comparait l'archive réelle `<hôte>-x`) ; une archive nommée `a{x}` (créée par `borg create ::a{{x}}`) est joignable (avant :
+  `Mount`, `DiffBkp` et l'`Index` de sa paire : « Invalid placeholder »).
 
 Avis **toujours** affiché sur stderr en mode sûr (code inchangé) : `mode sûr : attributs étendus et ACL non restaurés (--fidele
 pour les restaurer)` suivi de la commande `--fidele` complète à taper (`  mode fidèle (aucune protection des bases, du dépôt et du
@@ -1851,6 +1855,11 @@ borgHelper -c DelBkp -n mon-serveur -b archive-id
 
 `-b last` est refusé (nom exact attendu, code 2) ; depuis 1.0.206 un nom d'archive qui contient « last » est accepté
 (avant : refusé).
+
+Archive **absente du dépôt** (1.0.220 ; avant : code 0, rien dit, `borg compact` lancé quand même) :
+`[ERREUR] <nick> : archive absente du dépôt : <nom>`, **code 1**, pas de `borg compact` — un `cron` qui supprime une archive
+inexistante le voit ; les bases sont tout de même rapprochées (une archive supprimée hors borgHelper, encore listée, en est retirée). Le nom est littéral : `-b '{hostname}-x'` ne vise jamais l'archive que borg
+désignerait par ce marqueur.
 
 Opération prioritaire (1.0.142) : un `Index` en cours se met en pause, comme pour `Prune`.
 
@@ -2372,10 +2381,10 @@ borgHelper -c ArchiveHistory -n mon-serveur -j    # historique archive_stats (pa
 | `-j` | Sortie JSON `{borghelper_version,nick,rows:[...]}` (`RepoHistory` : `+ baseline`, 1.0.192) — sans `-j` : message court, pas de crash (mode texte non destiné à un usage interactif élaboré) |
 
 `RepoHistory -j` : une ligne par événement `repo_stats` (`id`,`op` (`'bkp'|'prune'|'index'`),`unique_csize`,
-`total_size`,`total_csize`,`updated_at`), ordonnées par `id` croissant. `updated_at` est en **UTC** (`datetime('now')` de
+`total_size`,`total_csize`,`updated_at`), ordonnées par `updated_at` croissant, `id` en départage (story 106 ; avant : par `id`). `updated_at` est en **UTC** (`datetime('now')` de
 SQLite), contrairement à `archive_date` d'`ArchiveHistory` (heure locale de borg). `history.db` sans table `repo_stats` (fichier vide,
 en-tête seul, vue seule) : `rows: []` (1.0.176 ; avant : `{"error": … no such table}`).
-Depuis 1.0.192 : `baseline` — dernière mesure d'avant la fenêtre `STATS_RETENTION_MONTHS` (plus grand `id`), même forme
+Depuis 1.0.192 : `baseline` — dernière mesure d'avant la fenêtre `STATS_RETENTION_MONTHS` (la plus récente par `updated_at`, `id` en départage — story 106), même forme
 qu'une ligne de `rows`, **hors** `rows` ; `null` s'il n'y en a pas (aucune mesure, ou toutes dans la fenêtre). La purge à
 l'écriture la garde (une seule par nick). Elle sert à chiffrer le gain d'un Prune qui ouvre la fenêtre (l'UI ne la dessine
 jamais) ; rien n'est calculé côté serveur.
@@ -2794,6 +2803,14 @@ borgHelper affiche `[ERREUR] DB occupée : … réessayer plus tard (ne PAS supp
 à supprimer le fichier pour reconstruire. Supprimée pendant qu'un Index, un Bkp ou borgHelperWWW la tenait encore ouverte,
 une `diff.db` ou une `cache.db` ne peut pas être recréée tout de suite : `[ERREUR] DB : … recréée alors qu'un autre processus tenait encore
 l'ancienne ouverte` (1.0.169) — attendre la fin de ce processus, puis relancer ; ne rien supprimer de plus.
+
+**Conseil de fin (story 112) :** `IdxPurge` ne recalcule pas lui-même les comptes par inode des paires touchées (leurs valeurs
+gardées deviennent périmées : Report et IdxTop les calculent à la volée, plus lentement sur un dépôt à beaucoup de liens physiques,
+jusqu'à un `Index -n <nick>` simple — ni un Bkp, ni une tranche à échéance — qui les refait). Si CETTE purge (lignes de `diff_index`
+ou snapshots) a rendu périmée au moins une valeur gardée, sa **dernière ligne**, par nick, est :
+`  <nick>: lancer Index pour recalculer les comptes (borgHelper -c Index -n <nick>)`. Rien en `-D`, rien quand il n'y a rien à purger,
+rien si les valeurs périmées l'étaient déjà avant la purge, rien dans la purge interne d'une reconstruction (`Index --rebuild`). Avec
+borgHelperWWW, `POST /idxpurge` relaie cette ligne telle quelle dans le `stderr` de sa réponse (l'UI l'affiche).
 
 > **Workflow recommandé :**  
 > `IdxTop` → identifier les arborescences volumineuses → ajouter à `IDX_EXCLUDE` dans borghelperrc → `IdxPurge` (sans `-x`) pour purger l'historique existant.

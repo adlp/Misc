@@ -1,5 +1,65 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.220, borgHelperWWW 1.36.1 — Report par date, IdxPurge conseille Index, noms d'archive littéraux — 2026-11-18
+
+Lot de trois stories (106, 112, 98), vérifiées ensemble.
+
+### Report : dernière taille de dépôt prise par date, pas par id
+
+Story 106 (report 87a, deferred-work l. 1023). `get_repo_stats` lisait `ORDER BY id DESC LIMIT 1` : une ligne `repo_stats` recopiée
+tard par la migration vers `history.db` (écrite par un ancien binaire après `done`) a un id plus grand qu'une mesure plus récente,
+et Report (colonne `taille`) affichait une taille de dépôt ancienne. Storage lisait déjà par `updated_at`, `id` en départage.
+
+- **borgHelper — `get_repo_stats` : `ORDER BY updated_at DESC, id DESC`** (même ordre que `get_storage_measures`). Consommateurs
+  alignés d'office : colonne `taille` de Report (`-o`), comparaison de `_refresh_repo_point` (ligne `index` écrite seulement si la taille a changé). Format de
+  `updated_at` vérifié : un seul dans `repo_stats` (`datetime('now')`, à l'écriture et à la copie de migration), le tri par texte est
+  chronologique. Aucune ligne existante réécrite, schéma et index inchangés.
+- **borgHelper — `rows` de `RepoHistory -j`** triées par `updated_at`, `id` en départage (l'UI prend `rows[i-1]` pour « mesure précédente » du gain d'un Prune : un ordre par id la faisait remonter sur une ligne recopiée tard). Décision d'agent, à valider : l'ordre visible de l'API JSON change (contenu inchangé).
+- **borgHelper — jumelles alignées** : `baseline` de `RepoHistory -j` et la purge de `store_repo_stats` (base épargnée) prenaient
+  « la plus grande id » avant la fenêtre ; elles prennent la plus récente par `updated_at`, `id` en départage — la ligne que la purge garde
+  reste celle que `baseline` rend. `archive_stats` lit déjà par `archive_date` : inchangé.
+- **Contrôles** : `repo_stats : get_repo_stats et purge par date…` et `RepoHistory -j : baseline et purge par updated_at…` (deux lignes,
+  id et date en ordre inverse) ; les deux échouent sur l'ancien code.
+
+### IdxPurge conseille de lancer Index
+
+Story 112 (décision de l'utilisateur du 2026-10-22, Q88-1 = B, suite de la décision 7 de la story 88).
+
+- **borgHelper — `IdxPurge` finit par un conseil.** Après une purge (hors `-D`), si CETTE purge a rendu périmée au moins une
+  correction par inode gardée (même empreinte que les lecteurs, `_hl_stale_pairs` lu avant et après le commit ; lignes de
+  `diff_index` ou snapshots), la dernière ligne du nick est `  <nick>: lancer Index pour recalculer les comptes (borgHelper -c Index -n <nick>)` :
+  seul un `Index -n <nick>` simple les refait (ni un Bkp, ni une tranche à échéance), et Report/IdxTop restent plus lents sur un dépôt à
+  beaucoup de liens physiques tant qu'il n'est pas lancé. Rien en `-D`, rien s'il n'y a rien à purger, rien si les valeurs périmées
+  l'étaient déjà, rien dans la purge interne d'une reconstruction (`advise=False`). Le compte se fait hors verrou d'écriture, après le
+  commit : une erreur de ce compte ne perd jamais la purge. Ligne ajoutée à l'aide `-h` d'IdxPurge. IdxPurge ne relance toujours pas la
+  passe de calcul. borgHelperWWW : `POST /idxpurge` relaie la ligne dans son `stderr` (rien à changer). Contrôles : « Liens physiques :
+  comptes par inode » (plain et chiffré : présente en purge totale, partielle et de snapshots seule ; absente en `-D`, sans rien à
+  purger, valeur déjà périmée, `advise=False`, paire disparue) et « Liens physiques sur vrai borg » ; « fantôme : IDX_EXCLUDE » (aucun
+  conseil dans une reconstruction).
+
+### Noms d'archive littéraux partout, DelBkp d'une archive absente
+
+Story 98 (reports 93 ; décision de l'utilisateur du 2026-10-22, Q98-1 : recommandation A). Mesuré sur 1.0.219 (borg 1.2.6, bac neuf, deux
+archives dont `a{x}` créée par `borg create ::a{{x}}`) : `Restore` et `DelBkp` étaient déjà littéraux (1.0.206, 1.0.214) mais pas les autres
+sites qui composent `::<archive>`.
+
+- **borgHelper — `Mount`, `DiffBkp`, `Index` : nom d'archive littéral (`_borg_literal`)** : `Mount -b '{hostname}-ns-1'` **montait l'archive
+  réelle** `<hôte>-ns-1` (code 0, rien dit) ; `DiffBkp -b '{hostname}-ns-1,real-1'` comparait l'archive réelle et enregistrait une paire sous
+  le nom à marqueur ; une archive nommée `a{x}` n'était joignable ni par `Mount` ni par `DiffBkp` ni par l'`Index` de sa paire
+  (« Invalid placeholder "x" »). Désormais « Archive … does not exist », code 2, rien monté ni calculé ; `a{x}` jointe. Même correctif aux
+  `borg list` des snapshots (incrémental et complet) et aux `borg info` des statistiques par archive. `ARCHIVE2` de `borg diff` aussi (mesuré :
+  remplacé comme l'emplacement).
+- **borgHelper — `DelBkp` d'une archive absente du dépôt** : `[ERREUR] <nick> : archive absente du dépôt : <nom>`, **code 1**, pas de
+  `borg compact` ; les bases sont rapprochées comme après un `borg delete` réussi (une archive supprimée hors borgHelper, encore dans
+  les bases, en est retirée — décision de l'utilisateur ; avant : code 0, rien dit, compact lancé). `borg delete` 1.2.6 rend ici code 0 et
+  `Archive <nom> not found (1/1).` (la spec attendait « does not exist », reconnu aussi) ; le nom exact est exigé dans la ligne.
+- **borgHelperWWW — `/download/file`, `/download/tar`** : nom d'archive littéral (`_borg_literal` importé de borgHelper), y compris la « dernière
+  archive » rendue par `borg list`.
+- Paires enregistrées avant ce correctif sous un nom à marqueur (ex. `real-1 → {hostname}-x`, écrite par l'ancien `DiffBkp`) : encore servies
+  par `DiffBkp` depuis la base jusqu'au prochain `Index`, qui les purge (archive absente du dépôt).
+- Contrôle `noms d'archive sur vrai borg` (CodecSelfTest) : Restore/Mount/DiffBkp/Index avec `{hostname}-ns-1` et `a{x}`, DelBkp absente
+  et présente, journal des argv (doublement, aucun `compact`).
+
 ## borgHelper 1.0.219, borgHelperWWW 1.36.0, UI 1.28.1 — Exploration d'un nick : lecture rapide, vue d'une archive épinglée juste — 2026-11-18
 
 Story 121 (demande de l'utilisateur du 2026-11-12 : ouvrir un répertoire de l'explorateur prend « un temps monstre », d'autant plus que
