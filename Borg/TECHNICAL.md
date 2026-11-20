@@ -207,7 +207,7 @@ Métadonnées de versionning du schéma — une ligne par clé.
 | Clé | Valeur | Notes |
 |-----|--------|-------|
 | `schema_version` | entier (ex : `"1"`) | Incrémenté uniquement lors d'un changement de schéma |
-| `borghelper_version` | chaîne (ex : `"1.0.41"`) | Écrite seulement si elle diffère de la valeur déjà stockée (Story 1.5, voir ci-dessous) |
+| `borghelper_version` | chaîne (ex : `"1.0.41"`) | Écrite seulement par une version STRICTEMENT plus récente que la valeur stockée, ou si celle-ci est absente/illisible (Story 1.5 ; story 129, 1.0.222, voir ci-dessous) |
 
 Au démarrage : si `schema_version` stockée > constante attendue (`DIFF_DB_SCHEMA_VERSION` / `CACHE_DB_SCHEMA_VERSION`) → erreur + exit. Indique que la DB a été créée par une version plus récente incompatible.
 
@@ -216,12 +216,44 @@ Au démarrage : si `schema_version` stockée > constante attendue (`DIFF_DB_SCHE
 de la DB, même sans le moindre changement — chaque appel `borgHelper` étant un sous-processus distinct,
 la fermeture de la connexion SQLite déclenche un checkpoint WAL qui avance la date de modification du
 fichier `.db` **même pour un appel en lecture pure**. Désormais, chaque ligne n'est réécrite que si sa
-valeur stockée diffère réellement de la nouvelle (la valeur est de toute façon déjà lue pour la
+valeur stockée diffère réellement de la nouvelle (`schema_version` : seulement remontée à la version de base ;
+`borghelper_version` : règle plus étroite depuis la story 129, voir le paragraphe suivant) (la valeur est de toute façon déjà lue pour la
 comparaison `stored>schema_version`, aucun coût supplémentaire). Un appel en lecture qui ne modifie
 aucune donnée laisse maintenant `cache.db`/`diff.db` bit-pour-bit inchangés, y compris leur date de
 modification — condition nécessaire (avec le correctif `ensure_diff_db()` ci-dessous) pour que le
 cache SQLite par périmètre de `borgHelperWWW` (Story 1.5, voir README.md) puisse jamais produire un
 hit : sa clé d'invalidation inclut ces dates de modification, capturées **avant** l'appel `borgHelper`.
+
+**`borghelper_version` : réécrite seulement par une version plus récente (story 129, 1.0.222)** : la règle de la Story 1.5
+(`stored != Version`) réécrivait la valeur à chaque passage d'une version DIFFÉRENTE, plus ancienne comprise. Deux versions qui
+lisent la même base en alternance (la CLI et le `borgHelper` de borgHelperWWW, pas mis à jour ensemble) l'écrivaient donc à
+chaque fois — 20 alternances sur 20 mesurées (audit 2026-11-19, rapport §3.3 c) — ce qui avançait le mtime de `diff.db`/`cache.db`
+et périmait le cache de réponses de WWW. `_check_set_meta` n'écrit plus que si `_version_newer(Version, stockée)` :
+
+- comparaison numérique par composant, composants manquants = 0 (`1.0.99 < 1.0.100`, `1.0 = 1.0.0`), jamais par texte ; les espaces
+  autour sont ignorés (` 1.0.300 ` = `1.0.300`) ;
+- égale ou plus ancienne : rien n'est écrit, donc ni `INSERT`, ni verrou d'écriture pris (un lecteur n'attend plus `_READER_WRITE_WAIT`
+  ce verrou pour cela) ; la base et son `-wal` restent bit-pour-bit et mtime inchangés ;
+- stockée absente, `NULL`, vide ou illisible (pas `n.n.n` : suffixe `-dev`/`rc1`, préfixe `v`, texte, octets, composant vide) : écrite,
+  comme avant ; version du programme illisible : jamais écrite, base neuve comprise (`Version` est une constante numérique) ;
+- plus récente que la valeur stockée : écrite, attente et abandon d'un lecteur sur verrou tenu inchangés (`_reader_busy_skip`) ;
+- `schema_version` et sa barrière ne sont pas concernés.
+
+**Condition de l'effet.** L'alternance ne cesse que lorsque TOUTES les versions qui ouvrent la base portent cette règle, donc quand la
+CLI ET le `borgHelper` de borgHelperWWW sont mis à jour. Une version d'avant la règle (`!=`) exécute son ancien code : elle réécrit sa
+valeur à chaque passage, et la version munie de la règle réécrit la sienne au passage suivant (mesuré : le code de la story, numéroté
+plus récent, contre le binaire 986cfe2 réel : 20 écritures sur 20).
+
+Conséquence assumée (diagnostic) : `borghelper_version` n'est plus « la version qui a ouvert la base en dernier » mais « la plus récente
+qui l'a ouverte, parmi les versions munies de la règle » (une version d'avant la règle y pose encore la sienne).
+
+**Mesure** (base fabriquée dans un bac, 20 passages alternés ; empreinte = mtime, taille, sha256 des trois bases et des `-wal`). Le « courant »
+est le code de la story (copie numérotée 1.0.222 pour la mesure) ; l'« ancien » est, selon la ligne, une COPIE du même code à `Version=1.0.200`
+(une future version plus ancienne MUNIE de la règle : ce binaire n'a jamais existé) ou le vrai binaire d'avant (986cfe2, 1.0.220).
+LstBkp, DuIdx, Status (`diff.db`) et CacheInfo (`cache.db`) : avant la règle, 19 écritures sur 20 (une par passage, sauf le premier, de la
+version déjà stockée) ; deux versions munies de la règle : 1 sur 20 (premier passage de la plus récente) ; code de la story contre le
+binaire réel d'avant : 20 sur 20. `history.db` n'est atteinte par aucune des commandes mesurées (RepoHistory, ArchiveHistory : 0 écriture
+avant et après) : elle n'est couverte que par les contrôles de CodecSelfTest. Sorties : `_bmad-output/work/s129/mesure_complete.txt`.
 
 #### `diff_index`
 Stocke chaque événement de fichier entre deux archives consécutives.
@@ -2319,6 +2351,78 @@ Instructions SQLite de `_treehist_listing` après : gros répertoire `-b ALL` 1,
 Le plancher d'un clic est maintenant le démarrage de l'interpréteur et la KDF (base chiffrée), puis la lecture de la dernière archive
 (racine : ses N lignes parcourues en Python).
 
+### Exploration par saut d'index (borgHelper 1.0.222, borgHelperWWW 1.36.2, story 126)
+
+**Cause** (audit du 2026-11-19, base de production : un nick, 2 snapshots de 791 000 entrées, `diff.db` 1,9 Go chiffrée siv1, 15 paires indexées) : les requêtes
+de snapshot de `TreeHist` (`archive_snapshot_v WHERE nick=? AND archive=? AND instr(substr(path,K),'/')=0`, puis le `DISTINCT substr` des segments, puis la
+ligne propre) se planifient en `SEARCH s USING COVERING INDEX sqlite_autoindex_archive_snapshot_1 (nick=? AND archive=?)` + `SEARCH sf USING INTEGER PRIMARY KEY` :
+SQLite parcourt les 791 000 lignes de l'archive et fait une recherche par rowid dans `snapshot_file` pour chacune, la borne de chemin n'étant testée
+qu'après la jointure. Le coût dépend de la taille de l'archive, pas de celle du dossier : 1,1 Go lus à froid et 5-7 s à chaud pour un dossier de 5 entrées comme pour
+la racine. `FileHist` : `archive_snapshot_v WHERE nick=? AND path=?` lisait les 1,58 M lignes des deux snapshots pour UN fichier (1,3-3,4 s).
+
+**Principe** (aucun changement de format) : le chemin est CHERCHÉ au lieu de filtrer l'archive. `snapshot_file` se lit par `idx_snapfile_nick_path` (`INDEXED BY`), l'appartenance
+à l'archive se teste par la clé primaire `(nick,archive,file_id)` de `archive_snapshot` (`CROSS JOIN` : ordre de jointure imposé, comme la story 121). Trois briques
+(`_SNAP_FROM`, `_SNAP_MEMBER` : les deux moitiés du plan, partagées par toutes) :
+
+| fonction | rôle |
+|---|---|
+| `_snap_own(conn,n,archive,stored)` | ligne propre (type, droits, propriétaire) d'UN chemin stocké dans l'archive : une recherche ; sert à la ligne du dossier listé et, en `-X`, à chaque entrée changée |
+| `_snap_kids(conn,n,archive,stored_prefix)` | enfants directs d'un dossier -> `{segment: [descendants ?, type, mode, owner]}` ; hybride lecture d'un trait / saut d'index |
+| `_diff_direct_paths(conn,n,stored_prefix)` | chemins de `diff_index` qui sont enfants directs (candidats « supprimés ») ; même hybride, sans appartenance |
+
+**Saut d'index** (`_snap_kids`, sous-arbre de plus de `_SNAP_SCAN_MAX` lignes) : à chaque tour, UNE requête rend la première ligne MEMBRE de l'archive après le curseur
+(`sf.path>? AND sf.path<hi ORDER BY sf.path LIMIT 1`, marqueur `/*saut*/` ; les lignes d'autres archives sont écartées au passage par la recherche en clé primaire).
+Segment = reste du chemin jusqu'au prochain `/`. Ligne PROPRE (`seg` seul) : l'enfant est une feuille jusqu'à preuve du contraire, le curseur passe à cette ligne (revue 1 : une seule requête
+par feuille ; la première version cherchait en plus un descendant par une requête `LIMIT 1` puis refaisait ce parcours : 2 requêtes par feuille et un double parcours des sous-arbres d'autres archives).
+Ligne SOUS `seg/…` : le dossier a des descendants (sa ligne propre, si l'archive la contient, est déjà lue : elle passe avant), le curseur saute le sous-arbre (`>= seg0`, `'0'` = `'/'`+1).
+Une requête par feuille, deux par dossier. **Pourquoi pas un saut direct après `seg`** : dans l'ordre des chemins, les frères dont le nom commence par `seg` suivi d'un caractère
+inférieur à `/` (`.`, `-`, espace) se trouvent ENTRE `seg` et `seg/…` : `foo`, `foo-bar`, `foo.txt`, `foo/x`. Sauter à `foo0` dès `foo` les perd ; chercher « le frère après `foo` »
+puis « après le sous-arbre » revient à `foo` par `foo/x` et boucle sans fin (le prototype de l'audit, `work/audit/out/proto.py`, avait ce défaut : 18/18 cas identiques
+sur la base de l'utilisateur, où aucun nom n'est préfixe d'un autre segment, mais boucle infinie sur `foo`, `foo.txt`, `foo/x`). Ici on ne saute qu'en arrivant DANS le sous-arbre ;
+le contrôle `_s126_kids_structure` écrit ces chemins à la main et coupe toute boucle par un gestionnaire de progression.
+
+**Preuve d'ordre (chemins chiffrés)** — le saut ne suppose rien sur l'ordre des valeurs chiffrées, seulement leur STRUCTURE : (1) un chemin stocké est `seg1/seg2/…`, chaque segment sur
+l'alphabet `A-Za-z0-9.-` (`_b64e` : `+`->`.`, `/`->`-`), jamais `/` : le sous-arbre de `p` est exactement `[p/, p0)` (aucun caractère entre `/` et `0`) — le même intervalle que `PathCodec.prefix_bounds`,
+déjà employé par toutes les lectures ; (2) la comparaison est BINARY (octets) en base claire comme chiffrée ; (3) la liste des enfants est triée en Python (`sorted(children)`) sur les noms DÉCODÉS,
+l'ordre de visite est sans effet sur la sortie ; (4) `-` et `.` (0x2D, 0x2E) étant < `/`, un segment chiffré peut être préfixe d'un autre (`seg` / `seg-…`) : le cas des frères « entre » est traité
+(ci-dessus), il n'a jamais lieu en pratique (le segment commence par 12 octets de tag HMAC, `_PATH_TAG_LEN` : deux segments de même début sont improbables). **Mesuré sur la base chiffrée de production** (`work/s126/ordre.py`, comptes seulement) : 0 chemin stocké hors alphabet,
+0 segment vide ; 3 997 dossiers par archive (7 994 lectures sur les deux snapshots, 101 251 enfants au total) lus par saut d'index (seuil 0) ET par lecture complète du sous-arbre : 0 différence
+(`{segment: (descendants, type, droits, propriétaire)}`) ; 0 paire de frères dont l'un est préfixe de l'autre. **Portée de cette mesure** (revue 1) : la référence de `ordre.py` est la lecture d'un trait de `_snap_kids` (`_SNAP_FROM`/`_SNAP_MEMBER`), PAS l'ancienne requête par la vue ; la racine et les sous-arbres de plus de 400 000 lignes n'y sont pas comparés. Elle prouve que le saut d'index égale la lecture d'un trait sur les données réelles ; l'égalité avec 1.0.220 vient des 25 cas comparés octet pour octet sur la base de l'utilisateur et des contrôles contre les références lentes (bases fabriquées, différentiel aléatoire).
+
+**Seuil de l'hybride** (`_SNAP_SCAN_MAX = 1000`) : une sonde (`SELECT COUNT(*) FROM (SELECT 1 … LIMIT ?)` sur l'index couvrant, au plus T+1 entrées) compte les lignes du sous-arbre, toutes archives ; au plus T :
+une lecture d'un trait (lignes membres, regroupées par segment en Python) ; au-delà : saut d'index. Mesuré (`work/s126/seuil.py`, 108 dossiers réels, `-b` dernière archive, à chaud, meilleur de 2-3, après la simplification de la revue 1 :
+une requête par feuille) : lecture d'un trait ≈ 6-10 µs par ligne du sous-arbre, saut d'index ≈ 17 µs par feuille et quelques dizaines de µs par dossier ; le saut gagne dès que les enfants sont rares (419 000 lignes, 217 enfants : 14 ms ; 170 222 lignes,
+6 enfants : 0,4 ms contre 2,5 à 3 s en lecture d'un trait), la lecture d'un trait gagne dans un dossier plat (10 564 fichiers : 0,076 s contre 0,18 s ; avant la simplification : 0,46 s). Somme des temps sur les 108 dossiers selon T :
+300 : 0,27 s ; 1 000 : 0,28 s ; 2 000 : 0,36 s ; 5 000 : 0,41 s ; 8 000 : 0,55 s ; 10 000 : 0,73 s ; 12 000 : 0,63 s ; 25 000 : 1,08 s ; lecture d'un trait seule : 9,9 s (2,9 s au pire). Le saut ne coûtant plus que ~2,4 x la lecture d'un trait même dans le pire cas
+(dossier plat), alors que la lecture d'un trait peut coûter 1 000 x le saut (peu d'enfants, gros sous-arbre), le seuil est BAS : T = 1 000 (pire coût de la lecture d'un trait : 7 ms ; l'ancien seuil de 12 000 coûtait jusqu'à 76 ms par clic sur sept dossiers réels pour gagner 0,1 s sur « gros »).
+**Limite connue** : un dossier plat de beaucoup de feuilles (Maildir) passe au saut, ~2,4 x la lecture d'un trait : base fabriquée chiffrée, 60 000 fichiers dans un dossier, 1 snapshot de 60 000 entrées, machine chargée (load 12) : `_snap_kids` seul 0,99 s en saut,
+0,47 s en lecture d'un trait ; listage complet 1,6 s (hybride, T = 1 000) à 2,4 s, ancien code 3,1 s sur cette petite archive (le décodage des 60 000 noms, ~1,3 s, domine) ; sur une archive de 791 000 entrées l'ancien code coûte 5-7 s de plus. Avant la simplification de la revue 1 : saut 2,8 s, lecture d'un trait 1,4 s (2 requêtes par feuille).
+**Limite connue (revue 2, R2-4) : un sous-arbre présent seulement dans une AUTRE archive.** Le saut écarte les lignes d'autres archives par une recherche en clé primaire PAR LIGNE : un dossier vidé ou supprimé dans l'archive listée (ligne propre seule, ou plus rien) mais plein dans un snapshot plus ancien encore gardé, ou la vue épinglée d'une archive ancienne alors qu'un gros dossier a été ajouté depuis, se parcourt ligne à ligne. Mesuré (revue 2) : 30 000 fichiers sous un dossier d'une autre archive, 308 000 instructions SQLite, 19 à 26 ms ; sur un dossier de 400 000 entrées supprimé : ~0,3 s. Le coût est borné par les lignes des AUTRES snapshots sous le dossier, donc jamais au-delà de l'ancien balayage d'une archive réelle de même taille — mais « coût proportionnel au dossier » est exact pour l'archive listée, pas pour les autres. Résultat toujours exact.
+
+**Autres lectures de `TreeHist`** : (a) `_events_for` reçoit le chemin STOCKÉ de l'entrée (lu en SQL) : plus de `_path_stored(full_path)` ni de deux `_psel_under` par entrée (3 encodages complets, 74 000 HMAC pour 10 564 entrées) ;
+(b) les événements des sous-répertoires et ceux du répertoire listé (`.`) viennent d'UNE lecture `GROUP BY (enfant direct, archive_new, archive_new_date)` du sous-arbre de `diff_index` (`_deep_fill`, au lieu d'une lecture du sous-arbre PAR répertoire : 18 x 40 000
+lignes au 2e niveau) : le coût reste proportionnel aux lignes du sous-arbre de `diff_index` (aucun index ne couvre `(nick,path,archive_new)`, la ligne est lue pour `archive_new`) : ~5 µs par ligne, 0,2 s pour 44 700 lignes.
+**Ordre à date égale** (revue 1, C-1 : deux archives de même seconde — `--timestamp`, recreate, transfert) : l'ancienne lecture `SELECT DISTINCT archive_new,archive_new_date … ORDER BY archive_new_date` rendait les paires dans l'ordre de PREMIÈRE APPARITION du parcours
+(le tri SQL est stable) : par (chemin, id) sous un préfixe (parcours de `idx_diff_nick_path`), par id à la racine (parcours de `idx_diff_nick_date`) ; ce n'est PAS l'ordre des noms. `_deep_fill` lit donc, par groupe, `MIN(path||char(0)||printf('%020d',id))` et `MIN(id)`
+et trie sur (date, rang) — rang par chemin pour les enfants et pour `.` sous un préfixe, rang par id pour `.` à la racine : mêmes sorties qu'avant, vérifiées par le décor `kz`/`ka` (même date, noms inversés par rapport à l'indexation, chemins inversés par rapport à l'indexation) et par le différentiel aléatoire à dates égales ;
+(c) les candidats « supprimés » se lisent par `_diff_direct_paths` (le sous-arbre entier de `diff_index` n'est plus lu : 0,09 s -> quelques ms), et un enfant déjà lu dans le snapshot n'est plus décodé deux fois ;
+(d) **transaction de lecture, défense en profondeur** (revue 1, C-6 ; revue 2, R2-2/R2-3) : `_treehist_listing`, `_treehist_changes` et `FileHist` passent par le gestionnaire `_read_tx` existant (story 88 : `BEGIN` différé si l'appelant n'est pas déjà dans une transaction, base en WAL seulement, rollback à la fin). `TreeHist` ouvrait DÉJÀ une transaction avant la dernière archive (1.0.219) : par la CLI ou WWW `_read_tx` ne fait rien et rien ne change. Il garantit qu'un appel DIRECT des méthodes lit aussi un seul instantané — les milliers d'instructions du saut, ou les 2+2K de FileHist, ne verraient sinon chacune que leur état WAL (un Index ou une purge `IDX_SNAP_KEEP` validant entre deux : listage partiel).
+
+**`FileHist`** : une requête par archive de `_snapshot_archives` (K sauts d'index, story 121) : `snapshot_file` par `(nick,path)` + clé primaire d'`archive_snapshot` + le `NOT EXISTS` d'avant (`_snap_notin`, paramétré
+par les colonnes de la ligne). Même lignes, même ordre (archives par nom croissant = l'ordre du balayage d'avant, tri stable par date). 1,8-4,4 s -> 0,20-0,23 s.
+
+**JSON compact** (`TreeHist -j` seulement) : `BORGHELPERC_JSON_COMPACT=1` -> `json.dumps(..., separators=(',',':'))` sur une ligne ; toute autre valeur ou l'absence de la variable : `indent=2` comme avant. borgHelperWWW la pose dans
+`_build_borghelper_argv_env` (point commun des lancements ; seul TreeHist la lit) et, quand il ré-écrit la sortie — `_expose_stdout` (nicks exposés), `_merge_parts` (plusieurs rc), `_scoped_filter_result` (appelant à périmètre), `_scoped_cached_multi` (réponse servie du cache par périmètre : la forme ne dépend pas de l'état du cache) — garde la forme compacte pour TreeHist (`_dumps_like` : compacte si toutes les sorties lues tiennent sur une ligne, indentée sinon, et pour toute autre commande). « gros » dossier (10 565 entrées) : 3,47 Mo -> 2,58 Mo, ~0,1 s.
+
+**Contrôles** (CodecSelfTest, `_s126_*`, bases fabriquées claire `ep` et chiffrée `ee`, 6 archives dont `kz` et `ka` de même date, versions multiples, lien physique, entrées d'autres archives seulement, dossier de 320 entrées, dossier à un enfant de 400 descendants, nom non UTF-8 en chiffré ; chaque échec s'affiche en dict `{sous-contrôle: …}`) :
+`_s126_same_as_reference` (JSON IDENTIQUE, même ordre, à la référence lente d'avant : `_s126_ref_listing` = `_treehist_listing` de 1.0.220 y compris la vue épinglée, `_s121_ref_changes` ; ~2 800 combinaisons ; stratégies forcées par `_SNAP_SCAN_MAX` = 0 / 6 / énorme,
+sauts d'index tracés par leur marqueur ; ordre à date égale écrit en dur : racine par id, préfixe en clair par chemin), `_s126_content` (contenu attendu écrit en dur), `_s126_kids_structure` (chemins écrits à la main), `_s126_filehist_same` (`_s126_ref_filehist`), `_s126_plans` (aucune requête ne lit `archive_snapshot` hors clé primaire complète — lignes de plan retenues par table, alias `s` ou index `idx_snap_nick_archive` ;
+saut sans TEMP B-TREE ; cinq témoins dont la jointure sans `s.archive=?` et la jointure forcée sur `idx_snap_nick_archive`), `_s126_cost` (6 000 entrées de plus hors du dossier : coût < 1,6 x ; la référence : > 5 x), `_s126_skip_cost`, `_s126_read_tx` (un écrivain qui valide entre deux instructions ne change rien ; vue normale, -X et FileHist), `_s126_compact_json` ; borgHelperWWW : `_child_json_compact`, `_compact_relay` (quatre relais). Chaque échec n'affiche que les sous-contrôles en échec. Gardes existantes adaptées :
+`_plans_ok` (seule la clause `ORDER BY path LIMIT 1` d'une requête de saut, marquée `SELECT /*saut*/`, est retirée avant le test LIKE/GLOB/ORDER BY), `_s121_plans_ops` (requêtes `d.path=sf.path` de FileHist ; lecture groupée d'événements choisie par son texte `GROUP BY 1,2,3` + `(path>='`, pas par l'indice qu'elle doit montrer). Ces contrôles tournent aussi hors selftest par `work/s126/run_checks.py` et `run_www.py` (extraction par AST des mêmes fonctions).
+
+**Mesures** (base de production copiée, `work/s126/batch.py`, CLI par le lanceur de WWW, 1 froid / 2 chauds entrelacés avant/après, load 7 à 47 ; froid = pages retirées du cache de l'OS ; sorties identiques à 1.0.220 sur les 25 cas) : voir CHANGELOG ; à charge moyenne (load 7, 5 passages à chaud) racine 0,33 s, niveau 1 0,30 s, niveau 2 0,34 s, niveau 3 0,21 s, « actif » 0,30 s ; sous charge forte le niveau 2 monte à 0,5-0,67 s
+(sous-arbre de `diff_index` de 44 700 lignes) ; FileHist 0,17-0,26 s.
+
 ## Écriture des chemins et barrière de migration (1.0.102, chiffrement story 3)
 
 Toute écriture de chemin est, comme les lectures (story 2), indépendante du mode : elle passe par `_path_stored(conn,
@@ -3921,11 +4025,11 @@ bien `DbEncrypt -y` (code 2, base intacte).
 Chaque DB (`cache.db`, `diff.db`) contient une table `db_meta (key TEXT PK, value TEXT)` avec deux entrées permanentes :
 
 - `schema_version` : entier correspondant aux constantes `DIFF_DB_SCHEMA_VERSION` / `CACHE_DB_SCHEMA_VERSION` du script
-- `borghelper_version` : version de borgHelper qui a ouvert la DB en dernier
+- `borghelper_version` : la plus récente version de borgHelper qui a ouvert la DB, parmi les versions munies de la règle de la story 129 (une version plus ancienne munie de la règle ne la réécrit plus ; une version d'avant la règle la réécrit encore)
 
 À chaque ouverture (`ensure_diff_db` / `ensure_cache_db`) :
 1. Si `schema_version` DB > constante attendue → erreur + exit (DB d'une version future)
-2. Sinon → mise à jour de `borghelper_version` et confirmation de `schema_version`
+2. Sinon → `borghelper_version` écrite seulement si la version du programme est strictement plus récente que la valeur stockée (ou si celle-ci est absente/illisible) ; confirmation de `schema_version`
 
 Depuis 1.0.100 il y a deux notions distinctes : la version **maximale comprise** (constantes `*_SCHEMA_VERSION`,
 refus si la base est plus récente) et la version **de base écrite** dans une base `plain`

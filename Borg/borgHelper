@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.221"
+Version="1.0.222"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -3737,14 +3737,14 @@ def filtrer_lignes(tableau,X):
     else: cles_a_conserver=toutes_cles[:2]+toutes_cles[-X:]
     return {cle:tableau[cle] for cle in cles_a_conserver}
 
-def _snap_notin(date_from='',date_to=''):
+def _snap_notin(date_from='',date_to='',nick_col='archive_snapshot_v.nick',path_col='archive_snapshot_v.path'):
     conds=[]
     if date_from: conds.append('d.archive_new_date>=?')
     if date_to: conds.append('d.archive_new_date<=?')
     extra=(' AND '+' AND '.join(conds)) if conds else ''
     # 1.0.219 (story 121, revue 1) : INDEXED BY — avec une borne de date, SQLite choisit idx_diff_nick_date (nick,date>?) et balaie, POUR CHAQUE
     # ligne de snapshot, toutes les lignes de diff_index plus récentes (24 M d'instructions contre 96 k sur le bac) ; une recherche (nick,path) suffit
-    return f"AND NOT EXISTS(SELECT 1 FROM diff_index d INDEXED BY idx_diff_nick_path WHERE d.nick=archive_snapshot_v.nick AND d.path=archive_snapshot_v.path{extra})"
+    return f"AND NOT EXISTS(SELECT 1 FROM diff_index d INDEXED BY idx_diff_nick_path WHERE d.nick={nick_col} AND d.path={path_col}{extra})"
 
 def _snap_params(af_params,archive_from,archive_to):
     date_from=date_to=''
@@ -5623,6 +5623,103 @@ def _latest_snapshot_archive(conn,n):
         if best is None or (d is not None and (best[0] is None or d>best[0])): best=(d,a)
     return best[1] if best else None
 
+# Story 126 : lecture d'UN dossier d'un snapshot sans lire l'archive entière. La vue archive_snapshot_v, filtrée par archive, se plan-
+# ifiait en balayage de toutes les lignes de l'archive (SEARCH s USING COVERING INDEX sqlite_autoindex_archive_snapshot_1 (nick=? AND
+# archive=?) puis snapshot_file par rowid : 791 000 lignes et 1,1 Go lus à froid sur la base d'un utilisateur, pour un dossier de 5
+# entrées comme pour la racine). Ici le chemin est CHERCHÉ : snapshot_file par idx_snapfile_nick_path, puis l'appartenance à l'archive par
+# la clé primaire d'archive_snapshot (nick,archive,file_id) — CROSS JOIN + INDEXED BY écrits explicitement (jamais dépendants des
+# statistiques, aucun ANALYZE n'est lancé : story 121). Une valeur de chemin n'est comparée qu'à des bornes ('p/' <= x < 'p0') et à un
+# segment : l'ordre des valeurs chiffrées n'a pas de sens pour l'utilisateur, il ne sert qu'à sauter d'un enfant au suivant — la
+# structure (segments joints par '/', alphabet A-Za-z0-9.- sans '/') est la même en clair et chiffré.
+_SNAP_SCAN_MAX=1000   # sous-arbre d'au plus ce nombre de lignes de snapshot_file (toutes versions) : lu d'un trait ; au-delà : saut d'index (seuil mesuré, TECHNICAL.md)
+_SNAP_FROM=("FROM snapshot_file sf INDEXED BY idx_snapfile_nick_path CROSS JOIN archive_snapshot s WHERE sf.nick=? AND ")
+_SNAP_MEMBER=" AND s.nick=sf.nick AND s.archive=? AND s.file_id=sf.id"
+
+def _snap_own(conn,n,archive,stored):
+    """(type,mode,owner) de la ligne de chemin STOCKÉ `stored` dans le snapshot `archive`, ou None si l'archive ne la contient pas."""
+    return conn.execute("SELECT sf.type,sf.mode,sf.owner "+_SNAP_FROM+"sf.path=?"+_SNAP_MEMBER+" LIMIT 1",(n,stored,archive)).fetchone()
+
+def _snap_kids(conn,n,archive,stored_prefix):
+    """Enfants DIRECTS de `stored_prefix` (valeur stockée ; '' = racine) dans le snapshot `archive` ->
+    {segment stocké: [a_des_descendants, type, mode, owner]} (type/mode/owner : sa propre ligne, None si l'archive ne la contient pas —
+    un dossier connu par ses seuls descendants). Même résultat que lire toutes les lignes sous le préfixe et les regrouper par segment
+    (ancien plan, balayage de l'archive entière), à coût proportionnel au dossier DANS L'ARCHIVE listée (les lignes d'autres archives sous le dossier
+    coûtent chacune une recherche en clé primaire : TECHNICAL, limite connue) :
+    - petit sous-arbre (sonde : au plus _SNAP_SCAN_MAX lignes de snapshot_file) : une lecture d'un trait, appartenance par la clé primaire ;
+    - sinon un SAUT D'INDEX, un enfant à la fois : la première ligne de l'archive à partir du curseur (un seul parcours de l'index, les
+      lignes d'autres archives sont écartées au passage) donne le segment ; ligne propre -> l'enfant est une feuille jusqu'à preuve du
+      contraire, le curseur passe à cette ligne (revue 1 : plus de requête « un descendant existe-t-il ») ; ligne sous 'seg/' -> le dossier
+      a des descendants (sa ligne propre, si l'archive la contient, est déjà lue : elle passe avant), puis le curseur saute le sous-arbre
+      ('seg0'). Les frères dont le nom commence par `seg` suivi d'un caractère < '/' ('.', '-', ' ') se trouvent ENTRE 'seg' et 'seg/…' :
+      on ne saute donc qu'en arrivant dans le sous-arbre, jamais avant (un saut direct après 'seg' les perdrait ; un retour à 'seg'
+      après eux bouclerait). Une requête par feuille, deux par dossier."""
+    lo=stored_prefix+'/' if stored_prefix else ''
+    hi=stored_prefix+'0' if stored_prefix else None   # '/'+1 : fin du sous-arbre
+    kids={}
+    bound=[hi] if hi is not None else []
+    probe=conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM snapshot_file INDEXED BY idx_snapfile_nick_path WHERE nick=? AND path>=?"
+                       +(" AND path<?" if hi is not None else "")+" LIMIT ?)",[n,lo]+bound+[_SNAP_SCAN_MAX+1]).fetchone()[0]
+    ln=len(lo)
+    if probe<=_SNAP_SCAN_MAX:
+        for path,t,m,o in conn.execute("SELECT sf.path,sf.type,sf.mode,sf.owner "+_SNAP_FROM+"sf.path>=?"+(" AND sf.path<?" if hi is not None else "")
+                                       +_SNAP_MEMBER,[n,lo]+bound+[archive]):
+            rest=path[ln:]
+            if not rest: continue
+            i=rest.find('/')
+            if i<0:
+                k=kids.setdefault(rest,[False,None,None,None]); k[1]=t; k[2]=m; k[3]=o
+            else: kids.setdefault(rest[:i],[False,None,None,None])[0]=True
+        return kids
+    def nxt(op,cur):   # première ligne de l'archive après (ou à partir de) `cur`, sous le préfixe
+        return conn.execute("SELECT /*saut*/ sf.path,sf.type,sf.mode,sf.owner "+_SNAP_FROM+f"sf.path{op}?"+(" AND sf.path<?" if hi is not None else "")
+                            +_SNAP_MEMBER+" ORDER BY sf.path LIMIT 1",[n,cur]+bound+[archive]).fetchone()
+    cur=lo; op='>='
+    while True:
+        r=nxt(op,cur)
+        if r is None: break
+        path,t,m,o=r
+        rest=path[ln:]; i=rest.find('/')
+        seg=rest if i<0 else rest[:i]
+        if not seg: cur=path; op='>'; continue
+        child=lo+seg
+        if i>=0:   # sous-arbre atteint : le dossier a des descendants ; on saute le reste de son sous-arbre
+            kids.setdefault(seg,[True,None,None,None])[0]=True
+            cur=child+'0'; op='>='
+        else:      # ligne propre de l'enfant : feuille tant qu'une ligne 'seg/…' de l'archive ne la contredit pas (lue plus loin)
+            kids[seg]=[False,t,m,o]
+            cur=path; op='>'
+    return kids
+
+def _diff_direct_paths(conn,n,stored_prefix):
+    """Chemins STOCKÉS distincts de diff_index qui sont des enfants DIRECTS de `stored_prefix` ('' = racine), tous événements confondus
+    (ce que TreeHist décode pour retrouver les entrées supprimées). Même ensemble que `SELECT DISTINCT path … sous le préfixe` filtré sur
+    « pas de '/' dans le reste » (ancienne lecture : tout le sous-arbre de diff_index, 44 700 lignes = 0,09 s au 2e niveau d'une base
+    d'utilisateur), sans lire les descendants : petit sous-arbre -> une lecture d'un trait ; sinon saut d'index sur idx_diff_nick_path
+    (même mécanique que _snap_kids : après une ligne propre on avance d'une ligne — les frères 'seg.x' se trouvent entre 'seg' et 'seg/…' —,
+    en arrivant dans 'seg/…' on saute à 'seg0'). Aucune appartenance à une archive ici : diff_index se lit tel quel."""
+    lo=stored_prefix+'/' if stored_prefix else ''
+    hi=stored_prefix+'0' if stored_prefix else None
+    bound=[hi] if hi is not None else []
+    ln=len(lo); res=[]
+    probe=conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path>=?"
+                       +(" AND path<?" if hi is not None else "")+" LIMIT ?)",[n,lo]+bound+[_SNAP_SCAN_MAX+1]).fetchone()[0]
+    if probe<=_SNAP_SCAN_MAX:
+        for (p,) in conn.execute("SELECT DISTINCT path FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path>=?"+(" AND path<?" if hi is not None else ""),[n,lo]+bound):
+            rest=p[ln:]
+            if rest and '/' not in rest: res.append(p)
+        return res
+    cur=lo; op='>='
+    while True:
+        r=conn.execute(f"SELECT /*saut*/ path FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path{op}?"+(" AND path<?" if hi is not None else "")
+                       +" ORDER BY path LIMIT 1",[n,cur]+bound).fetchone()
+        if r is None: break
+        p=r[0]; rest=p[ln:]; i=rest.find('/')
+        if i<0:
+            if rest: res.append(p)
+            cur=p; op='>'
+        else: cur=lo+rest[:i]+'0'; op='>='
+    return res
+
 def _psel_eq(conn,path,col='path'):
     return f"{col}=?",[_path_stored(conn,path)],None
 
@@ -5940,6 +6037,25 @@ def _atomic_write_rc(cfgfile,config):
         try: os.fsync(dfd)
         finally: os.close(dfd)
     except OSError: pass
+
+_VERSION_RE=re.compile(r'[0-9]+(?:\.[0-9]+)*')
+
+def _version_newer(candidate,stored):
+    """1.0.222 (story 129) : True si `candidate` est STRICTEMENT plus récente que `stored`, comparaison numérique par composant
+    (1.0.99 < 1.0.100 ; 1.0 == 1.0.0 : les composants manquants valent 0), jamais par texte ; les espaces autour sont ignorés
+    (` 1.0.300 ` se lit 1.0.300). `stored` absent ou illisible (None, vide, pas « n.n.n » : suffixe `-dev`/`rc1`, préfixe `v`,
+    octets, composant vide) -> True : la valeur est écrite, comme avant la règle. `candidate` illisible -> False, base neuve
+    comprise : jamais écrite par ce code (Version est une constante numérique ; une Version à suffixe ne tamponnerait aucune base).
+    Une valeur à composant de plus de 4300 chiffres (int refusé sous 3.11+) -> False, comme sous 3.10."""
+    try:
+        c=_VERSION_RE.fullmatch(str(candidate).strip())
+        if c is None: return False
+        s=_VERSION_RE.fullmatch(str(stored).strip()) if stored is not None else None
+        if s is None: return True
+        cv=[int(x) for x in c.group().split('.')]; sv=[int(x) for x in s.group().split('.')]
+        n=max(len(cv),len(sv)); cv+=[0]*(n-len(cv)); sv+=[0]*(n-len(sv))
+        return cv>sv
+    except Exception: return stored is None
 
 class BorgHelperDB:
     """SQLite layer: cache.db and diff.db operations. No borg calls."""
@@ -6312,7 +6428,12 @@ class BorgHelperDB:
             conn.execute("INSERT OR REPLACE INTO db_meta VALUES('schema_version',?)",(str(base_version),))
         ver_row=conn.execute("SELECT value FROM db_meta WHERE key='borghelper_version'").fetchone()
         stored_ver=ver_row[0] if ver_row else None
-        if stored_ver!=Version:
+        # 1.0.222 (story 129) : seulement si ce programme est STRICTEMENT plus récent que la valeur stockée (valeur absente ou
+        # illisible : écrite). Avant, `!=` : deux versions qui lisent la même base en alternance (CLI et serveur web pas mis à jour
+        # ensemble) la réécrivaient à chaque passage, ce qui avançait le mtime et périmait le cache de réponses de borgHelperWWW.
+        # L'alternance ne cesse que lorsque TOUTES les versions qui ouvrent la base portent cette règle : une version d'avant
+        # (`!=`) réécrit encore sa valeur à chaque passage.
+        if _version_newer(Version,stored_ver):
             conn.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(Version,))
 
     def _auto_enc_cfg(self,db_path,nick):
@@ -12684,15 +12805,23 @@ class BorgHelper:
                 conn=None
                 try:
                     conn=_open_db(db_path,nick=n,role='read',empty_ok=True)
-                    af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-                    pstored=_path_stored(conn,path)
-                    # 1.0.219 (story 121, jumelle de TreeHist) : INDEXED BY — sans statistiques, le plan balayait tout diff_index par date
-                    cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,pstored]+af_params)
-                    n_rows=cur.fetchall()
-                    df,dt=_snap_params(af_params,archive_from,archive_to)
-                    snap_extra=[x for x in [df,dt] if x]
-                    cur=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,pstored]+snap_extra)
-                    n_rows+=cur.fetchall(); conn.close()
+                    with _read_tx(conn):   # revue 2 (R2-3) : les 2+2K instructions (événements, liste des archives, une requête par archive) voient UN instantané — une purge ou un Index entre deux ne donne plus un état qui n'a jamais existé
+                        af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
+                        pstored=_path_stored(conn,path)
+                        # 1.0.219 (story 121, jumelle de TreeHist) : INDEXED BY — sans statistiques, le plan balayait tout diff_index par date
+                        cur=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,pstored]+af_params)
+                        n_rows=cur.fetchall()
+                        df,dt=_snap_params(af_params,archive_from,archive_to)
+                        snap_extra=[x for x in [df,dt] if x]
+                        # Story 126 : une recherche par archive snapshotée (K, par _snapshot_archives) au lieu de la vue sur les K x N lignes de tous les
+                        # snapshots du nick (plan « SEARCH s USING INDEX idx_snap_nick_archive (nick=?) » : 1,58 M lignes lues pour UN fichier, 1,3-3,4 s) :
+                        # snapshot_file par (nick,path), puis l'appartenance à l'archive par la clé primaire d'archive_snapshot. Mêmes lignes, même ordre
+                        # (archives par nom croissant = l'ordre du balayage d'avant ; tri stable par date ensuite) ; NOT EXISTS inchangé (_snap_notin).
+                        snap_sql=("SELECT s.nick,s.archive_date,'',s.archive,'présent',NULL,sf.size "+_SNAP_FROM+"sf.path=?"+_SNAP_MEMBER
+                                  +" "+_snap_notin(df,dt,'s.nick','sf.path'))
+                        for arch in list(_snapshot_archives(conn,n)):
+                            n_rows+=conn.execute(snap_sql,[n,pstored,arch]+snap_extra).fetchall()
+                    conn.close()
                 except sqlite3.Error as e:
                     if as_json: _reader_sqlite_err(e,db_path); results[n]={'error':f"SQLite error ({db_path}): {e}"}   # 1.0.178 (A87)
                     else: printer(_reader_sqlite_line(e,db_path))
@@ -12717,6 +12846,12 @@ class BorgHelper:
         print(t)
 
     def _treehist_listing(self,n,prefix,conn,archive_from=None,archive_to=None,debug=0,as_json=False):
+        """Liste le contenu direct d'un répertoire (voir _treehist_listing_tx), lu dans UNE transaction de lecture (revue 1 de la story 126, C-6) :
+        la lecture d'un dossier fait des milliers d'instructions (saut d'index), chacune verrait sinon son propre état WAL — un Index ou une purge
+        IDX_SNAP_KEEP entre deux donnerait un listage partiel. Déjà dans une transaction (TreeHist) : rien de plus."""
+        with _read_tx(conn): return self._treehist_listing_tx(n,prefix,conn,archive_from,archive_to,debug,as_json)
+
+    def _treehist_listing_tx(self,n,prefix,conn,archive_from=None,archive_to=None,debug=0,as_json=False):
         """Liste le contenu DIRECT du répertoire courant (dernière archive snapshotée) en un seul
         tableau : le répertoire courant lui-même en '.', puis ses enfants immédiats — même sans
         événement dans la plage demandée. Colonne 'genre' (répertoire/fichier/lien symbolique/…) tirée
@@ -12764,57 +12899,30 @@ class BorgHelper:
                              f"derniers (IDX_SNAP_KEEP) ; LstBkpFls / Restore pour le lire")
                 if as_json: return {'error':msg}
                 print(f"{n}: {msg}"); return None
-        # le préfixe lui-même ET ses descendants : égalité + intervalle (racine : aucune borne)
-        psql,pprm,_=_psel_under(conn,prefix,self_too=True)
         plen=len(prefix)+1 if prefix else 0
         children={}       # name -> is_dir (heuristique de secours si le type est inconnu)
         type_by_name={}    # name -> type réel de SA PROPRE entrée (pas celui d'un enfant plus profond)
         mode_by_name={}    # name -> droits unix (dernier état connu) de SA PROPRE entrée
         owner_by_name={}   # name -> propriétaire (dernier état connu) de SA PROPRE entrée
+        stored_by_name={}  # name -> chemin STOCKÉ de l'entrée (story 126 : lu en SQL, jamais ré-encodé par entrée — 74 000 HMAC pour 10 564 entrées)
         own_type=None; own_mode=None; own_owner=None
-        if conn.codec is not None:
-            # Base chiffrée — « piste 2 » (1.0.121, choix utilisateur) : SEULS le répertoire listé et ses
-            # enfants DIRECTS sont décodés (donc vérifiés), plus chaque chemin du sous-arbre. AD-3 ne
-            # chiffre pas le séparateur '/' : la structure se lit sur la valeur STOCKÉE (même nombre de
-            # '/' que le chemin logique, alphabet base64 ASCII — substr/instr de SQLite y sont exacts au
-            # caractère près). SQLite sépare donc lui-même les lignes des enfants directs (reste sans '/')
-            # des descendants plus profonds, dont il ne renvoie que le segment chiffré de l'enfant direct
-            # (DISTINCT) : Python décode une valeur par entrée affichée, pas une par ligne du sous-arbre
-            # (…/kernel de la démo : 6 474 -> 15). Compromis accepté : un segment altéré PLUS PROFOND
-            # qu'un enfant direct n'est détecté qu'en descendant jusqu'à lui (ou par TreeFind/Search, qui
-            # décodent tout) — le répertoire listé et ses enfants restent vérifiés à chaque affichage.
-            enc_prefix=conn.codec.path.encode(prefix) if prefix else ''
-            skip=len(enc_prefix)+1 if enc_prefix else 0
-            usql,uprm,_=_psel_under(conn,prefix)
-            rest=f"substr(path,{skip+1})"
-            if prefix:
-                own=conn.execute("SELECT type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path=?",
-                                 (n,latest,enc_prefix)).fetchone()
-                if own: own_type,own_mode,own_owner=own
-            def _child(stored_child):
-                lp=conn.codec.decode_path(stored_child)  # préfixe (mémo) + segment de l'enfant, vérifiés
-                return lp[plen:] if prefix else lp
-            for path,ftype,fmode,fowner in conn.execute(
-                    f"SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(usql)} AND instr({rest},'/')=0",
-                    [n,latest]+uprm):
-                name=_child(path)
-                children.setdefault(name,False)
-                type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
-            for (seg,) in conn.execute(
-                    f"SELECT DISTINCT substr({rest},1,instr({rest},'/')-1) FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(usql)} AND instr({rest},'/')>0",
-                    [n,latest]+uprm):
-                children[_child(f"{enc_prefix}/{seg}" if enc_prefix else seg)]=True
-        else:
-            for path,ftype,fmode,fowner in conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm):
-                lp=_path_decode(conn,path)
-                if prefix and lp==prefix:
-                    own_type=ftype; own_mode=fmode; own_owner=fowner; continue
-                rel=lp[plen:] if prefix else lp
-                if not rel: continue
-                seg=rel.split('/',1)
-                name=seg[0]; is_dir=len(seg)>1
-                children[name]=children.get(name,False) or is_dir
-                if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+        # Story 126 : le répertoire listé et ses enfants DIRECTS se LISENT dans le snapshot par saut d'index (_snap_kids), en clair comme en
+        # chiffré — plus de balayage de l'archive entière à chaque clic (1,1 Go lus à froid, 6 s à chaud sur une archive de 791 000 entrées).
+        # Base chiffrée — « piste 2 » (1.0.121, choix utilisateur) : SEULS le répertoire listé et ses enfants DIRECTS sont décodés (donc
+        # vérifiés), jamais chaque chemin du sous-arbre. AD-3 ne chiffre pas le séparateur '/' : la structure se lit sur la valeur STOCKÉE
+        # (même nombre de '/' que le chemin logique, alphabet base64 ASCII sans '/'). Compromis accepté : un segment altéré PLUS PROFOND
+        # qu'un enfant direct n'est détecté qu'en descendant jusqu'à lui (ou par TreeFind/Search, qui décodent tout) — le répertoire listé et ses
+        # enfants restent vérifiés à chaque affichage (un enfant absent de l'archive n'est jamais décodé).
+        sp=_path_stored(conn,prefix) if prefix else ''
+        if prefix:
+            own=_snap_own(conn,n,latest,sp)
+            if own: own_type,own_mode,own_owner=own
+        for seg,(has_desc,ftype,fmode,fowner) in _snap_kids(conn,n,latest,sp).items():
+            stored_child=f"{sp}/{seg}" if sp else seg
+            lp=_path_decode(conn,stored_child)   # préfixe (mémo) + segment de l'enfant, vérifiés (chiffré) ; tel quel en clair
+            name=lp[plen:] if prefix else lp
+            children[name]=has_desc; stored_by_name[name]=stored_child
+            type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
         # Enfants directs supprimés (diff_index) : jamais archive_snapshot_v/archive_snapshot, purgés
         # indépendamment selon IDX_SNAP_KEEP — diff_index n'est purgé qu'au prune réel de l'archive
         # (_cleanup_index_after_prune), donc une ligne survivante référence toujours une archive encore
@@ -12834,16 +12942,11 @@ class BorgHelper:
         # candidats structurellement enfants directs sont décodés puis interrogés pour leur dernier
         # événement — la requête par candidat (petit nombre, jamais le goulot mesuré) est conservée telle
         # quelle. Mesuré Story 6/PerfBench : ~5,7 s -> voir TECHNICAL.md pour le chiffre après correctif.
-        usql,uprm,_=_psel_under(conn,prefix)
-        if conn.codec is not None:
-            enc_prefix=conn.codec.path.encode(prefix) if prefix else ''
-            stored_skip=len(enc_prefix)+1 if enc_prefix else 0
-        else:
-            stored_skip=plen
         del_rows=[]
-        for (stored,) in conn.execute("SELECT DISTINCT path FROM diff_index WHERE nick=?"+_wh(usql),[n]+uprm).fetchall():
-            rest=stored[stored_skip:]
-            if not rest or '/' in rest: continue  # pas structurellement un enfant direct -- jamais décodé
+        present_stored=set(stored_by_name.values())   # story 126 : un enfant déjà lu dans le snapshot n'est plus décodé une 2e fois (0,35 s pour 10 564 noms)
+        # story 126 : seuls les chemins structurellement enfants directs sont lus (_diff_direct_paths : saut d'index, plus le sous-arbre entier)
+        for stored in _diff_direct_paths(conn,n,sp):
+            if stored in present_stored: continue   # décodé et lu dans le snapshot : son nom est dans children (le décodage est une bijection)
             lp=_path_decode(conn,stored)
             nm=lp[plen:] if prefix else lp
             if not nm or nm in children: continue
@@ -12868,7 +12971,22 @@ class BorgHelper:
         # vue épinglée sur son propre snapshot : les événements de X seulement (archive_new=X)
         if pin_date is not None: af_sql,af_params=" AND archive_new=?",[archive_from]
         else: af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
-        def _events_for(full_path,recursive=False):
+        _deep={}; _deep_done=[]   # segment stocké de l'enfant direct (None : ligne d'un enfant direct sans descendant) -> {(archive_new,date): (rang par chemin, plus petit id)}
+        def _deep_fill():
+            # Revue 1 (C-1) : à DATE ÉGALE (deux archives de même seconde : --timestamp, recreate, transfert) l'ancienne lecture DISTINCT ... ORDER BY archive_new_date
+            # rendait les paires dans l'ordre de PREMIÈRE APPARITION du parcours : par chemin puis id sous un préfixe (INDEXED BY idx_diff_nick_path), par id
+            # à la racine (idx_diff_nick_date) — le rang de chaque groupe est donc son plus petit (chemin, id) / son plus petit id, rendus par la même requête (char(0) est inférieur à tout octet : l'ordre de la chaîne est celui de (chemin, id) ; un chemin ne contient jamais NUL).
+            _deep_done.append(True)
+            rest_=f"substr(path,{len(sp)+2})" if sp else "path"
+            for seg,a_new,d,pk,mid in conn.execute(f"SELECT CASE WHEN instr({rest_},'/')>0 THEN substr({rest_},1,instr({rest_},'/')-1) END,archive_new,archive_new_date,"
+                                                   "MIN(path||char(0)||printf('%020d',id)),MIN(id) "
+                                                   "FROM diff_index"+(" INDEXED BY idx_diff_nick_path" if sp else "")+" WHERE nick=?"+(" AND (path>=? AND path<?)" if sp else "")
+                                                   +af_sql+" GROUP BY 1,2,3",[n]+([sp+'/',sp+'0'] if sp else [])+af_params):
+                _deep.setdefault(seg,{})[(a_new,d)]=(pk,mid)
+        def _events_for(stored_path,recursive=False):
+            # Story 126 : `stored_path` = chemin STOCKÉ de l'entrée (lu en SQL par _snap_kids, ou celui du répertoire listé), plus le chemin
+            # logique ré-encodé — _path_stored (chiffré : un HMAC par segment) + _psel_under (encore deux encodages) coûtaient 3 encodages complets
+            # par entrée affichée (0,5 s pour 10 564 entrées). Bornes du sous-arbre = celles de _psel_under ('p/' <= x < 'p0', racine : aucune).
             # recursive=True (répertoires) : un événement n'importe où dans la sous-arborescence
             # compte comme un événement de CE répertoire — sans en lister le détail (pas de contenu
             # de sous-répertoire). added/removed ne concernent QUE l'entrée du répertoire lui-même
@@ -12879,13 +12997,24 @@ class BorgHelper:
             # entrée affichée : (C+1) x D lignes, 16-23 s pour 3 025 entrées sur le bac (même plan en SQLite 3.37 et 3.50). Index fixé :
             # une recherche (nick,path) puis tri des quelques lignes du chemin — plan déterministe, indépendant des statistiques et de
             # la version de SQLite ; idx_diff_nick_path est créé par ensure_diff_db (absent = erreur SQLite visible, jamais une sortie fausse).
-            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,_path_stored(conn,full_path)]+af_params).fetchall()
+            own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,stored_path]+af_params).fetchall()
             if not recursive: return own
-            dsql,dprm,_=_psel_under(conn,full_path)
+            # Story 126 : les événements de TOUS les sous-répertoires affichés (et ceux du répertoire listé, '.') viennent d'UNE seule lecture de
+            # diff_index sous le préfixe, regroupée par enfant direct (_deep_fill) — avant : une lecture du sous-arbre PAR répertoire affiché (18 lectures
+            # de dizaines de milliers de lignes : 0,35 s au 2e niveau d'une base d'utilisateur), chacune DISTINCT (archive,date) comme ici.
             # 1.0.219 (revue 1) : sous-répertoire + plage de dates (-b X -B Y) : sans INDEXED BY, idx_diff_nick_date (nick, plage) lit toutes les
-            # lignes de la plage de tout le nick pour chaque sous-répertoire (55 k instructions contre 4 k sur le bac) ; racine : pas de borne de chemin
-            deep=conn.execute("SELECT DISTINCT archive_new,archive_new_date FROM diff_index"+(" INDEXED BY idx_diff_nick_path" if dsql else "")
-                              +" WHERE nick=?"+_wh(dsql)+af_sql+" ORDER BY archive_new_date",[n]+dprm+af_params).fetchall()
+            # lignes de la plage de tout le nick (55 k instructions contre 4 k sur le bac) ; racine : pas de borne de chemin (donc pas d'INDEXED BY)
+            if not _deep_done: _deep_fill()
+            if stored_path==sp:   # le répertoire listé : toutes les paires sous le préfixe ; rang = plus petit id (racine) ou plus petit chemin (préfixe), comme l'ancienne lecture
+                allp={}
+                for g in _deep.values():
+                    for k,r in g.items():
+                        if k not in allp: allp[k]=r
+                        else: allp[k]=min(allp[k],r,key=lambda x:x[0 if sp else 1])
+                deep=sorted(allp,key=lambda k:(k[1] or '',allp[k][0 if sp else 1]))
+            else:
+                g=_deep.get(stored_path[len(sp)+1:] if sp else stored_path,{})
+                deep=sorted(g,key=lambda k:(k[1] or '',g[k][0]))
             own_archives={a for _,a,_ in own}
             synthetic=[('modified',arch,date) for arch,date in deep if arch not in own_archives]
             return sorted(own+synthetic,key=lambda r:r[2] or '')
@@ -12897,8 +13026,8 @@ class BorgHelper:
             from prettytable import PrettyTable
             t=PrettyTable(['nom','genre','droits','propriétaire','type','archive','date'])
             t.align['nom']='l'; t.align['archive']='l'
-        def _add_rows(name,genre,droits,owner,full_path,is_dir,recursive=False):
-            events=_events_for(full_path,recursive=recursive)
+        def _add_rows(name,genre,droits,owner,full_path,is_dir,stored_path,recursive=False):
+            events=_events_for(stored_path,recursive=recursive)
             droits_disp=droits or '—'; owner_disp=owner or '—'
             if as_json:
                 entries.append({'name':name,'full_path':full_path,'genre':genre,'mode':droits,'owner':owner,'is_dir':is_dir,
@@ -12920,12 +13049,12 @@ class BorgHelper:
                     'deleted':True,'last_seen_archive':archive_old,'events':[]})
                 return
             t.add_row([name,genre,'—','—','supprimé',archive_old,'—'])
-        _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),own_mode,own_owner,prefix,True,recursive=True)
+        _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),own_mode,own_owner,prefix,True,sp,recursive=True)
         for name in sorted(set(children)|set(deleted_children)):
             full=f"{prefix}/{name}" if prefix else name
             if name in children:
                 is_dir=children[name]
-                _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),owner_by_name.get(name),full,is_dir,recursive=is_dir)
+                _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),owner_by_name.get(name),full,is_dir,stored_by_name[name],recursive=is_dir)
             else:
                 archive_old,etype=deleted_children[name]
                 _add_deleted_row(name,_TREEHIST_GENRES.get(etype,'inconnu'),full,etype=='d',archive_old)
@@ -12948,6 +13077,10 @@ class BorgHelper:
         return None
 
     def _treehist_changes(self,n,prefix,conn,archive_from=None,archive_to=None,as_json=False):
+        """Mode « changements » de TreeHist (voir _treehist_changes_tx), lu dans UNE transaction de lecture (story 126, revue 1, C-6)."""
+        with _read_tx(conn): return self._treehist_changes_tx(n,prefix,conn,archive_from,archive_to,as_json)
+
+    def _treehist_changes_tx(self,n,prefix,conn,archive_from=None,archive_to=None,as_json=False):
         """Mode « changements » de TreeHist (-X, 1.0.133) : SEULS les enfants directs de <prefix> qui ont changé
         entre archive_from (EXCLUE : on compare depuis son contenu) et archive_to (INCLUSE) — fichier ajouté,
         modifié ou supprimé ; répertoire dès qu'un changement a eu lieu n'importe où en dessous (événements
@@ -12994,15 +13127,12 @@ class BorgHelper:
         # 1.0.219 (story 121) : droits/propriétaire de TOUS les enfants directs en UNE requête (même séparation enfants directs /
         # descendants que ci-dessus, sur la valeur stockée) au lieu d'une requête par entrée affichée (chacune lisait toute la dernière
         # archive : C x N lignes). Un chemin absent de la dernière archive reste None, comme avant.
-        snapmap={}
-        if latest is not None and (own or deep):
-            ssql,sprm,_=_psel_under(conn,prefix)
-            for sp_,st_,sm_,so_ in conn.execute(f"SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(ssql)} "
-                                                f"AND instr({rest},'/')=0",[n,latest]+sprm):
-                snapmap.setdefault(sp_,(st_,sm_,so_))
-        def _snap(full):
+        # Story 126 : plus de lecture de TOUS les enfants directs du snapshot (balayage de l'archive entière : 1,5 s à la racine d'une archive
+        # de 791 000 entrées) — la ligne propre de CHAQUE entrée changée est cherchée par son chemin stocké (clé du dictionnaire own/deep,
+        # déjà lue en SQL : plus d'encodage par entrée), une recherche par entrée affichée.
+        def _snap(stored):
             if latest is None: return None
-            return snapmap.get(_path_stored(conn,full))
+            return _snap_own(conn,n,latest,stored)
         entries=[]
         for key in set(own)|{(f"{stored_prefix}/{g}" if stored_prefix else g) for g in deep}:
             name=_name(key)
@@ -13014,7 +13144,7 @@ class BorgHelper:
             evs+=[{'type':'modified','archive':a,'date':(d or '')[:19]} for a,d in deep.get(seg,{}).items() if a not in seen]
             evs.sort(key=lambda e:e['date'])
             last_own=own[key][-1] if key in own else None
-            snap=_snap(full)
+            snap=_snap(key)
             etype=(snap[0] if snap and snap[0] else None) or (_diff_entry_type(last_own[0],last_own[4]) if last_own else None)
             is_dir=seg in deep or etype=='d'
             if is_dir and etype is None: etype='d'
@@ -13077,7 +13207,11 @@ class BorgHelper:
                 finally: _close_quiet(conn)   # 1.0.203 (story 81, D161) : fermée par le finally, erreurs comprises
         _iso.done()
         if as_json:
-            print(json.dumps(results,ensure_ascii=False,indent=2))
+            # Story 126 (P3) : JSON compact (sans indentation : environ -30 % d'octets, 3,5 Mo pour un dossier de 10 564 entrées) SEULEMENT quand
+            # l'appelant le demande par l'environnement (borgHelperWWW pose BORGHELPERC_JSON_COMPACT=1 : il relit la sortie avec json.loads) ;
+            # sur un terminal ou pour tout autre appelant, la sortie -j reste indentée à l'identique
+            if os.environ.get('BORGHELPERC_JSON_COMPACT')=='1': print(json.dumps(results,ensure_ascii=False,separators=(',',':')))
+            else: print(json.dumps(results,ensure_ascii=False,indent=2))
 
     def _treefind_listing(self,n,prefix,pattern,conn,debug=0,as_json=False):
         """Recherche récursive par NOM (pas le chemin complet) sous <prefix> (racine si omis), dans
@@ -16533,6 +16667,138 @@ def codec_selftest(pattern=None,list_only=False):
         check("schéma : base neuve -> version de base",lambda: _meta(os.path.join(tmp,'m3.db'),None,5,4)==4)
         check("schéma : version chiffrée (maximale) conservée",lambda: _meta(os.path.join(tmp,'m4.db'),5,5,4)==5)
         check("schéma : stored > maximale -> SchemaVersionError",lambda: raises(SchemaVersionError,lambda:_meta(os.path.join(tmp,'m5.db'),6,5,4)))
+        # ── story 129 (1.0.222) : borghelper_version réécrit seulement par une version plus récente ──
+        _g129=globals(); _ABS129=object()
+        def _s129_fail(bad):
+            """Échecs d'un contrôle imprimés d'un bloc, en UN dict {sous-contrôle: constat} (ligne « {…} » : lue par mutrun comme compte
+            rendu de sous-contrôles en échec, A125) ; vrai si aucun."""
+            if bad: print(f"  {bad}")
+            return not bad
+        def _s129_as(ver,fn):
+            """fn() exécutée comme un programme de version `ver` (Version du module posée puis restaurée), sortie avalée."""
+            old=_g129['Version']; _g129['Version']=ver
+            try:
+                with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()): return fn()
+            finally: _g129['Version']=old
+        def _s129_state(path):
+            """(mtime_ns, taille, sha256) de la base et de son -wal (None si absent) — pris juste avant et juste après l'appel."""
+            r=[]
+            for sfx in ('','-wal'):
+                try:
+                    st=os.stat(path+sfx)
+                    with open(path+sfx,'rb') as fh: r.append((st.st_mtime_ns,st.st_size,hashlib.sha256(fh.read()).hexdigest()))
+                except FileNotFoundError: r.append(None)
+            return r
+        def _s129_stamp(path): return (_q(path,"SELECT value FROM db_meta WHERE key='borghelper_version'",one=True) or (_ABS129,))[0]
+        def _s129_meta(name,stored,ver):
+            """_check_set_meta exécuté comme la version `ver` sur une base dont borghelper_version vaut `stored` (_ABS129 = ligne absente,
+            None = NULL) -> valeur stockée ensuite."""
+            c=_mk(os.path.join(tmp,name))
+            try:
+                if stored is not _ABS129: c.execute("INSERT OR REPLACE INTO db_meta VALUES('borghelper_version',?)",(stored,)); c.commit()
+                _s129_as(ver,lambda: bh._check_set_meta(c,5,os.path.join(tmp,name),4)); c.commit()
+                return c.execute("SELECT value FROM db_meta WHERE key='borghelper_version'").fetchone()[0]
+            finally: c.close()
+        def _s129_cmp():
+            """Comparaison numérique par composant : 1.0.99 < 1.0.100 (jamais par texte), 1.0 = 1.0.0 (composants manquants = 0),
+            candidate illisible -> jamais écrite."""
+            new=[('1.0.100','1.0.99'),('1.0.121','1.0.120'),('1.0.1','1.0'),('2.0.0','1.99.999'),('1.10.0','1.9.9'),('1.0.0','0.9.999'),
+                 (' 1.0.300 ','1.0.50'),('1.0.300\n','1.0.50')]
+            not_new=[('1.0.99','1.0.100'),('1.0.120','1.0.120'),('1.0','1.0.0'),('1.0.0','1.0'),('1.99.999','2.0.0'),('0.9.999','1.0.0'),('1.9.9','1.10.0'),
+                     ('1.0.50',' 1.0.300 '),('1.0.50','1.0.300\n')]
+            bad={f"comparaison : _version_newer({a!r},{b!r})":(not want) for want,pairs in ((True,new),(False,not_new)) for a,b in pairs
+                 if _version_newer(a,b) is not want}
+            bad.update({f"candidate illisible {x!r}":True for x in ('x','','1.0.x',None,'1.0.1-dev','v1.0.1',b'1.0.1') if _version_newer(x,'1.0.0') is not False})
+            return _s129_fail(bad)
+        check("borghelper_version : comparaison numérique par composant, jamais par texte (1.0.99 < 1.0.100, 1.0 = 1.0.0, candidate illisible jamais plus récente)",_s129_cmp)
+        def _s129_values():
+            """_check_set_meta : stockée absente, NULL, vide ou illisible (texte, suffixe, composant vide) -> écrite ; plus ancienne -> écrite ;
+            égale ou PLUS RÉCENTE -> gardée telle quelle, y compris 1.0.100 stockée et 1.0.99 qui lit (texte : '1.0.99' > '1.0.100')."""
+            res={}
+            for i,(stored,ver,want) in enumerate((
+                    ('1.0.99','1.0.100','1.0.100'),('1.0.100','1.0.99','1.0.100'),('1.0.100','1.0.100','1.0.100'),('1.0','1.0.0','1.0'),
+                    ('1.0.120','1.0.121','1.0.121'),('1.0.121','1.0.120','1.0.121'),('0.9.999','1.0.0','1.0.0'),('1.0.0','0.9.999','1.0.0'),
+                    (' 1.0.300 ','1.0.50',' 1.0.300 '),('1.0.300\n','1.0.50','1.0.300\n'),(' 1.0.30 ','1.0.50','1.0.50'),
+                    (_ABS129,'1.0.50','1.0.50'),(None,'1.0.50','1.0.50'),('','1.0.50','1.0.50'),('abc','1.0.50','1.0.50'),
+                    ('1.0.x','1.0.50','1.0.50'),('1.0.999-dev','1.0.50','1.0.50'),('1..2','1.0.50','1.0.50'),(' ','1.0.50','1.0.50'),
+                    ('v1.0.300','1.0.50','1.0.50'),(b'1.0.300','1.0.50','1.0.50'))):
+                got=_s129_meta(f's129v{i}.db',stored,ver)
+                if got!=want: res[f"stockée {'absente' if stored is _ABS129 else repr(stored)}, lue par {ver}"]=f"stockée ensuite {got!r}, attendu {want!r}"
+            return _s129_fail(res)
+        check("borghelper_version : valeur absente, NULL ou illisible -> écrite ; plus ancienne -> écrite ; égale ou plus récente -> gardée (1.0.99 / 1.0.100 compris)",_s129_values)
+        def _s129_hold(code,p):
+            """Enfant (groupe à part, tué par _rb_killtree) qui tient une connexion sur `p` ; « tenu » lu avant de rendre la main. Jamais une
+            connexion tenue par CE processus : un open/close de la base ici lèverait ses verrous POSIX (1.0.210, story 94)."""
+            ps=_rb_popen([sys.executable,'-c',code,p],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            if ps.stdout.readline().strip()!='tenu': _rb_killtree(ps); raise RuntimeError("s129 : connexion non tenue")
+            return ps
+        _S129_READ=("import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None)\nc.execute('BEGIN')\n"
+                    "c.execute('SELECT count(*) FROM db_meta').fetchall()\nprint('tenu',flush=True)\ntime.sleep(120)\n")
+        _S129_WRITE=("import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None)\nc.execute('BEGIN IMMEDIATE')\n"
+                     "print('tenu',flush=True)\ntime.sleep(120)\n")
+        def _s129_alt():
+            """Alternance version courante / plus ancienne simulée (1.0.99 : numériquement plus ancienne, textuellement plus GRANDE que
+            1.0.222) sur diff.db, cache.db et history.db, lecteur (create=False) et écrivain (create=True) : l'ancienne n'écrit rien
+            — contenu, taille ET mtime de la base et de son -wal identiques — la courante n'écrit rien non plus quand la valeur est la
+            sienne ; base dont l'ancienne a écrit la valeur (posée à la main) : la plus récente l'écrit UNE fois (base changée),
+            puis plus personne.
+            Sous-cas (mêmes bases) : connexion LECTRICE tenue par un autre processus pendant l'alternance -> le -wal existe, et l'ancienne
+            ne le change pas (mtime, taille, sha) alors que la plus récente le change ; verrou d'ÉCRITURE tenu par un autre processus :
+            l'ancienne (valeur stockée plus récente que la sienne) rend aussitôt, sans attendre _READER_WRITE_WAIT ni marquer la base
+            sautée, la plus récente (valeur stockée plus ancienne) attend, marque la base sautée et n'écrit rien (history.db :
+            reader=True lève l'erreur « occupée » à l'appelant). history.db est aussi passée par reader=True (chemin de _migrate_to_history).
+            Clés des sous-contrôles : « <base> création », « <base> 1/<i> <version> create=<c> », « <base> 2/ … », « <base> -wal tenu : … »,
+            « <base> verrou d'écriture tenu : ancienne|courante » ; <base> = diff, cache, history, history reader=True."""
+            d=os.path.join(tmp,'s129'); os.makedirs(d,exist_ok=True); cur=_g129['Version']; old='1.0.99'; bad={}
+            kinds=(('diff',lambda x,p,c: x.ensure_diff_db(p,create=c),lambda x,p: x.ensure_diff_db(p,create=False),lambda x,p: x.ensure_diff_db(p)),
+                   ('cache',lambda x,p,c: x.ensure_cache_db(p,create=c),lambda x,p: x.ensure_cache_db(p,create=False),lambda x,p: x.ensure_cache_db(p)),
+                   ('history',lambda x,p,c: x.ensure_history_db(p,create=c),None,lambda x,p: x.ensure_history_db(p)),   # reader=False : 60 s sur verrou tenu, pas de sous-cas
+                   ('history reader=True',lambda x,p,c: x.ensure_history_db(p,create=False,reader=True),
+                    lambda x,p: x.ensure_history_db(p,create=False,reader=True),lambda x,p: x.ensure_history_db(p)))
+            def step(kind,ens,p,label,ver,create,changed,want,wal=False):
+                b=_s129_state(p); _s129_as(ver,lambda: ens(BorgHelperDB(tmp,'st'),p,create)); a=_s129_state(p); got=_s129_stamp(p)
+                if (a!=b)!=changed or got!=want or (wal and a[1] is None):
+                    bad[f"{kind} {label}"]=('base changée' if a!=b else 'base intacte',f"tampon {got!r}",'-wal présent' if a[1] is not None else '-wal absent')
+            def setv(p,v):
+                c=sqlite3.connect(p)
+                try: c.execute("UPDATE db_meta SET value=? WHERE key='borghelper_version'",(v,)); c.commit()
+                finally: c.close()
+            for kind,ens,rd,mk in kinds:
+                p=os.path.join(d,kind.replace(' ','_').replace('=','')+'.db')
+                _s129_as(cur,lambda: mk(BorgHelperDB(tmp,'st'),p))
+                if _s129_stamp(p)!=cur: bad[f"{kind} création"]=f"tampon {_s129_stamp(p)!r}"; continue
+                for i,(ver,create) in enumerate(((old,False),(old,True),(cur,False),(old,False),(cur,True),(old,True),(old,False),(cur,False))):
+                    step(kind,ens,p,f'1/{i} {ver} create={create}',ver,create,False,cur)
+                setv(p,old)
+                step(kind,ens,p,'2/ ancienne sur sa valeur',old,False,False,old)
+                step(kind,ens,p,'2/ ancienne écrivain sur sa valeur',old,True,False,old)
+                step(kind,ens,p,'2/ courante, 1er passage',cur,False,True,cur)
+                step(kind,ens,p,'2/ ancienne après la courante',old,False,False,cur)
+                step(kind,ens,p,'2/ courante, 2e passage',cur,True,False,cur)
+                step(kind,ens,p,'2/ ancienne écrivain',old,True,False,cur)
+                h=_s129_hold(_S129_READ,p)   # connexion lectrice d'un autre processus : le -wal existe pendant les pas
+                try:
+                    step(kind,ens,p,'-wal tenu : 1/ ancienne sur la valeur de la courante',old,False,False,cur,True)
+                    setv(p,old)
+                    step(kind,ens,p,'-wal tenu : 2/ ancienne sur sa valeur',old,False,False,old,True)
+                    step(kind,ens,p,'-wal tenu : 3/ courante, 1er passage (le -wal change)',cur,False,True,cur,True)
+                    step(kind,ens,p,'-wal tenu : 4/ ancienne',old,True,False,cur,True)
+                    step(kind,ens,p,'-wal tenu : 5/ courante, 2e passage',cur,True,False,cur,True)
+                finally: _rb_killtree(h)
+                if rd is None: continue
+                for who,ver,stored in (('ancienne',old,cur),('courante',cur,old)):
+                    setv(p,stored); h=_s129_hold(_S129_WRITE,p); x=BorgHelperDB(tmp,'st'); exc=None; t0=time.monotonic()
+                    try:
+                        try: _s129_as(ver,lambda: rd(x,p))
+                        except (sqlite3.OperationalError,SystemExit) as e: exc=e
+                    finally: _rb_killtree(h)
+                    dt=time.monotonic()-t0; marked=x._reader_skip_fresh(p); got=_s129_stamp(p)
+                    if who=='ancienne': ok=exc is None and dt<1.0 and not marked
+                    elif kind=='history reader=True': ok=isinstance(exc,sqlite3.OperationalError) and not marked
+                    else: ok=exc is None and marked
+                    if not ok or got!=stored: bad[f"{kind} verrou d'écriture tenu : {who}"]=(type(exc).__name__ if exc else 'rendue',f"{dt:.1f} s",f"base marquée sautée {marked}",f"tampon {got!r}")
+            return _s129_fail(bad)
+        check("borghelper_version : alternance version courante / plus ancienne simulée sur diff.db, cache.db, history.db (lecteur, écrivain, reader=True ; -wal tenu ; verrou d'écriture tenu) -> l'ancienne n'écrit rien ni n'attend (contenu, mtime de la base et du -wal), la plus récente écrit une fois",_s129_alt)
         # ── repo_stats historique (migration structurelle + capture Prune) ──
         rs_dir=os.path.join(tmp,'rstats'); os.makedirs(rs_dir)
         def _rs_reader(nick):
@@ -20317,8 +20583,9 @@ def codec_selftest(pattern=None,list_only=False):
                           lambda nk=nk: bhq.duidx(nk,None,archive_from=A1,archive_to=A3,as_json=True)]
                 with mock.patch(f"{__name__}._open_db",tracing_open):
                     for op in ops: _q_run(op)
-                want=[x for x in sql if 'FROM diff_index' in x and (re.search(r"\bpath\s*=\s*'",x) or re.search(r"\.path\s*=\s*archive_snapshot_v\.path",x)
-                                                or ('SELECT DISTINCT archive_new,archive_new_date' in x and re.search(r"\(path>='",x)))]
+                want=[x for x in sql if 'FROM diff_index' in x and (re.search(r"\bpath\s*=\s*'",x) or re.search(r"\.path\s*=\s*(archive_snapshot_v|sf)\.path",x)
+                                                or ('SELECT DISTINCT archive_new,archive_new_date' in x and re.search(r"\(path>='",x))
+                                                or ('GROUP BY 1,2,3' in x and "(path>='" in x))]   # story 126 : FileHist par archive (d.path=sf.path), événements regroupés par enfant
                 bad=[]
                 for qp_ in (bhq.db.get_diff_db('qp'),bhq.db.get_diff_db('qe')):
                     c2=_open_db(qp_,nick=None,role='read',empty_ok=True)
@@ -20328,10 +20595,531 @@ def codec_selftest(pattern=None,list_only=False):
                             except sqlite3.Error: continue
                             if 'idx_diff_nick_path' not in pl or 'idx_diff_nick_date' in pl: bad.append((x[:120],pl[:160]))
                     finally: c2.close()
-                n_notin=sum(1 for x in want if 'archive_snapshot_v.path' in x)
+                n_notin=sum(1 for x in want if 'archive_snapshot_v.path' in x or 'd.path=sf.path' in x)
                 if bad or len(want)<20 or n_notin<4: print(f"  {len(want)} requêtes par chemin (dont {n_notin} NOT EXISTS) ; hors plan : {bad[:3]}")
                 return not bad and len(want)>=20 and n_notin>=4
             check("TreeHist/FileHist/Search/DuIdx 1.0.219 : requêtes par chemin (événements, dernier événement, NOT EXISTS par ligne de snapshot) sur idx_diff_nick_path — plage, épinglée, -X, clair et chiffré",_s121_plans_ops)
+            # ── Story 126 : exploration par saut d'index — TreeHist (vue, épinglée, -X) et FileHist lisent le dossier / les K archives, pas l'archive entière ──
+            def _s126_ref_listing(self,n,prefix,conn,archive_from=None,archive_to=None):
+                """Référence LENTE : _treehist_listing de 1.0.220 (avant la story 126) recopié, JSON seul — enfants directs par balayage de TOUTES les
+                lignes de l'archive (vue archive_snapshot_v, substr/instr), sous-arbre de diff_index lu en entier, une lecture des événements par
+                répertoire. `self` = le BorgHelper. Y compris la vue d'une archive épinglée (-b X -B X). Le contrôle compare la vraie méthode à elle."""
+                prefix=_norm_lp(prefix)
+                latest=_latest_snapshot_archive(conn,n)
+                if latest is None: return {'error':f"aucun snapshot indexé sous {prefix or '/'} — lancez : borgHelper -c Index -n {n}"}
+                pin_date=None
+                if archive_from and archive_from!='ALL' and archive_from==archive_to:
+                    _has,_d=_snapshot_probe(conn,n,archive_from)
+                    if _has and _d is None: _d=self._archive_date(conn,n,archive_from)
+                    if _has and _d is not None: latest=archive_from; pin_date=_d
+                    else:
+                        if not _has and self._archive_date(conn,n,archive_from) is None:
+                            msg=f"{archive_from} pas encore indexée — lancez Index (ou attendez l'Index de fin de Bkp)"
+                        elif _has: msg=f"date de {archive_from} inconnue — relancer Index"
+                        else:
+                            _xd=self._archive_date(conn,n,archive_from); _ls=_latest_snapshot_archive(conn,n)
+                            _ld=(_snapshot_probe(conn,n,_ls)[1] or self._archive_date(conn,n,_ls)) if _ls is not None else None
+                            if _ls is None or (_ld is not None and _xd>=_ld): msg=f"{archive_from} pas encore indexée — lancez Index (ou attendez l'Index de fin de Bkp)"
+                            else:
+                                try: _kp=_snap_keep(self.borg.cfgread(n) or {})
+                                except (Exception,SystemExit): _kp=None
+                                msg=(f"contenu de {archive_from} non indexé — snapshots gardés : les {_kp if _kp is not None else ''}{' ' if _kp is not None else ''}"
+                                     f"derniers (IDX_SNAP_KEEP) ; LstBkpFls / Restore pour le lire")
+                        return {'error':msg}
+                psql,pprm,_=_psel_under(conn,prefix,self_too=True)
+                plen=len(prefix)+1 if prefix else 0
+                children={}; type_by_name={}; mode_by_name={}; owner_by_name={}
+                own_type=None; own_mode=None; own_owner=None
+                if conn.codec is not None:
+                    enc_prefix=conn.codec.path.encode(prefix) if prefix else ''
+                    skip=len(enc_prefix)+1 if enc_prefix else 0
+                    usql,uprm,_=_psel_under(conn,prefix)
+                    rest=f"substr(path,{skip+1})"
+                    if prefix:
+                        own=conn.execute("SELECT type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=? AND path=?",(n,latest,enc_prefix)).fetchone()
+                        if own: own_type,own_mode,own_owner=own
+                    def _child(stored_child):
+                        lp=conn.codec.decode_path(stored_child)
+                        return lp[plen:] if prefix else lp
+                    for path,ftype,fmode,fowner in conn.execute(
+                            f"SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(usql)} AND instr({rest},'/')=0",[n,latest]+uprm):
+                        name=_child(path); children.setdefault(name,False)
+                        type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+                    for (seg,) in conn.execute(
+                            f"SELECT DISTINCT substr({rest},1,instr({rest},'/')-1) FROM archive_snapshot_v WHERE nick=? AND archive=?{_wh(usql)} AND instr({rest},'/')>0",[n,latest]+uprm):
+                        children[_child(f"{enc_prefix}/{seg}" if enc_prefix else seg)]=True
+                else:
+                    for path,ftype,fmode,fowner in conn.execute("SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[n,latest]+pprm):
+                        lp=_path_decode(conn,path)
+                        if prefix and lp==prefix: own_type=ftype; own_mode=fmode; own_owner=fowner; continue
+                        rel=lp[plen:] if prefix else lp
+                        if not rel: continue
+                        seg=rel.split('/',1); name=seg[0]; is_dir=len(seg)>1
+                        children[name]=children.get(name,False) or is_dir
+                        if not is_dir: type_by_name[name]=ftype; mode_by_name[name]=fmode; owner_by_name[name]=fowner
+                usql,uprm,_=_psel_under(conn,prefix)
+                if conn.codec is not None:
+                    enc_prefix=conn.codec.path.encode(prefix) if prefix else ''
+                    stored_skip=len(enc_prefix)+1 if enc_prefix else 0
+                else: stored_skip=plen
+                del_rows=[]
+                for (stored,) in conn.execute("SELECT DISTINCT path FROM diff_index WHERE nick=?"+_wh(usql),[n]+uprm).fetchall():
+                    rest=stored[stored_skip:]
+                    if not rest or '/' in rest: continue
+                    lp=_path_decode(conn,stored); nm=lp[plen:] if prefix else lp
+                    if not nm or nm in children: continue
+                    last=conn.execute("SELECT change_type,archive_old,size_before FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"
+                                      +(" AND archive_new_date<=?" if pin_date is not None else "")+" ORDER BY archive_new_date DESC,id DESC LIMIT 1",
+                                      (n,stored) if pin_date is None else (n,stored,pin_date)).fetchone()
+                    if last and last[0] in _DIFF_REMOVED_TYPES: del_rows.append((lp,last[1],_diff_entry_type(last[0],last[2])))
+                deleted_children={}
+                for path,archive_old,etype in del_rows:
+                    name=path[plen:] if prefix else path
+                    if not name or name in children: continue
+                    deleted_children[name]=(archive_old,etype)
+                if not children and not deleted_children and (not prefix or own_type is None): return {'error':f"{prefix or '/'} vide ou introuvable dans le snapshot ({latest})"}
+                if pin_date is not None: af_sql,af_params=" AND archive_new=?",[archive_from]
+                else: af_sql,af_params=self.db._diff_archive_filter(n,archive_from,conn,archive_to)
+                def _events_for(full_path,recursive=False):
+                    own=conn.execute("SELECT change_type,archive_new,archive_new_date FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,_path_stored(conn,full_path)]+af_params).fetchall()
+                    if not recursive: return own
+                    dsql,dprm,_=_psel_under(conn,full_path)
+                    deep=conn.execute("SELECT DISTINCT archive_new,archive_new_date FROM diff_index"+(" INDEXED BY idx_diff_nick_path" if dsql else "")
+                                      +" WHERE nick=?"+_wh(dsql)+af_sql+" ORDER BY archive_new_date",[n]+dprm+af_params).fetchall()
+                    own_archives={a for _,a,_ in own}
+                    return sorted(own+[('modified',arch,date) for arch,date in deep if arch not in own_archives],key=lambda r:r[2] or '')
+                def _genre(is_dir,known_type):
+                    if known_type: return _TREEHIST_GENRES.get(known_type,f"type '{known_type}'")
+                    return 'répertoire' if is_dir else 'inconnu (réindexer)'
+                entries=[]
+                def _add_rows(name,genre,droits,owner,full_path,is_dir,recursive=False):
+                    entries.append({'name':name,'full_path':full_path,'genre':genre,'mode':droits,'owner':owner,'is_dir':is_dir,
+                        'events':[{'type':ct,'archive':arch,'date':(date or '')[:19]} for ct,arch,date in _events_for(full_path,recursive=recursive)]})
+                _add_rows('.',_TREEHIST_GENRES.get(own_type,'répertoire'),own_mode,own_owner,prefix,True,recursive=True)
+                for name in sorted(set(children)|set(deleted_children)):
+                    full=f"{prefix}/{name}" if prefix else name
+                    if name in children:
+                        is_dir=children[name]
+                        _add_rows(name,_genre(is_dir,type_by_name.get(name)),mode_by_name.get(name),owner_by_name.get(name),full,is_dir,recursive=is_dir)
+                    else:
+                        archive_old,etype=deleted_children[name]
+                        entries.append({'name':name,'full_path':full,'genre':_TREEHIST_GENRES.get(etype,'inconnu'),'mode':None,'owner':None,'is_dir':etype=='d',
+                                        'deleted':True,'last_seen_archive':archive_old,'events':[]})
+                return {'path':prefix,'archive':latest,'entries':entries}
+            def _s126_ref_filehist(bh,n,path,archive_from,archive_to):
+                """Référence LENTE : FileHist de 1.0.220 recopié (JSON seul) — le snapshot par la vue sur les lignes de TOUS les snapshots du nick."""
+                conn=_open_db(bh.db.get_diff_db(n),nick=n,role='read',empty_ok=True)
+                try:
+                    af_sql,af_params=bh.db._diff_archive_filter(n,archive_from,conn,archive_to)
+                    pstored=_path_stored(conn,path)
+                    rows=conn.execute("SELECT nick,archive_new_date,archive_old,archive_new,change_type,size_before,size_after FROM diff_index INDEXED BY idx_diff_nick_path WHERE nick=? AND path=?"+af_sql+" ORDER BY archive_new_date,id",[n,pstored]+af_params).fetchall()
+                    df,dt=_snap_params(af_params,archive_from,archive_to)
+                    rows+=conn.execute("SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick=? AND path=? "+_snap_notin(df,dt),[n,pstored]+[x for x in [df,dt] if x]).fetchall()
+                finally: conn.close()
+                rows.sort(key=lambda r:(r[1] or ''))
+                return [{'date':(d or '')[:19],'archive_before':ao,'archive_after':an,'type':t,'size_before':sb,'size_after':sa} for _,d,ao,an,t,sb,sa in rows]
+            def _s126_tree(arch,encrypted,noise=0):
+                """Arbre de l'archive `arch` (k1..k4, kz, ka) des bases fabriquées de la story 126 : frères dont le nom commence par celui d'un autre suivi d'un caractère
+                < '/' ('foo', 'foo.txt', 'foo-bar', 'foo bar' : ils se trouvent ENTRE 'foo' et 'foo/…' dans l'ordre des chemins), dossier connu par ses seuls
+                descendants (zeta), fichier avec descendants (odd), versions multiples (ver, foo.txt), lien physique (hl1/hl2), entrées d'autres archives seulement,
+                dossier de 300 fichiers + 20 sous-dossiers (big), chaîne profonde, accents, nom non UTF-8 (chiffré seul) ; `noise` : fichiers hors des dossiers lus."""
+                i={'k1':1,'k2':2,'k3':3,'k4':3,'kz':3,'ka':3}[arch]; L=[]
+                def D(p): L.append({'path':p,'size':None,'mtime':'m','type':'d','mode':'drwx','owner':'o','link':None})
+                def F(p,**k): L.append({**{'path':p,'size':3,'mtime':'m','type':'-','mode':'-rw-','owner':'o','link':None},**k})
+                D('alt'); F('alt/a1'); F('alt/z1')
+                D('top'); D('top/foo'); D('top/foo/a'); F('top/foo/a/y'); F('top/foo/a.txt'); F('top/foo/b'); D('top/foo-bar'); F('top/foo-bar/q')
+                F('top/foo.txt',mode=f"-rw-{arch}"); F('top/foo bar'); F('top/foo0'); F('top/foo1'); F('top/zeta/m'); F('top/odd'); F('top/odd/x')
+                F('top/ver',size=i,mode=f"-rw-{i}"); F('top/hl1'); F('top/hl2',mode='hrw-',link='top/hl1'); F('top/éa'); F('top/Éb')
+                if arch!='k2': D('top/foo/a-b'); F('top/foo/a-b/z')
+                if arch=='k1': F('top/gone'); D('top/gonedir'); F('top/gonedir/x')
+                if arch in ('k1','k2'): F('top/foo/gone2')
+                if arch=='k2': F('top/onlyk2')
+                if arch in ('k3','k4','kz','ka'): F('top/readded')
+                D('big')
+                for j in range(300): F(f"big/f{j:03d}")
+                for j in range(20): D(f"big/s{j}"); F(f"big/s{j}/f")
+                D('deep'); D('deep/a'); D('deep/a/b'); D('deep/a/b/c'); D('deep/a/b/c/d'); D('deep/a/b/c/d/e'); F('deep/a/b/c/d/e/f')
+                D('wide'); D('wide/w0'); F('wide/x')
+                for j in range(400): F(f"wide/w0/g{j}")   # un enfant à 400 descendants : le saut d'index doit le franchir d'un coup
+                if encrypted: F('top/'+b'\xff\xfe'.decode('utf-8','surrogateescape'))
+                for j in range(noise): F(f"noise/n{j}")
+                return L
+            def _s126_env(noise=0,tag='main'):
+                """BorgHelper + deux bases fabriquées, claire 'ep' et chiffrée 'ee', mêmes données, 6 archives — k1..k4 de dates distinctes, kz puis ka de MÊME date (revue 1, C-1 : l'ordre des événements synthétiques à date égale doit rester celui d'avant) —, paires de diff_index k1->k2->k3->k4->kz->ka."""
+                c=_s126_env.cache.get((noise,tag))
+                if c is not None: return c
+                d=os.path.join(tmp,f's126-{tag}-{noise}'); cache=os.path.join(d,'cache'); rc=os.path.join(d,'rc'); os.makedirs(cache,exist_ok=True)
+                with open(rc,'w') as f:
+                    for nk,enc in (('ep','false'),('ee','true')): f.write(f"[{nk}]\nBORG_REPO=/r\nBORG_PASSPHRASE=pw\nSER_NAME=s\nGLOB_ARCH=s-*\nMOUNTPOINT=/m\nDB_ENCRYPT={enc}\n")
+                os.chmod(rc,0o600)
+                bh=BorgHelper(cfgfile=rc,cache_dir=cache); _DB_CFG_READERS[os.path.realpath(cache)]=bh.borg.cfgread
+                DT={'k1':'2026-04-01T00:00:00','k2':'2026-04-02T00:00:00','k3':'2026-04-03T00:00:00','k4':'2026-04-04T00:00:00','kz':'2026-04-05T00:00:00','ka':'2026-04-05T00:00:00'}   # kz et ka : MÊME date, noms en ordre inverse de l'indexation
+                def ent(p,ct,sb=None,sa=None): return {'change_type':ct,'path':p,'size_before':sb,'size_after':sa}
+                DIFF={('k1','k2'):[ent('top/gone','removed',3),ent('top/gonedir','removed directory'),ent('top/gonedir/x','removed',3),ent('top/onlyk2','added',None,3),
+                                   ent('top/foo.txt','modified',3,4),ent('top/readded','removed',3),ent('top/nope','removed',3),ent('big/f005','modified',1,2),
+                                   ent('big/s3/f','modified',1,2),ent('top/foo/a/y','modified',1,2)]+[ent(f"wide/w0/g{j}",'modified',1,2) for j in range(400)],
+                      ('k2','k3'):[ent('top/onlyk2','removed',3),ent('top/foo/gone2','removed',3),ent('top/foo.txt','modified',4,5),ent('top/readded','added',None,3),
+                                   ent('top/zeta/m','added',None,3),ent('deep/a/b/c/d/e/f','added',None,3)],
+                      ('k3','k4'):[ent('top/foo-bar/q','modified',1,2),ent('top/foo/b','modified',3,4),ent('top/ver','modified',3,4)],
+                      ('k4','kz'):[ent('top/zeta/m','modified',1,2),ent('alt/a1','modified',1,2)],   # kz : indexée d'abord (ids plus petits) ; 'top/zeta/…' APRÈS 'top/foo/…' dans l'ordre des chemins, 'alt/a1' AVANT 'alt/z1'
+                      ('kz','ka'):[ent('top/foo/a/y','modified',2,3),ent('alt/z1','modified',2,3)]}  # ka : indexée ensuite, nom plus petit que kz ; sous 'top' : ordre par id [kz,ka], par chemin [ka,kz], par nom [ka,kz] ; sous 'alt' : id [kz,ka], chemin [kz,ka], nom [ka,kz]
+                for nk in ('ep','ee'):
+                    db_=bh.db.get_diff_db(nk)
+                    for suf in ('','-wal','-shm'):
+                        if os.path.exists(db_+suf): os.unlink(db_+suf)
+                    bh.db.ensure_diff_db(db_,create=True,nick=nk)
+                    for (o,nw),ents in DIFF.items(): assert bh.db.store_diff_entries(nk,o,nw,DT[nw],ents,db_path=db_)
+                    for a in ('k1','k2','k3','k4','kz','ka'):
+                        assert bh.db.store_archive_stats(nk,a,DT[a],60,10**6,10**6,10**4,10,db_path=db_)
+                        assert bh.db.store_archive_snapshot(nk,a,DT[a],_s126_tree(a,nk=='ee',noise),db_path=db_)
+                _s126_env.cache[(noise,tag)]={'bh':bh,'DT':DT}
+                return _s126_env.cache[(noise,tag)]
+            _s126_env.cache={}
+            def _s126_dump(x): return json.dumps(x,ensure_ascii=False)
+            def _s126_same_as_reference():
+                """TreeHist (story 126) : JSON IDENTIQUE (même ordre) à la référence lente d'avant — vue ALL/plage/-b seul, épinglée (archive avec le dernier snapshot, ancienne,
+                inconnue), -X ; clair ET chiffré (dont un nom non UTF-8) ; racine, dossiers à frères 'prefixe', dossier connu par ses descendants, fichier à descendants,
+                dossier de 320 entrées, chaîne profonde, préfixe absent, préfixe fichier ; chaque stratégie de _snap_kids forcée (saut d'index seul : seuil 0 ; lecture
+                d'un trait seule : seuil énorme ; hybride : seuil 6). Les deux stratégies sont vues à l'œuvre (marqueur /*saut*/ dans le journal SQL)."""
+                E=_s126_env(); bh=E['bh']; g=globals(); real=g['_SNAP_SCAN_MAX']; bad=[]; n_ok=0; saut={}
+                PFS=(None,'alt','top','top/foo','top/foo/a','top/foo/a-b','top/foo-bar','top/zeta','top/odd','top/foo.txt','top/hl2','big','big/s3','wide','wide/w0','deep','deep/a/b','inconnu','top/inconnu')
+                LA=(('ALL',None),(None,None),('k1','k3'),('k1',None),('k2','k2'),('k1','k1'),('k3','k3'),('k4','k4'),('k3','k4'),('kz','ka'),('ka','ka'),('kz','kz'),('k4','ka'),('inconnue','inconnue'))
+                CH=(('k1','k2'),('k2','k3'),('k1','k3'),(None,None),('ALL',None),('k3','k1'),('inconnue','k3'),('k3','k4'),('k4','ka'),('kz','ka'),('k4','kz'))
+                try:
+                    for mx in (0,6,10**9):
+                        g['_SNAP_SCAN_MAX']=mx
+                        for nk in ('ep','ee'):
+                            conn=_open_db(bh.db.get_diff_db(nk),nick=nk,role='read',empty_ok=True)
+                            sql=[]; conn.set_trace_callback(sql.append)
+                            try:
+                                for pf in PFS:
+                                    pfx=_norm_lp(pf or '')
+                                    for af,at in LA:
+                                        a=_s126_dump(bh._treehist_listing(nk,pfx,conn,archive_from=af,archive_to=at,as_json=True)); b=_s126_dump(_s126_ref_listing(bh,nk,pfx,conn,af,at))
+                                        n_ok+=1
+                                        if a!=b: bad.append((nk,pf,af,at,mx,'liste'))
+                                    for af,at in CH:
+                                        a=_s126_dump(bh._treehist_changes(nk,pfx,conn,archive_from=af,archive_to=at,as_json=True)); b=_s126_dump(_s121_ref_changes(bh,nk,pfx,conn,af,at))
+                                        n_ok+=1
+                                        if a!=b: bad.append((nk,pf,af,at,mx,'-X'))
+                            finally: conn.close()
+                            saut[mx]=saut.get(mx,0)+sum(1 for s_ in sql if '/*saut*/' in s_)
+                finally: g['_SNAP_SCAN_MAX']=real
+                # revue 1 (C-1) : deux archives de MÊME date (kz indexée d'abord, ka ensuite, noms en ordre inverse) — l'ordre de leurs événements synthétiques est celui d'avant :
+                # à la racine, '.' = ordre d'indexation (id) [kz, ka] ; sous un préfixe en clair, ordre des chemins : 'top/foo/…' (ka) avant 'top/zeta/…' (kz) -> [ka, kz]
+                tie={}
+                for nk in ('ep','ee'):
+                    conn=_open_db(bh.db.get_diff_db(nk),nick=nk,role='read',empty_ok=True)
+                    try:
+                        for pf in ('','top'):
+                            r=bh._treehist_listing(nk,pf,conn,archive_from='ALL',as_json=True)
+                            tie[(nk,pf)]=[x['archive'] for x in r['entries'][0]['events'] if x['date'].startswith('2026-04-05')]
+                            if pf=='':   # dossiers enfants de la racine : toujours l'ordre des chemins
+                                for e in r['entries']:
+                                    if e['name'] in ('top','alt'): tie[(nk,'/'+e['name'])]=[x['archive'] for x in e['events'] if x['date'].startswith('2026-04-05')]
+                    finally: conn.close()
+                res={'liste identique':[b for b in bad if b[-1]=='liste'][:4] or True,'-X identique':[b for b in bad if b[-1]=='-X'][:4] or True,'combinaisons':n_ok>1500 or n_ok,
+                     'sauts d\'index tracés (seuil 0 : oui, seuil énorme : non)':(saut[0]>100 and saut[10**9]==0) or saut,
+                     'date égale racine (ordre des id)':(tie[('ep','')]==['kz','ka'] and tie[('ee','')]==['kz','ka']) or tie,
+                     'date égale préfixe en clair (ordre des chemins)':tie[('ep','top')]==['ka','kz'] or tie,
+                     'date égale dossier enfant en clair, chemins avant noms (top : ka, kz)':tie[('ep','/top')]==['ka','kz'] or tie,
+                     'date égale dossier enfant en clair, chemins avant noms (alt : kz, ka)':tie[('ep','/alt')]==['kz','ka'] or tie}
+                bad_={k:v for k,v in res.items() if v is not True}   # revue 2 (R2-5) : seules les entrées en échec sont affichées (une vise ne peut plus tomber sur une clé qui passe)
+                if bad_: print(f"  {bad_}")
+                return not bad_
+            check("TreeHist story 126 : JSON identique à la référence lente d'avant (balayage de l'archive, un sous-arbre de diff_index par dossier), clair et chiffré, vue/plage/épinglée/-X, frères 'seg.x' entre 'seg' et 'seg/…', saut d'index et lecture d'un trait",_s126_same_as_reference)
+            def _s126_content():
+                """Contenu attendu du dossier 'top' de la base fabriquée (écrit en dur, la référence ne suffit pas à elle seule) : enfants présents, dossiers (foo
+                a des descendants ; zeta n'a QUE des descendants ; odd est un fichier à descendants), supprimés (gone, gonedir, onlyk2, nope), vue épinglée sur k2
+                (gone encore présent, onlyk2 présent, readded absent), identique en clair et chiffré, les noms non UTF-8 revenant intacts."""
+                E=_s126_env(); bh=E['bh']; res={}
+                for nk in ('ep','ee'):
+                    conn=_open_db(bh.db.get_diff_db(nk),nick=nk,role='read',empty_ok=True)
+                    try:
+                        r=bh._treehist_listing(nk,'top',conn,archive_from='ALL',as_json=True); p=bh._treehist_listing(nk,'top',conn,archive_from='k2',archive_to='k2',as_json=True)
+                    finally: conn.close()
+                    ev={e['name']:e for e in r['entries']}; pv={e['name']:e for e in p['entries']}
+                    nm='\udcff\udcfe'
+                    res[nk]=(r['archive'],sorted(k for k,e in ev.items() if not e.get('deleted') and k!='.' and k!=nm),sorted(k for k,e in ev.items() if e.get('deleted')),
+                             [k for k,e in ev.items() if e['is_dir'] and not e.get('deleted')],ev['zeta']['genre'],ev['odd']['is_dir'],ev['hl2']['mode'],
+                             sorted(k for k,e in pv.items() if not e.get('deleted') and k!='.' and k!=nm),sorted(k for k,e in pv.items() if e.get('deleted')),p['archive'],nm in ev)
+                present=['foo','foo bar','foo-bar','foo.txt','foo0','foo1','hl1','hl2','odd','readded','ver','zeta','Éb','éa']   # tri Python (points de code)
+                pinned=['foo','foo bar','foo-bar','foo.txt','foo0','foo1','hl1','hl2','odd','onlyk2','ver','zeta','Éb','éa']          # k2 : onlyk2 présent, readded supprimé à k2
+                want=('ka',present,['gone','gonedir','nope','onlyk2'],['.','foo','foo-bar','odd','zeta'],'répertoire',True,'hrw-',pinned,['gone','gonedir','nope','readded'],'k2')
+                a,b=res['ep'],res['ee']
+                ok=a[:10]==want and b[:10]==want and a[10] is False and b[10] is True
+                if not ok: print(f"  {dict([(k,v) for k,v in (('clair conforme',a[:10]==want or a),('chiffré conforme',b[:10]==want or b),('nom non UTF-8 (clair absent, chiffré présent)',(a[10],b[10])==(False,True) or (a[10],b[10]))) if v is not True])}   attendu {want}")
+                return ok
+            check("TreeHist story 126 : contenu attendu du dossier fabriqué (présents, répertoires, dossier connu par ses seuls descendants, fichier à descendants, supprimés, vue épinglée), clair == chiffré",_s126_content)
+            def _s126_kids_structure():
+                """_snap_kids et _diff_direct_paths sur des chemins stockés écrits À LA MAIN (clair, caractères autour de '/') : 'a', 'a-b', 'a.txt' entre 'a' et
+                'a/x' ; 'a0' après ; ligne d'une autre archive entre deux membres ; dossier sans ligne propre ; ligne propre sans descendant dans l'archive mais avec
+                dans une autre. Attentes en dur, saut d'index (seuil 0) ET lecture d'un trait (seuil énorme) ; une boucle infinie (le défaut d'un saut direct
+                après 'a') est coupée par un gestionnaire de progression -> échec, jamais un blocage."""
+                p=os.path.join(tmp,'s126-kids.db')
+                for suf in ('','-wal','-shm'):
+                    if os.path.exists(p+suf): os.unlink(p+suf)
+                E=_s126_env(); E['bh'].db.ensure_diff_db(p,create=True)
+                c=_open_db(p,nick=None,role='admin'); g=globals(); real=g['_SNAP_SCAN_MAX']
+                try:
+                    P=['a','a-b','a-b/z','a.txt','a/x','a/y/w','a0','b','b/c','c','d/e','e','e/f','f/g']   # rien d'autre ; ids 1..len
+                    for i,x in enumerate(P,1): c.execute("INSERT INTO snapshot_file(id,nick,path,type,mode,owner) VALUES(?,'k',?,?,?,?)",(i,x,'d' if x in ('a','b') else '-',f"m{i}",f"o{i}"))
+                    ids={x:i for i,x in enumerate(P,1)}
+                    for x in P:
+                        if x not in ('a-b/z','e'): c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES('k','A1','2026-01-01',?)",(ids[x],))   # absents de A1 : a-b/z, e (seulement dans une autre archive)
+                    for x in ('a','a-b','a-b/z','e','e/f','c'): c.execute("INSERT INTO archive_snapshot(nick,archive,archive_date,file_id) VALUES('k','A2','2026-01-02',?)",(ids[x],))
+                    for x in ('e','e/f','b','b/c'): c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path) VALUES('k','A1','A2','2026-01-02','modified',?)",(x,))
+                    for x in ('a','a/x','a-b','a.txt','zz','zz/q','a/y/w'): c.execute("INSERT INTO diff_index(nick,archive_old,archive_new,archive_new_date,change_type,path) VALUES('k','A1','A2','2026-01-02','added',?)",(x,))
+                    c.commit()
+                    steps=[0]
+                    def guard(): steps[0]+=1; return 1 if steps[0]>3000 else 0
+                    def kids(arch,sp,mx):
+                        g['_SNAP_SCAN_MAX']=mx; steps[0]=0; c.set_progress_handler(guard,1000)
+                        try: return {k:tuple(v) for k,v in _snap_kids(c,'k',arch,sp).items()}
+                        except sqlite3.OperationalError as e: return f"boucle : {e}"
+                        finally: c.set_progress_handler(None,0)
+                    def dp(sp,mx):
+                        g['_SNAP_SCAN_MAX']=mx; steps[0]=0; c.set_progress_handler(guard,1000)
+                        try: return sorted(_diff_direct_paths(c,'k',sp))
+                        except sqlite3.OperationalError as e: return f"boucle : {e}"
+                        finally: c.set_progress_handler(None,0)
+                    want1={'a':(True,'d','m1','o1'),'a-b':(False,'-','m2','o2'),'a.txt':(False,'-','m4','o4'),'a0':(False,'-','m7','o7'),'b':(True,'d','m8','o8'),'c':(False,'-','m10','o10'),
+                           'd':(True,None,None,None),'e':(True,None,None,None),'f':(True,None,None,None)}
+                    want2={'a':(False,'d','m1','o1'),'a-b':(True,'-','m2','o2'),'c':(False,'-','m10','o10'),'e':(True,'-','m12','o12')}
+                    want_a1={'x':(False,'-','m5','o5'),'y':(True,None,None,None)}
+                    ok={}
+                    for mx,nom in ((0,'saut'),(10**9,'un trait')):
+                        ok[f'{nom} : racine A1']=kids('A1','',mx)==want1 or kids('A1','',mx); ok[f'{nom} : racine A2']=kids('A2','',mx)==want2 or kids('A2','',mx)
+                        ok[f'{nom} : dossier a (A1)']=kids('A1','a',mx)==want_a1 or kids('A1','a',mx); ok[f'{nom} : dossier a (A2)']=kids('A2','a',mx)=={} or kids('A2','a',mx)
+                        ok[f'{nom} : dossier zz (A1)']=kids('A1','zz',mx)=={} or kids('A1','zz',mx); ok[f'{nom} : dossier b (A2)']=kids('A2','b',mx)=={} or kids('A2','b',mx)
+                        # diff_index : enfants directs (chemins stockés distincts) — 'a', 'a-b', 'a.txt', 'b', 'e', 'zz' sous la racine (jamais 'a/x', 'zz/q', 'a/y/w')
+                        ok[f'{nom} : diff_index racine']=dp('',mx)==['a','a-b','a.txt','b','e','zz'] or dp('',mx); ok[f'{nom} : diff_index a']=dp('a',mx)==['a/x'] or dp('a',mx)
+                        ok[f'{nom} : diff_index zz']=dp('zz',mx)==['zz/q'] or dp('zz',mx); ok[f'{nom} : diff_index e']=dp('e',mx)==['e/f'] or dp('e',mx); ok[f'{nom} : diff_index b']=dp('b',mx)==['b/c'] or dp('b',mx)
+                    bad_={k:v for k,v in ok.items() if v is not True}
+                    if bad_: print(f"  {bad_}")
+                    return not bad_
+                finally: g['_SNAP_SCAN_MAX']=real; c.close()
+            check("TreeHist story 126 : _snap_kids / _diff_direct_paths sur chemins écrits à la main — frères 'a-b', 'a.txt' entre 'a' et 'a/x', autre archive, dossier sans ligne propre ; saut d'index == lecture d'un trait, sans boucle",_s126_kids_structure)
+            def _s126_filehist_same():
+                """FileHist (story 126) : mêmes lignes, même ordre que la référence lente (vue sur tous les snapshots), clair et chiffré — fichier à versions multiples, lien
+                physique, présent dans une seule archive, supprimé, absent, ré-ajouté, dossier ; ALL, sans -b, plage, épinglée, archive inconnue — et la sortie texte
+                contient les mêmes archives."""
+                E=_s126_env(); bh=E['bh']; bad=[]; n_ok=0
+                for nk in ('ep','ee'):
+                    for pf in ('top/ver','top/foo.txt','top/hl1','top/hl2','top/gone','top/onlyk2','top/readded','top/nope','top/foo/a-b/z','top/foo','top','inconnu','big/f005','deep/a/b/c/d/e/f'):
+                        for af,at in ((None,None),('ALL',None),('k1','k3'),('k2','k2'),('k3','k4'),('k1',None),('inconnue','k3')):
+                            out=io.StringIO()
+                            with contextlib.redirect_stdout(out): bh.filehist(nk,pf,archive_from=af,archive_to=at,as_json=True)
+                            try: new=json.loads(out.getvalue())[nk]
+                            except ValueError: new=out.getvalue()
+                            try: old=_s126_ref_filehist(bh,nk,pf,af,at)
+                            except SystemExit: old=None
+                            n_ok+=1
+                            if isinstance(new,dict) and old is None: continue   # archive inconnue : erreur des deux côtés (filtre d'archive)
+                            if new!=old: bad.append((nk,pf,af,at))
+                res={'lignes identiques à la référence':bad[:6] or True,'combinaisons':n_ok>150 or n_ok}
+                bad_={k:v for k,v in res.items() if v is not True}
+                if bad_: print(f"  {bad_}")
+                return not bad_
+            check("FileHist story 126 : mêmes lignes et même ordre que la référence lente (vue sur tous les snapshots), clair et chiffré, versions multiples/lien physique/supprimé/absent, ALL/plage/épinglée",_s126_filehist_same)
+            def _s126_plans():
+                """Plans de TreeHist (ALL, épinglée, -X) et FileHist (story 126) : AUCUNE requête tracée ne lit archive_snapshot autrement que par sa CLÉ PRIMAIRE complète
+                (nick,archive,file_id — jamais le balayage `(nick=? AND archive=?)` de la vue sur l'archive entière, ni `(nick=?)` de FileHist) ; seules exceptions : les sauts
+                de _snapshot_archives (`ORDER BY archive LIMIT 1`) et les sondes LIMIT 1 de _snapshot_probe ; les requêtes de saut/lecture lisent snapshot_file par
+                idx_snapfile_nick_path (INDEXED BY) sans TEMP B-TREE. La règle sur le PLAN retient les lignes qui nomment la table (`archive_snapshot`), son alias (`SEARCH s`) ou
+                l'index `idx_snap_nick_archive` ; éprouvée par cinq témoins : l'ancienne requête de FileHist et celle de TreeHist (par la vue : règle sur le texte), la jointure sans
+                `s.archive=?`, la jointure forcée sur idx_snap_nick_archive (plans qui ne citent pas le mot archive_snapshot) — jugées défectueuses — et la jointure correcte, jugée saine.
+                Résultat des témoins affiché en dict à l'échec."""
+                E=_s126_env(); bh=E['bh']; g=globals(); real=g['_SNAP_SCAN_MAX']; bad=[]; seen={'pk':0,'saut':0,'view':0}
+                def plan(conn,x): return ' | '.join(str(r_[-1]) for r_ in conn.execute('EXPLAIN QUERY PLAN '+x))
+                def judge(conn,s_):
+                    if 'archive_snapshot' not in s_ and 'snapshot_file' not in s_: return None
+                    try: pl=plan(conn,s_)
+                    except sqlite3.Error: return None
+                    if s_.lstrip().startswith(('PRAGMA','EXPLAIN','SELECT EXISTS','CREATE','DROP','ALTER','INSERT','UPDATE','DELETE','BEGIN','COMMIT','ROLLBACK')) or 'sqlite_master' in s_: return None   # ouverture de la base (vue, base vide), pas une lecture de snapshot
+                    if re.search(r'FROM archive_snapshot WHERE nick=\S+ (AND archive>\S+ )?ORDER BY archive LIMIT 1',s_): return None   # _snapshot_archives
+                    if 'archive_snapshot_v' in s_:
+                        return None if re.search(r'LIMIT 1$',s_.strip()) else ('vue sans LIMIT 1',pl)   # _snapshot_probe
+                    if 'archive_snapshot' in s_.replace('archive_snapshot_indexed','') or 'archive_snapshot' in pl.replace('archive_snapshot_indexed',''):   # le TEXTE de la requête compte : le plan peut ne nommer que l'alias ou l'index
+                        lines=[l for l in pl.split(' | ') if re.search(r'\b(SEARCH|SCAN) s\b',l) or 'archive_snapshot' in l or 'idx_snap_nick_archive' in l]   # revue 1 : l'alias `s` et l'index nomment la table sans la citer
+                        if not lines or not all('file_id=?' in l for l in lines): return ('archive_snapshot hors clé primaire',pl)
+                    if 'INDEXED BY idx_snapfile_nick_path' in s_ and ('TEMP B-TREE' in pl or 'idx_snapfile_nick_path' not in pl): return ('plan de saut',pl)
+                    return None
+                try:
+                    for mx in (0,10**9):
+                        g['_SNAP_SCAN_MAX']=mx
+                        for nk in ('ep','ee'):
+                            conn=_open_db(bh.db.get_diff_db(nk),nick=nk,role='read',empty_ok=True); sql=[]; conn.set_trace_callback(sql.append)
+                            try:
+                                for pf in (None,'top','top/foo','big'):
+                                    bh._treehist_listing(nk,_norm_lp(pf or ''),conn,archive_from='ALL',as_json=True); bh._treehist_listing(nk,_norm_lp(pf or ''),conn,archive_from='k2',archive_to='k2',as_json=True)
+                                    bh._treehist_changes(nk,_norm_lp(pf or ''),conn,archive_from='k1',archive_to='k3',as_json=True)
+                                conn.set_trace_callback(None)
+                                for s_ in sql:
+                                    r=judge(conn,s_)
+                                    if r: bad.append((nk,mx,s_[:90],r[0],r[1][:120]))
+                                    elif 'CROSS JOIN archive_snapshot' in s_: seen['pk']+=1
+                                    if '/*saut*/' in s_: seen['saut']+=1
+                            finally: conn.close()
+                    # FileHist : ses requêtes passent par _open_db réel ; tracées par une ouverture instrumentée
+                    real_open=_open_db; sqlf=[]
+                    def tracing_open(*a,**k):
+                        cc=real_open(*a,**k); cc.set_trace_callback(sqlf.append); return cc
+                    with mock.patch(f"{__name__}._open_db",tracing_open):
+                        for nk in ('ep','ee'):
+                            with contextlib.redirect_stdout(io.StringIO()):
+                                bh.filehist(nk,'top/ver',as_json=True); bh.filehist(nk,'top/foo.txt',archive_from='k1',archive_to='k3',as_json=True)
+                    cf=_open_db(bh.db.get_diff_db('ep'),nick='ep',role='read',empty_ok=True)
+                    try:
+                        for s_ in sqlf:
+                            r=judge(cf,s_)
+                            if r: bad.append(('filehist',s_[:90],r[0],r[1][:120]))
+                            elif 'CROSS JOIN archive_snapshot' in s_: seen['pk']+=1
+                        # témoin : l'ancienne requête de FileHist (vue) et celle de TreeHist (vue filtrée par archive) sont jugées défectueuses
+                        w1=judge(cf,"SELECT nick,archive_date,'',archive,'présent',NULL,size FROM archive_snapshot_v WHERE nick='ep' AND path='x' AND NOT EXISTS(SELECT 1 FROM diff_index d INDEXED BY idx_diff_nick_path WHERE d.nick=archive_snapshot_v.nick AND d.path=archive_snapshot_v.path)")
+                        w2=judge(cf,"SELECT path,type,mode,owner FROM archive_snapshot_v WHERE nick='ep' AND archive='k3' AND instr(substr(path,5),'/')=0")
+                        # témoins de la règle sur le PLAN (revue 1, C-2) : la jointure sans `s.archive=?` (plan `SEARCH s USING INDEX idx_snap_nick_archive (nick=?)`, alias sans le mot
+                        # archive_snapshot) et la même jointure forcée sur idx_snap_nick_archive sont jugées défectueuses, la bonne (clé primaire complète) ne l'est pas
+                        w3=judge(cf,"SELECT sf.type FROM snapshot_file sf INDEXED BY idx_snapfile_nick_path CROSS JOIN archive_snapshot s WHERE sf.nick='ep' AND sf.path='x' AND s.nick=sf.nick AND s.file_id=sf.id")
+                        w4=judge(cf,"SELECT sf.type FROM archive_snapshot s INDEXED BY idx_snap_nick_archive CROSS JOIN snapshot_file sf INDEXED BY idx_snapfile_nick_path WHERE s.nick='ep' AND s.archive='k3' AND sf.id=s.file_id AND sf.nick=s.nick AND sf.path='x'")
+                        w5=judge(cf,"SELECT sf.type FROM snapshot_file sf INDEXED BY idx_snapfile_nick_path CROSS JOIN archive_snapshot s WHERE sf.nick='ep' AND sf.path='x' AND s.nick=sf.nick AND s.archive='k3' AND s.file_id=sf.id")
+                    finally: cf.close()
+                finally: g['_SNAP_SCAN_MAX']=real
+                ver={'jointure sans archive':bool(w3),'idx_snap_nick_archive forcé':bool(w4),'clé primaire complète jugée saine':w5 is None,'vue FileHist':bool(w1),'vue TreeHist':bool(w2)}
+                res={'requêtes hors plan':bad[:3] or True,'requêtes lues (clé primaire >= 20)':seen['pk']>=20 or seen,'requêtes lues (sauts >= 10)':seen['saut']>=10 or seen,
+                     **{f'témoin {k}':v or False for k,v in ver.items()}}
+                bad_={k:v for k,v in res.items() if v is not True}   # revue 2 (R2-5)
+                if bad_: print(f"  {bad_}")
+                return not bad_
+            check("TreeHist/FileHist story 126 : plans — archive_snapshot lue par sa clé primaire complète seulement (jamais le balayage de l'archive), snapshot_file par idx_snapfile_nick_path sans TEMP B-TREE ; garde éprouvée sur l'ancienne requête (vue)",_s126_plans)
+            def _s126_cost():
+                """Coût de TreeHist indépendant de la taille de l'ARCHIVE (story 126) : le même dossier lu dans une base dont l'archive a 6 000 entrées de plus (hors du dossier)
+                coûte à peu près autant (instructions SQLite : < 1,6 x), alors que la référence lente d'avant coûte > 5 x ; idem FileHist d'un fichier."""
+                res={}
+                for noise in (0,6000):
+                    E=_s126_env(noise,'cost'); bh=E['bh']; vm=[0]; ref=[0]; fh=[0]
+                    conn=_open_db(bh.db.get_diff_db('ee'),nick='ee',role='read',empty_ok=True)
+                    try:
+                        conn.set_progress_handler(lambda: vm.__setitem__(0,vm[0]+1) or 0,100); bh._treehist_listing('ee','top/foo',conn,archive_from='ALL',as_json=True)
+                        conn.set_progress_handler(lambda: ref.__setitem__(0,ref[0]+1) or 0,100); _s126_ref_listing(bh,'ee','top/foo',conn,'ALL',None)
+                        conn.set_progress_handler(None,0)
+                    finally: conn.close()
+                    real_open=_open_db
+                    def counting_open(*a,**k):
+                        cc=real_open(*a,**k); cc.set_progress_handler(lambda: fh.__setitem__(0,fh[0]+1) or 0,100); return cc
+                    with mock.patch(f"{__name__}._open_db",counting_open):
+                        with contextlib.redirect_stdout(io.StringIO()): bh.filehist('ee','top/ver',as_json=True)
+                    res[noise]=(vm[0],ref[0],fh[0])
+                (a0,r0,f0),(a1,r1,f1)=res[0],res[6000]
+                res={'TreeHist : coût indépendant de la taille de l\'archive':a1<a0*1.6 or (a0,a1),'référence lente : coût proportionnel (garde éprouvée)':r1>r0*5 or (r0,r1),
+                     'FileHist : coût indépendant de la taille de l\'archive':f1<f0*1.6+50 or (f0,f1)}
+                bad_={k:v for k,v in res.items() if v is not True}
+                if bad_: print(f"  {bad_}   (instructions/100)")
+                return not bad_
+            check("TreeHist/FileHist story 126 : coût indépendant de la taille de l'archive (6 000 entrées de plus hors du dossier : < 1,6 x ; la référence lente d'avant : > 5 x)",_s126_cost)
+            def _s126_skip_cost():
+                """Le saut d'index franchit un sous-arbre d'un coup (story 126) : dossier 'wide' = UN enfant ('w0') à 400 descendants (+ un fichier) ; _snap_kids en saut d'index
+                (seuil 0) coûte moins du tiers de la lecture d'un trait (seuil énorme) en instructions SQLite, même résultat ; idem _diff_direct_paths (400 lignes de diff_index sous
+                'wide/w0/…', aucun enfant direct de 'wide' dans diff_index : pas de ligne propre). Une boucle qui descendrait le sous-arbre ligne à ligne ne changerait aucune sortie : seul le coût la voit."""
+                E=_s126_env(); bh=E['bh']; g=globals(); real=g['_SNAP_SCAN_MAX']; res={}
+                try:
+                    for nk in ('ep','ee'):
+                        conn=_open_db(bh.db.get_diff_db(nk),nick=nk,role='read',empty_ok=True)
+                        try:
+                            sp=_path_stored(conn,'wide')
+                            for mx in (0,10**9):
+                                g['_SNAP_SCAN_MAX']=mx; vm=[0]; conn.set_progress_handler(lambda: vm.__setitem__(0,vm[0]+1) or 0,100)
+                                k=_snap_kids(conn,nk,'k3',sp); n1=vm[0]; vm[0]=0; d=sorted(_diff_direct_paths(conn,nk,sp)); n2=vm[0]
+                                conn.set_progress_handler(None,0); res[(nk,mx)]=(k,n1,d,n2)
+                        finally: conn.close()
+                finally: g['_SNAP_SCAN_MAX']=real
+                ok={}
+                for nk in ('ep','ee'):
+                    (kb,nb,db_,mb),(ka,na,da,ma)=res[(nk,0)],res[(nk,10**9)]
+                    ok[f'{nk} : même résultat saut / un trait']=kb==ka or (sorted(kb),sorted(ka))
+                    ok[f'{nk} : enfants w0 (descendants) et x (fichier)']=sorted(v[0] for v in kb.values())==[False,True] or sorted(kb.values())
+                    ok[f'{nk} : diff_index sans enfant direct']=db_==da==[] or (db_,da)
+                    ok[f'{nk} : snapshot, saut < tiers de la lecture d\'un trait']=nb*3<na or (nb,na)
+                    ok[f'{nk} : diff_index, saut < tiers de la lecture d\'un trait']=mb*3<ma or (mb,ma)
+                bad_={k:v for k,v in ok.items() if v is not True}
+                if bad_: print(f"  {bad_}   (instructions/100)")
+                return not bad_
+            check("TreeHist story 126 : le saut d'index franchit un sous-arbre d'un coup (400 descendants : moins du tiers des instructions de la lecture d'un trait, même résultat), enfants de snapshot et de diff_index",_s126_skip_cost)
+            def _s126_read_tx():
+                """Lecture d'un dossier dans UNE transaction de lecture (story 126, revue 1, C-6) : un écrivain (purge, Index) qui valide ENTRE deux instructions du listage
+                — ici juste après la lecture de la ligne propre du dossier — ne change pas le résultat (même JSON qu'une lecture sans écrivain) ; en vue normale (`_treehist_listing`)
+                et en `-X` (`_treehist_changes`), clair et chiffré ; la transaction ouverte par l'appel est refermée, celle de l'appelant (TreeHist) est gardée. FileHist (revue 2, R2-3) :
+                idem pour un écrivain qui valide après la liste des archives. NB : `treehist` ouvrait déjà une transaction (1.0.219) — ce contrôle couvre l'appel DIRECT des méthodes
+                (défense en profondeur), pas un changement de comportement de TreeHist. Seules les entrées en échec sont affichées, en dict."""
+                res={}; g=globals(); orig=g['_snap_own']
+                for tag,fn,kw in (('tx1','_treehist_listing',dict(archive_from='ALL')),('tx2','_treehist_changes',dict(archive_from='k1',archive_to='ka'))):
+                    bh=_s126_env(tag=tag)['bh']
+                    for nk in ('ep','ee'):
+                        db_=bh.db.get_diff_db(nk); pf='top'
+                        c0=_open_db(db_,nick=nk,role='read',empty_ok=True)
+                        try: want=_s126_dump(getattr(bh,fn)(nk,pf,c0,as_json=True,**kw))
+                        finally: c0.close()
+                        conn=_open_db(db_,nick=nk,role='read',empty_ok=True); wconn=_open_db(db_,nick=nk,role='write'); fired=[0]
+                        def spy(*a,**k):
+                            r=orig(*a,**k)
+                            if not fired[0]:
+                                fired[0]=1; wconn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive IN ('ka','kz','k4')",(nk,)); wconn.commit()
+                            return r
+                        g['_snap_own']=spy
+                        try: got=_s126_dump(getattr(bh,fn)(nk,pf,conn,as_json=True,**kw)); after=conn.in_transaction
+                        finally: g['_snap_own']=orig; wconn.close()
+                        res[f'{fn} {nk} : écrivain concurrent sans effet']=(got==want and fired[0]==1) or (fired[0],got[:80],want[:80])
+                        res[f'{fn} {nk} : transaction de l\'appel refermée']=after is False
+                        conn.close()
+                # revue 2 (R2-3) : FileHist lit aussi dans une transaction — un écrivain qui valide APRÈS la liste des archives (avant leurs requêtes) ne change rien
+                bh4=_s126_env(tag='tx4')['bh']; real_sa=g['_snapshot_archives']
+                def fh(nk):
+                    out=io.StringIO()
+                    with contextlib.redirect_stdout(out): bh4.filehist(nk,'top/foo0',archive_from='ALL',as_json=True)   # aucune ligne de diff_index : une ligne « présent » par archive
+                    return out.getvalue()
+                for nk in ('ep','ee'):
+                    want=fh(nk); wconn=_open_db(bh4.db.get_diff_db(nk),nick=nk,role='write'); fired=[0]
+                    def spy_sa(conn_,n_):
+                        lst=list(real_sa(conn_,n_))
+                        if not fired[0]:
+                            fired[0]=1; wconn.execute("DELETE FROM archive_snapshot WHERE nick=? AND archive IN ('ka','kz','k4')",(nk,)); wconn.commit()
+                        return lst
+                    g['_snapshot_archives']=spy_sa
+                    try: got=fh(nk)
+                    finally: g['_snapshot_archives']=real_sa; wconn.close()
+                    res[f'FileHist {nk} : écrivain concurrent sans effet']=(got==want and fired[0]==1) or (fired[0],got[:80],want[:80])
+                bh=_s126_env(tag='tx3')['bh']; conn=_open_db(bh.db.get_diff_db('ep'),nick='ep',role='read',empty_ok=True)
+                try:
+                    conn.execute("BEGIN"); bh._treehist_listing('ep','top',conn,archive_from='ALL',as_json=True); res['transaction de l\'appelant gardée']=conn.in_transaction is True
+                finally: conn.close()
+                bad_={k:v for k,v in res.items() if v is not True}
+                if bad_: print(f"  {bad_}")
+                return not bad_
+            check("TreeHist story 126 : la lecture d'un dossier se fait dans une transaction de lecture (un écrivain qui valide entre deux instructions ne change rien), vue normale, -X et FileHist, clair et chiffré",_s126_read_tx)
+            def _s126_compact_json():
+                """TreeHist -j (story 126, P3) : indenté (2 espaces) tel quel ; COMPACT (une ligne, sans indentation) seulement quand BORGHELPERC_JSON_COMPACT=1 (posé par
+                borgHelperWWW) ; même contenu JSON dans les deux cas ; toute autre valeur de la variable : indenté."""
+                E=_s126_env(); bh=E['bh']; outs={}
+                saved=os.environ.get('BORGHELPERC_JSON_COMPACT')
+                try:
+                    for val in (None,'1','0','oui'):
+                        if val is None: os.environ.pop('BORGHELPERC_JSON_COMPACT',None)
+                        else: os.environ['BORGHELPERC_JSON_COMPACT']=val
+                        out=io.StringIO()
+                        with contextlib.redirect_stdout(out): bh.treehist('ee','top/foo',archive_from='ALL',as_json=True)
+                        outs[val]=out.getvalue()
+                finally:
+                    if saved is None: os.environ.pop('BORGHELPERC_JSON_COMPACT',None)
+                    else: os.environ['BORGHELPERC_JSON_COMPACT']=saved
+                ref=json.loads(outs[None])
+                ok={'défaut : indenté (2 espaces)':outs[None]==json.dumps(ref,ensure_ascii=False,indent=2)+'\n',
+                    'valeur 0 : indenté':outs['0']==outs[None],'valeur oui : indenté':outs['oui']==outs[None],
+                    '1 : une seule ligne, sans indentation':(outs['1'].count('\n')==1 and not re.search(r'\n\s',outs['1'])) or outs['1'].count('\n'),
+                    '1 : même contenu JSON':json.loads(outs['1'])==ref,'1 : plus court de 20 % au moins':len(outs['1'])<len(outs[None])*0.8 or (len(outs[None]),len(outs['1']))}
+                bad_={k:v for k,v in ok.items() if v is not True}
+                if bad_: print(f"  {bad_}")
+                return not bad_
+            check("TreeHist -j story 126 : indenté par défaut, compact (une ligne, contenu identique) seulement avec BORGHELPERC_JSON_COMPACT=1",_s126_compact_json)
             def _plans_ok():
                 """Aucun LIKE/GLOB ni ORDER BY sur un chemin dans le journal SQL des connexions chiffrées. 1.0.175 (A74) : contrôles de
                 parité écartés par -f -> échantillon des mêmes appels. 1.0.204 (story 83, D132) : chaque appel de l'échantillon tourne
@@ -20365,7 +21153,7 @@ def codec_selftest(pattern=None,list_only=False):
                     ran+=1; n0=len(traced); p,e=call()
                     if len(traced)==n0 or p!=e or bad(p): ko[cover]={'tracé':len(traced)>n0,'clair == chiffré':p==e,'clair':repr(p)[:120]}
                 if ko: print(f"  échantillon ({ran} appel(s) lancé(s)) : {ko}")
-                return bool(traced) and not ko and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',q)]
+                return bool(traced) and not ko and not [q for q in traced if re.search(r'\bLIKE\b|\bGLOB\b|ORDER BY[^\n]*\bpath\b',re.sub(r'ORDER BY sf\.path LIMIT 1$|ORDER BY path LIMIT 1$','',q.strip()) if q.lstrip().startswith('SELECT /*saut*/') else q)]   # story 126 : seule la clause `ORDER BY path LIMIT 1` d'une requête de saut d'index (marqueur exact) est retirée — elle ne trie rien pour l'utilisateur, elle avance dans la structure ; un LIKE/GLOB ou un autre tri dans la même requête reste vu
             check("plans (etc) sur connexion chiffrée : aucun LIKE/GLOB, aucun ORDER BY portant sur un chemin",_plans_ok)
         finally:
             globals()['_open_db']=_orig_open

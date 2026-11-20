@@ -2245,6 +2245,11 @@ simple `added` ou `removed` d'un fichier niché en dessous — remonte en `modif
 
 Pour descendre dans un sous-répertoire, relancer `TreeHist` avec `-f` pointant dessus.
 
+**Lecture (depuis 1.0.222, story 126)** : un clic ne lit que le dossier demandé — ses enfants directs sont trouvés par saut d'index dans le
+snapshot, sans parcourir l'archive entière (sur une archive de 791 000 entrées : à chaud 0,2-0,5 s au lieu de 5-7 s ; à froid 40 Mo lus au plus au lieu de 1,1 Go et plus) ; `FileHist`
+lit une recherche par archive snapshotée. Sorties inchangées. En `-j`, la variable d'environnement `BORGHELPERC_JSON_COMPACT=1` (posée par borgHelperWWW) donne un JSON
+sur une ligne, sans indentation (même contenu) ; sans elle, ou avec une autre valeur, la sortie reste indentée. Détail : TECHNICAL « Exploration par saut d'index ».
+
 **Archive épinglée (`-b X -B X`, bouton « Explorer » d'une archive de l'UI ; depuis 1.0.219)** : la vue d'une archive montre le
 **contenu de cette archive** quand son snapshot est en base (`IDX_SNAP_KEEP` dernières archives) : entrées, type, droits et
 propriétaire de X (champ JSON `archive` = X ; texte : « (snapshot X) ») ; une entrée ajoutée après X n'y figure pas, une entrée
@@ -4082,7 +4087,7 @@ attendu).
 
 Ce cache dépend d'un correctif appliqué à `borgHelper` lui-même (Story 1.5) : `_check_set_meta()`
 n'écrit désormais `db_meta` (`schema_version`/`borghelper_version`) que si la valeur stockée diffère
-réellement, et `ensure_diff_db()` ne recrée la vue `archive_snapshot_v` que si elle n'existe pas déjà
+réellement (`borghelper_version` : seulement par une version plus récente, 1.0.222 ; tant qu'une version d'avant cette règle ouvre aussi la base, elle réécrit encore la sienne), et `ensure_diff_db()` ne recrée la vue `archive_snapshot_v` que si elle n'existe pas déjà
 — sans ces deux correctifs, `cache.db`/`diff.db` voyaient leur date de modification avancer à **chaque**
 appel, même en lecture pure sans le moindre changement de données (chaque appel `borgHelper` étant un
 sous-processus séparé, la fermeture de connexion SQLite déclenche un checkpoint WAL qui touche le

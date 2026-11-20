@@ -1,5 +1,91 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.222, borgHelperWWW 1.36.2 — Exploration rapide (un clic lit le dossier), borghelper_version écrit seulement par une version plus récente — 2026-11-20
+
+Lot de deux stories (126, 129), vérifiées ensemble. Origine : audit de performance sur la base de production de l'utilisateur.
+
+### Exploration : un clic lit le dossier, pas toute l'archive
+
+Story 126 (audit de performance du 2026-11-19 sur la base de production de l'utilisateur : un nick à 791 000 entrées par snapshot, `diff.db`
+de 1,9 Go chiffrée ; décision : « oui à tout, prioritaire », pistes P1, P2, P3 de l'audit, **sans changement de format de base**).
+Chaque clic de l'explorateur (`GET /api/treehist` -> `TreeHist -j`) lisait l'archive ENTIÈRE : 1,1 Go à froid, 5-7 s à chaud près de la racine,
+11-13 s à froid, quelle que soit la taille du dossier ; `FileHist` d'un fichier 1,3-3,4 s (les deux snapshots lus). Détail, preuves et mesures :
+TECHNICAL « Exploration par saut d'index ». Toutes les sorties (texte et `-j`, vue normale, archive épinglée, `-X`, `FileHist`) sont **strictement
+identiques** à celles d'avant (1.0.220, même code de lecture que 1.0.221) : mêmes octets sur les 25 cas mesurés de la base de l'utilisateur, JSON identique et dans le même ordre
+sur les bases fabriquées du contrôle et sur un différentiel aléatoire (clair et chiffré), y compris l'ordre des événements de deux archives de même date.
+
+- **borgHelper — `TreeHist` : les enfants directs d'un dossier se lisent par saut d'index** (`_snap_kids`). Un enfant à la fois : première ligne de
+  l'archive après le curseur sur `idx_snapfile_nick_path`, appartenance à l'archive par la clé primaire de `archive_snapshot`, puis saut au sous-arbre
+  suivant (une requête par feuille, deux par dossier). Les frères dont le nom commence par celui d'un autre suivi d'un caractère inférieur à `/`
+  (`foo`, `foo.txt`, `foo-bar` se trouvent ENTRE `foo` et `foo/…`) sont traités sans boucle ni oubli (le prototype de l'audit bouclait sur ce cas ;
+  contrôle écrit). Hybride : un sous-arbre d'au plus 1 000 lignes de `snapshot_file` (sonde `LIMIT`) est lu d'un trait. Plans écrits (`CROSS JOIN`,
+  `INDEXED BY`), jamais dépendants des statistiques. Clair et chiffré par le même code : l'ordre des valeurs chiffrées n'a pas de sens pour
+  l'utilisateur, il ne sert qu'à avancer (preuve et mesure : TECHNICAL). Ligne propre du dossier : une recherche par chemin. Défense en profondeur :
+  `_treehist_listing`, `_treehist_changes` et `FileHist` lisent dans UNE transaction de lecture (`_read_tx`), même appelés directement ; `TreeHist` en ouvrait déjà une
+  (1.0.219), donc aucun changement visible par la CLI ou WWW.
+- **borgHelper — `TreeHist -X`** : droits et propriétaire de chaque entrée changée par une recherche par chemin stocké, au lieu de lire tous les
+  enfants directs de la dernière archive.
+- **borgHelper — `TreeHist` : lecture de `diff_index` réduite** : les événements de tous les sous-répertoires affichés (et du répertoire listé) viennent
+  d'UNE lecture groupée par enfant direct au lieu d'une lecture du sous-arbre par répertoire (à date d'archive égale, l'ordre d'avant est conservé : rang de
+  première apparition — plus petit chemin puis id pour chaque sous-répertoire et sous un préfixe, plus petit id pour le répertoire racine `.` lui-même) ; les chemins supprimés candidats (enfants directs) se
+  lisent par saut d'index au lieu de tout le sous-arbre ; un enfant déjà lu dans le snapshot n'est plus décodé une seconde fois.
+- **borgHelper — `FileHist`** : le snapshot se lit par archive snapshotée (K recherches : `snapshot_file` par `(nick,path)` puis clé primaire) au
+  lieu de la vue sur les K x N lignes de tous les snapshots.
+- **borgHelper — gros dossiers (P3)** : le chemin stocké de chaque entrée est lu en SQL (plus de ré-encodage du chemin complet, 3 encodages par entrée) ;
+  `TreeHist -j` sort un JSON compact (une ligne, -26 % d'octets) SEULEMENT quand `BORGHELPERC_JSON_COMPACT=1` est dans l'environnement ; sur un
+  terminal ou pour tout autre appelant la sortie reste indentée à l'identique. Pas de pagination (choix d'interface, non demandé).
+- **borgHelperWWW** : tout borgHelper lancé par le serveur reçoit `BORGHELPERC_JSON_COMPACT=1` (`_build_borghelper_argv_env`) ; la sortie est relue avec `json.loads`.
+  Les relais qui ré-écrivent le JSON (`_expose_stdout`, `_merge_parts` à plusieurs rc, `_scoped_filter_result` des appelants à périmètre, réponse servie du cache par périmètre
+  `_scoped_cached_multi`) gardent la forme compacte d'un TreeHist compact (`_dumps_like`) ; les autres commandes restent indentées. La variable est posée pour tout lancement, seul `TreeHist -j` la lit.
+- **Mesuré** (base de l'utilisateur, CLI par le lanceur de WWW, machine très chargée — load 7 à 47, d'où des « avant » dispersés ; 1 run à froid, 2 à chaud, avant/après entrelacés ; avant = 1.0.220 ; sorties identiques ; chaud = meilleur des 2 passages) :
+
+  | cas | froid avant -> après | chaud avant -> après |
+  |---|---|---|
+  | `TreeHist -b ALL` racine / niv.1 / niv.2 / niv.3 | 9,5 / 11,6 / 18,3 / 13,3 s -> 1,8 / 0,8 / 0,6 / 0,4 s | 5,3 / 5,5 / 20,4 / 4,8 s -> 0,24 / 0,41 / 0,52 / 0,24 s |
+  | idem niv.4 / actif / moyen / profond | 10,7 / 8,0 / 19,1 / 6,7 s -> 0,29 / 1,2 / 0,33 / 0,40 s | 5,1 / 1,9 / 2,8 / 1,85 s -> 0,28 / 0,52 / 0,35 / 0,26 s |
+  | idem « gros » (10 565 entrées, 3,5 Mo) | 9,2 -> 1,1 s | 3,9 -> 1,2 s (meilleur de 5 : 0,65 s ; compact : -0,1 s, 2,6 Mo) |
+  | archive épinglée (ancienne) racine / niv.2 / niv.3 / moyen / gros | 25,3 / 20,4 / 18,2 / 7,8 / 6,2 s -> 0,22 / 0,60 / 0,41 / 0,31 / 0,72 s | 11,2 / 8,6 / 6,2 / 2,7 / 2,3 s -> 0,16 / 0,31 / 0,23 / 0,24 / 0,66 s |
+  | archive épinglée (dernière) racine / niv.3 / moyen | 7,0 / 15,4 / 4,5 s -> 0,17 / 0,55 / 0,19 s | 3,4 / 3,7 / 2,0 s -> 0,20 / 0,17 / 0,19 s |
+  | `-X` racine / niv.2 / niv.3 / moyen | 4,3 / 3,7 / 3,5 / 4,0 s -> 0,20 / 0,16 / 0,20 / 0,26 s | 1,2 / 1,4 / 1,4 / 0,9 s -> 0,18 / 0,18 / 0,24 / 0,20 s |
+  | `FileHist` d'un fichier (`-b ALL` / sans `-b`) | 3,8 / 4,1 s -> 0,23 / 0,24 s | 1,5 / 1,9 s -> 0,17 / 0,21 s |
+  | lecture disque à froid | 1,1 à 2,6 Go | 0 à 40 Mo |
+
+  Sous charge moyenne (load 7, 5 passages à chaud) : racine 0,33 s, niv.1 0,30 s, niv.2 0,34 s, niv.3 0,21 s, actif 0,30 s. Le plancher d'un clic est le démarrage (0,13 s), la KDF (0,06 s) et, aux
+  niveaux dont le sous-arbre de `diff_index` est gros (niv. 2 et « actif » : 37 000 à 44 700 lignes), leur lecture groupée (~0,2 s).
+
+### `borghelper_version` de la base réécrit seulement par une version plus récente
+
+Story 129 (audit de lenteur du 2026-11-19, rapport §3.3 c / P7 ; décision de l'utilisateur du 2026-11-19 : « écrire si plus récente »).
+Mesuré : `_check_set_meta` réécrivait `db_meta.borghelper_version` dès que la valeur stockée DIFFÉRAIT de la version du programme (`!=`),
+plus ancienne comprise. Deux versions qui lisent la même base en alternance (CLI et `borgHelper` de borgHelperWWW pas mis à jour
+ensemble) l'écrivaient à chaque passage : 20 alternances sur 20, mtime de `diff.db` avancé, cache de réponses de WWW périmé.
+
+- **borgHelper — `_check_set_meta` n'écrit `borghelper_version` que si `_version_newer(Version, stockée)`** : comparaison numérique par
+  composant, composants manquants = 0 (`1.0.99 < 1.0.100`, `1.0 = 1.0.0`), jamais par texte ; espaces autour ignorés. Valeur stockée
+  absente, `NULL`, vide ou illisible (texte, suffixe, préfixe `v`, octets, composant vide) : écrite, comme avant. Égale ou plus ancienne :
+  aucun `INSERT`, donc ni écriture ni verrou d'écriture pris — la base et son `-wal` restent inchangés (contenu, taille, mtime). Lecteur
+  sur verrou tenu : attente `_READER_WRITE_WAIT` puis abandon silencieux inchangés pour une version plus récente ; une version égale ou plus
+  ancienne rend aussitôt sans marquer la base sautée ; aucun lecteur sans le verrou n'écrit. Seul site d'écriture de la clé (cache.db,
+  diff.db, history.db ; scopecache.db et push.db de borgHelperWWW passent par la même fonction du `borgHelper` importé — borgHelperWWW
+  inchangé). `schema_version` inchangé.
+- **Condition de l'effet** : l'alternance ne cesse que lorsque TOUTES les versions qui ouvrent la base portent cette règle, donc quand la
+  CLI ET le `borgHelper` de borgHelperWWW sont mis à jour. Une version d'avant la règle (`!=`) réécrit encore sa valeur à chaque passage,
+  et la version munie de la règle la sienne au passage suivant (mesuré : 20 écritures sur 20 contre le binaire 986cfe2).
+- **Conséquence visible (diagnostic)** : la valeur n'est plus « la version qui a ouvert la base en dernier » mais « la plus récente qui l'a
+  ouverte, parmi les versions munies de la règle ».
+- **Mesure** (base fabriquée dans un bac, 20 passages alternés ; empreinte = mtime, taille et sha256 des trois bases et de leurs `-wal`).
+  « Ancien » = COPIE du code de la story à `Version=1.0.200` (une future version plus ancienne munie de la règle ; ce binaire n'a jamais
+  existé) ou le vrai binaire d'avant (986cfe2). LstBkp, DuIdx, Status (diff.db) et CacheInfo (cache.db) : avant la règle, 19 écritures sur
+  20 (toutes sauf le premier passage, de la version déjà stockée) ; deux versions munies de la règle : 1 sur 20 (premier passage de la plus
+  récente, aucune de l'ancienne) ; code de la story contre le binaire réel d'avant : 20 sur 20. IdxTop, RepoHistory, ArchiveHistory : 0 dans
+  tous les cas ; history.db n'est atteinte par aucune commande mesurée (contrôles seulement).
+- **Contrôles** (`CodecSelfTest`, trois contrôles ; échecs affichés en un dict `{sous-contrôle: constat}`) : `borghelper_version : comparaison
+  numérique par composant…`, `borghelper_version : valeur absente, NULL ou illisible -> écrite…`, `borghelper_version : alternance version
+  courante / plus ancienne simulée sur diff.db, cache.db, history.db…` (lecteur, écrivain, `ensure_history_db(reader=True)` ; connexion
+  lectrice d'un autre processus -> `-wal` présent ; verrou d'écriture tenu par un autre processus : l'ancienne rend sans attendre ni marquer
+  la base sautée). La version plus ancienne simulée, 1.0.99, est textuellement PLUS GRANDE que 1.0.222 : piège de la comparaison par texte.
+- **Docs** : TECHNICAL.md (tableau `db_meta`, `_check_set_meta`, Versionning), README.md (cache de périmètre WWW).
+
 ## borgHelper 1.0.221 — Restore : existants remplacés et dits, `--sans-ecraser`, `-W` sans écrasement de noms — 2026-11-18
 
 Story 113 (sortie de la story 99 par décision de l'utilisateur du 2026-10-22, décisions revues ensemble ; décision 5 du 2026-10-23 :

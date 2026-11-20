@@ -87,7 +87,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.36.1"
+WWW_VERSION="1.36.2"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -3398,6 +3398,9 @@ def _build_borghelper_argv_env(cmd: str, nick: Optional[str], extra_args, passph
     # 1.28.5 (story 23) : jamais la notice de nettoyage dans /report ou /status texte (état de la machine) — elle ne
     # passe que par /access borg_cleanup, réservé aux admins quand les groupes sont actifs
     env['BORGHELPERC_NO_CLEANUP_NOTICE']='1'
+    # story 126 (P3) : WWW relit la sortie -j avec json.loads — TreeHist l'émet sans indentation (environ -30 % d'octets sur un gros dossier) ;
+    # sur un terminal la sortie reste indentée (variable absente)
+    env['BORGHELPERC_JSON_COMPACT']='1'
     return argv,env
 
 def _run_group(argv,timeout,env):
@@ -3574,13 +3577,20 @@ def _expose_json(cmd,data,mp):
             data=dict(data,backups={mp.get(k,k):rows(k,a) for k,a in data['backups'].items()})
     return data
 
+def _dumps_like(cmd,srcs,x):
+    """json.dumps de `x` pour relayer une sortie lue : COMPACT (une ligne, comme borgHelper l'émet avec BORGHELPERC_JSON_COMPACT=1, story 126) quand
+    la commande est TreeHist et que toutes les sorties lues `srcs` tiennent sur une ligne ; indenté (2 espaces) sinon, comme avant. Seul TreeHist -j est
+    compact : les autres commandes gardent leur forme."""
+    if cmd=='treehist' and srcs and all('\n' not in (o or '').strip() for o in srcs): return json.dumps(x,ensure_ascii=False,separators=(',',':'))
+    return json.dumps(x,ensure_ascii=False,indent=2)
+
 def _expose_stdout(cmd,out,mp):
     """stdout d'UN rc : JSON aux nicks exposés (réécrit seulement s'il change), texte tel quel (nicks nus de borgHelper)."""
     if not mp or not (out or '').strip(): return out
     try: d=json.loads(out)
     except ValueError: return out
     x=_expose_json(cmd,d,mp)
-    return out if x==d else json.dumps(x,ensure_ascii=False,indent=2)
+    return out if x==d else _dumps_like(cmd,[out],x)
 
 def _readable_bytes(v):
     m=re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?) ([A-Z]{1,2})\s*',str(v))
@@ -3659,7 +3669,7 @@ def _merge_parts(cmd,parts,duidx=None,json_req=False):
             if errs: res['error']=errs
         else: res={'error':errs} if errs else {}
         out=json.dumps(res,ensure_ascii=False,indent=2) if res else '{}'
-    else: out=json.dumps(_merge_json(cmd,[(e.prefix,d) for e,d in objs]),ensure_ascii=False,indent=2)
+    else: out=_dumps_like(cmd,[o for _e,_mp,_c,o,_t in parts if (o or '').strip()],_merge_json(cmd,[(e.prefix,d) for e,d in objs]))
     return CommandResult(exitcode=code,stdout=out,stderr=err)
 
 def _opt_values(args,opts=('-f','-s','-b','-B','-N','-p')):
@@ -3820,9 +3830,9 @@ def _scoped_exec(cmd,nick,args,passphrase):
 def _run_scoped(cmd: str, nick: str, extra_args, filter_fn, passphrase: Optional[str]=None) -> JSONResponse:
     args=list(extra_args)
     if '-j' not in args: args=args+['-j']
-    return _scoped_filter_result(_scoped_exec(cmd,nick,args,passphrase),filter_fn)
+    return _scoped_filter_result(_scoped_exec(cmd,nick,args,passphrase),filter_fn,cmd)
 
-def _scoped_filter_result(result,filter_fn):
+def _scoped_filter_result(result,filter_fn,cmd=None):
     """Sortie d'un appelant à périmètre restreint (commune à _run_scoped et _run_scoped_raw, 1.28.6). Filtrée QUEL QUE
     SOIT le code de sortie (borgHelper 1.0.167, story 30 : un lecteur multi-nicks imprime les résultats des autres nicks
     même quand l'un échoue) — avant, un code ≠ 0 relayait stdout tel quel. Fail-closed : stdout non-JSON ou d'une forme
@@ -3830,7 +3840,7 @@ def _scoped_filter_result(result,filter_fn):
     if result.exitcode==0 or (result.stdout or '').strip():
         try:
             parsed=json.loads(result.stdout)
-            result.stdout=json.dumps(filter_fn(parsed),ensure_ascii=False,indent=2)
+            result.stdout=_dumps_like(cmd,[result.stdout],filter_fn(parsed))
         except (ValueError,TypeError,KeyError,AttributeError) as e:
             if not isinstance(e,ValueError):   # JSON valide d'une forme que le filtre ne connaît pas : défaut à voir au journal
                 print(f"[borgHelperWWW] filtre de périmètre en échec ({type(e).__name__}: {e}) — sortie refusée",file=sys.stderr,flush=True)
@@ -3980,7 +3990,7 @@ def _run_scoped_raw(cmd,nick,extra_args,raw_flag,filter_fn,passphrase=None):
     Jamais mis en `_RESPONSE_CACHE` (même règle que `_run_scoped()`, AD-5)."""
     args=list(extra_args)
     if raw_flag not in args: args=args+[raw_flag]
-    return _scoped_filter_result(_scoped_exec(cmd,nick,args,passphrase),filter_fn)   # 1.28.6 : même garde que _run_scoped
+    return _scoped_filter_result(_scoped_exec(cmd,nick,args,passphrase),filter_fn,cmd)   # 1.28.6 : même garde que _run_scoped
 
 # ── Enveloppes de cache par périmètre autour de _run_scoped/_run_scoped_raw (Story 1.5) ────────
 # Jamais à l'intérieur de _run_scoped()/_run_scoped_raw() elles-mêmes (Code Map du spec 1.5 : ces
@@ -4037,7 +4047,8 @@ def _scoped_cached_multi(cmd,nick,nicks,scopes,fingerprints,params,run_fn):
                 s=fragments[n].get('stderr','')
                 if s and s not in seen: seen.append(s)
             stderr='\n'.join(seen)
-            result_dict={'exitcode':0,'stdout':json.dumps(combined,ensure_ascii=False,indent=2),'stderr':stderr}
+            # story 126 (revue 2, R2-1) : TreeHist compact aussi quand la réponse est SERVIE du cache (les fragments sont rangés sur une ligne) — la forme ne dépend pas de l'état du cache
+            result_dict={'exitcode':0,'stdout':_dumps_like(cmd,[fragments[n]['stdout'] for n in nicks],combined),'stderr':stderr}
             return JSONResponse(status_code=200,content=result_dict)
     resp=run_fn()
     try: result_dict=json.loads(resp.body)
@@ -5834,6 +5845,50 @@ def push_selftest():
         if bad: print(f"  {bad}")
         return not bad and len(res)==4
     check("borgHelper lancé par WWW (_exec_borghelper, _launch_bkp_detached Bkp et index, _reconcile_run) : BORGHELPERC_NO_CLEANUP_NOTICE=1 dans son environnement (vrai sous-processus, 1.31.18)",_child_no_cleanup_notice)
+    def _child_json_compact():
+        """story 126 (P3) : tout borgHelper lancé par WWW reçoit BORGHELPERC_JSON_COMPACT=1 (TreeHist -j sans indentation ; WWW relit la sortie avec json.loads),
+        quelle que soit la valeur héritée de l'environnement du serveur ; _build_borghelper_argv_env est le point commun des lancements (lecture, Bkp, index, périmètres)."""
+        saved=os.environ.pop('BORGHELPERC_JSON_COMPACT',None)
+        try:
+            with mock.patch(f"{__name__}._launcher_path",lambda: None):   # aucun dossier de bytecode préparé par ce contrôle
+                _a,e1=_build_borghelper_argv_env('treehist','nk',['-f','x','-j'],cfgfile='/rc')
+                os.environ['BORGHELPERC_JSON_COMPACT']='0'
+                _a,e2=_build_borghelper_argv_env('treehist','nk',[],cfgfile='/rc')
+        finally:
+            if saved is None: os.environ.pop('BORGHELPERC_JSON_COMPACT',None)
+            else: os.environ['BORGHELPERC_JSON_COMPACT']=saved
+        return e1.get('BORGHELPERC_JSON_COMPACT')=='1' and e2.get('BORGHELPERC_JSON_COMPACT')=='1'
+    check("borgHelper lancé par WWW (_build_borghelper_argv_env) : BORGHELPERC_JSON_COMPACT=1 dans son environnement, même si le serveur en a hérité une autre valeur (story 126)",_child_json_compact)
+    def _compact_relay():
+        """story 126 (revue 1, C-7 ; revue 2, R2-1) : les quatre relais qui ré-écrivent une sortie JSON (_expose_stdout, _merge_parts à plusieurs rc, _scoped_filter_result,
+        _scoped_cached_multi servi du cache) gardent la forme COMPACTE d'un TreeHist -j compact (une ligne) et indentent comme avant tout le reste (TreeHist indenté, autres
+        commandes, même sortie sur une ligne). Dict {relais: ok} : seules les entrées en échec sont affichées, d'un bloc."""
+        raw={'db':{'path':'','entries':[{'name':'a','is_dir':False}]}}
+        comp=json.dumps(raw,separators=(',',':')); ind=json.dumps(raw,indent=2)
+        eW=_RcEntry.__new__(_RcEntry); eM=_RcEntry.__new__(_RcEntry); eW.prefix='web'; eM.prefix='mail'
+        mp={'db':'web:db'}; res={}
+        one=lambda cmd,src: _expose_stdout(cmd,src,mp)
+        res['expose compact']='\n' not in one('treehist',comp) and json.loads(one('treehist',comp))=={'web:db':raw['db']}
+        res['expose indenté']='\n' in one('treehist',ind)
+        res['expose autre commande']='\n' in one('filehist',comp)
+        two=lambda cmd,src: _merge_parts(cmd,[(eW,{'db':'web:db'},0,src,''),(eM,{'db':'mail:db'},0,src,'')],json_req=True).stdout
+        res['fusion compact']='\n' not in two('treehist',comp) and set(json.loads(two('treehist',comp)))=={'web:db','mail:db'}
+        res['fusion indenté']='\n' in two('treehist',ind)
+        res['fusion un compact, un indenté']='\n' in _merge_parts('treehist',[(eW,{'db':'web:db'},0,comp,''),(eM,{'db':'mail:db'},0,ind,'')],json_req=True).stdout
+        sc=lambda cmd,src: json.loads(_scoped_filter_result(CommandResult(exitcode=0,stdout=src,stderr=''),lambda d:d,cmd).body)['stdout']
+        res['périmètre compact']='\n' not in sc('treehist',comp) and json.loads(sc('treehist',comp))==raw
+        res['périmètre indenté']='\n' in sc('treehist',ind)
+        res['périmètre autre commande']='\n' in sc('filehist',comp)
+        # revue 2 (R2-1) : le cache par périmètre SERVI (hit complet, fragments d'une ligne) rend la même forme qu'un miss : compact pour TreeHist, indenté pour les autres
+        def cache(cmd):
+            with mock.patch(f"{__name__}._scope_cache_get",lambda n,c,p,sg,fp: {'stdout':json.dumps(raw['db']),'stderr':''}):
+                return json.loads(_scoped_cached_multi(cmd,'a,b',['a','b'],{},{},{},lambda: None).body)['stdout']
+        res['cache par périmètre compact']='\n' not in cache('treehist') and set(json.loads(cache('treehist')))=={'a','b'}
+        res['cache par périmètre autre commande']='\n' in cache('filehist')
+        bad={k:v for k,v in res.items() if v is not True}
+        if bad: print(f"  {bad}")
+        return not bad
+    check("borgHelperWWW : relais JSON (_expose_stdout, _merge_parts, _scoped_filter_result, cache par périmètre servi) — TreeHist -j compact reste compact, indenté et autres commandes restent indentés (story 126, revues 1 et 2)",_compact_relay)
     def _launcher_121():
         """1.36.0 (story 121) : lanceur de borgHelper à bytecode en cache, avec un vrai sous-processus et un faux borgHelper (script Python qui
         rend ce que le vrai verrait) : (1) l'enfant voit comme un script lancé tel quel : sys.argv[0] = chemin de borgHelper, arguments
