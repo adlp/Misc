@@ -1,5 +1,62 @@
 # Changelog — borgHelper
 
+## borgHelper 1.0.221 — Restore : existants remplacés et dits, `--sans-ecraser`, `-W` sans écrasement de noms — 2026-11-18
+
+Story 113 (sortie de la story 99 par décision de l'utilisateur du 2026-10-22, décisions revues ensemble ; décision 5 du 2026-10-23 :
+mode fidèle = `borg extract` brut). Mesuré le 2026-10-22 (borgHelper 1.0.212, borg 1.2.6) : `Restore -w` et `-W` remplaçaient sans rien
+dire un fichier existant de la destination (même en lecture seule : remplacé, droits de l'archive), code 0 ; `-W` aplatissait
+l'arborescence et, pour deux fichiers de même nom à des niveaux différents, le dernier copié gagnait. Mode sûr seulement (le mode
+`--fidele` garde le comportement de borg, documenté).
+
+- **borgHelper — `Restore -w`/`-W` (mode sûr, vers un dossier) : un fichier existant différent est remplacé ET dit** :
+  `[WARN] N fichiers existants remplacés` (`1 fichier existant remplacé`) + liste des chemins (50 au plus, puis `… et N autres`), code 0.
+  Différent = type, taille, date (à la seconde, comme tar) ou droits autres, ou lien symbolique vers une autre cible ; comparaison
+  par `lstat`, sans suivre de lien ; remplacement par l'écriture atomique de 1.0.214. Un fichier remplacé par un dossier et le second
+  nom d'un lien physique sont comptés dans ces fichiers ; un dossier vide remplacé par un fichier est dit à part (`N dossiers existants
+  remplacés`).
+- **borgHelper — existant identique : ni réécrit ni dit** : relancer une restauration ne produit aucun `[WARN]`, rien n'est réécrit (même
+  inode, même date) ; il compte parmi les éléments restaurés. En root, uid/gid de l'archive sont aussi comparés ; un lien symbolique identique
+  reste « créé par cette restauration » (`--liens-en-dossiers` le convertit à la relance) ; le second nom d'un lien physique déjà présent comme
+  fichier ordinaire identique (non lié) est laissé. Limites : contenu non lu, xattr/ACL non comparés, exFAT/vfat (dates à 2 s) : toujours « différent ».
+- **borgHelper — `--sans-ecraser`** (option longue, mode sûr vers un dossier) : les existants différents sont gardés — rien n'est ouvert
+  en écriture, droits et date d'un dossier présent non plus —, `[WARN] N fichiers existants gardés` + liste, code 1. Refusé (code 2) avec
+  `--fidele` et vers un tar/stdout ; bibliothèque : `restore(…, no_overwrite=True)`. Avec `--liens-en-dossiers`, un lien symbolique déjà
+  présent n'est jamais remplacé par un dossier (ses éléments dessous sont sautés). L'avis du mode fidèle (commande proposée) dit alors
+  « écrase les existants » : `--fidele` ne garde rien.
+- **borgHelper — `-W` : deux fichiers de même nom ne s'écrasent plus.** Les collisions sont connues AVANT d'écrire (liste de la
+  sélection : snapshot de l'archive si elle est indexée et la sélection est un chemin exact — aucun appel borg —, sinon un `borg list`
+  de plus de cette seule sélection) ; dès qu'il y a une collision : `[WARN] collisions de noms : fichiers rangés sous leur dossier
+  parent`, code 0, et CHAQUE fichier est rangé sous son dossier parent (`etc/a/config`, `etc/b/config`, `etc/c/other` -> `a/config`,
+  `b/config`, `c/other`) ; si ce chemin collisionne encore, on remonte d'un niveau pour les fichiers concernés (`x/a/log`, `y/a/log`
+  -> `x/a/log`, `y/a/log`). Sans collision : sortie identique à 1.0.214. Liste indisponible : `[WARN] collisions non vérifiables : le
+  dernier de même nom gagne` (avec `--sans-ecraser` : `le premier de même nom est gardé`), code 1. **Collision imprévue** (liste
+  périmée ou fausse : archive supprimée puis recréée sous le même nom) : le doublon n'est PAS écrit, `[WARN] collision de noms imprévue :
+  N fichiers non écrits` + liste, code 1, aussi vers un tar (un lien physique dont le premier nom a été écarté n'est pas émis non plus : il
+  lierait l'homonyme). Noms comparés sous la forme de `borg list` : un octet non UTF-8 y est un « ? », les noms du flux sont ramenés à cette forme
+  pour retrouver leur rangement, la destination garde les vrais octets ; un « ? » légitime (`page?id=1`) ne change rien. Un même chemin d'archive
+  rendu deux fois par borg (racines imbriquées, `BORG_ROOTBKP=/etc /etc/ssh` : mesuré, `borg list` et `export-tar` le donnent deux fois) n'est
+  pas une collision : le dernier remplace sans rien dire, comme en 1.0.214. Les `[WARN]` de rangement sont dits après l'export. Un dossier existant
+  remplacé ou gardé est dit à part (`N dossiers existants …`). Vers un `.tar`/`.tgz`/stdout, les mêmes noms sont rangés dans le tar. Le snapshot n'est lu que
+  s'il est complet pour la sélection (chemin exact canonique — ni `./etc`, ni `..`, ni style de motif `re:`/`sh:`/… —, pas de joker, pas
+  d'`IDX_INCLUDE`/`IDX_EXCLUDE`, aucun exclu enregistré pour le nick, au moins une ligne lue ; sonde sans chemin créateur de base) ;
+  les noms sous `*/log/*` (exclus de la sélection par `--exclude`, mesuré : `'/log/' in chemin`) ne comptent pas.
+- **Coût mesuré** (bac, 20 000 fichiers de 4 Ko, `-f '**'`, borg 1.2.6, machine chargée — charge 10 à 11 —, 3 passes entrelacées avec le
+  code d'avant comme témoin) : `-w` dans un dossier neuf 8,9 s (avant 9,3 s) ; `-w` sur 20 000 existants identiques 7,6 s (rien écrit) ;
+  sur 20 000 existants tous différents (remplacés) 8,6 s (avant 9,2 s : le repérage des existants, un `lstat` par entrée, ne se
+  voit pas) ; `-W` avec collisions sur tous les fichiers (100 noms x 200 dossiers) 13,0 s contre 9,8 s avant : le `borg list` de la
+  sélection coûte ≈ 3,0 s (contre 6 à 8,6 s pour `export-tar` de la même sélection), soit +33 % sur ce `-W` (médianes) ; sans joker, indexé :
+  aucun appel borg (le coût de lecture du snapshot, clair ou chiffré, n'est pas mesuré).
+- Seconde lecture des liens physiques : le second nom déjà présent et identique est dit « laissé (déjà identique, non lié) », pas « écrit ».
+- Contrôles : écrivain sur flux fabriqué (remplacés, identiques, date à la seconde, périphériques, `--sans-ecraser` sans aucune ouverture d'un
+  existant, `_flat_levels`, rangement à plat avec lien physique, dossier ou tar, relance d'un `-W`, même chemin rendu deux fois, noms
+  « ? » et non UTF-8, collisions non vérifiées, `[WARN]` bornés), options refusées, et sur vrai borg (remplacé 0444, relancé sans
+  avertissement, `--sans-ecraser`, `-W` collisions dossier/joker/tgz, noms sous `*/log/*`, snapshot sans `borg list` sur base en clair et
+  chiffrée, snapshot sans ligne ou périmé (dossier et tgz), `borg list` joker et `IDX_EXCLUDE`, liste en panne, export en échec,
+  `--fidele` brut). Le borg factice répond à `borg list --format '{type}{NUL}…'`.
+- Contrôle « _MEI* d'un vrai borg » : dans le cas sans TMPDIR (`/tmp` partagé), un `_MEI*` nouveau créé par un autre processus (runs complets en parallèle, story 124 ; autre borg de la machine) n'est plus pris pour un reste ; le dossier de CE borg, relevé par son mappage, est toujours prouvé retiré (échec vu au premier run complet parallèle, rejoué seul : OK).
+- Docs : README (`--sans-ecraser`, « Existants et collisions », codes), TECHNICAL, LIBRARY (`no_overwrite`), `-H Restore`. borgHelperWWW :
+  inchangé — `POST /restore` relaie les `[WARN]` (code 0 -> 200) et ne passe pas `--sans-ecraser`.
+
 ## borgHelper 1.0.220, borgHelperWWW 1.36.1 — Report par date, IdxPurge conseille Index, noms d'archive littéraux — 2026-11-18
 
 Lot de trois stories (106, 112, 98), vérifiées ensemble.

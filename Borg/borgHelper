@@ -10,7 +10,7 @@ import getopt,sys,os,socket,configparser,subprocess,select,json,sqlite3,re,time,
 import hmac,hashlib,secrets,base64,stat,functools,shutil,contextlib,itertools,glob,shlex
 from concurrent.futures import ThreadPoolExecutor,as_completed,CancelledError
 
-Version="1.0.220"
+Version="1.0.221"
 # Versions de schéma — deux notions distinctes (AD-10) :
 #   *_SCHEMA_VERSION      = version MAXIMALE comprise par ce binaire (refus si base plus récente) ;
 #   *_BASE_SCHEMA_VERSION = version écrite dans une base 'plain' (un ancien binaire continue de l'ouvrir
@@ -2506,6 +2506,85 @@ class _SkipLog:
                 else: printer(f"  (toute la sélection : {c} élément{'s' if c>1 else ''})")
             if m: printer(f"  … et {m} autre{'s' if m>1 else ''}")
 
+class _PathLog:
+    """1.0.221 (story 113) : chemins d'un [WARN] « fichiers existants remplacés/gardés » — au plus _SKIP_SHOWN chemins gardés, les
+    suivants comptés (« … et N autres ») : mémoire et sortie bornées comme _SkipLog."""
+    def __init__(self): self.paths=[]; self.more=0
+    def add(self,p):
+        if len(self.paths)<_SKIP_SHOWN: self.paths.append(p)
+        else: self.more+=1
+    def __len__(self): return len(self.paths)+self.more
+    def __bool__(self): return len(self)>0
+    def report(self,verb,noun='fichier',adj='existant',head=''):
+        """`verb` : « remplacé », « gardé » ou « non écrit » ; `noun` : « fichier » ou « dossier » ; `adj` : « existant » ou « » (accord
+        en nombre fait ici) ; `head` : cause dite en tête : `[WARN] N fichiers existants remplacés`, `[WARN] collision de noms imprévue :
+        N fichiers non écrits`."""
+        n=len(self)
+        if not n: return
+        s='s' if n>1 else ''
+        printer(f"[WARN] {head}{n} {noun}{s}"+(f" {adj}{s}" if adj else '')+f" {verb}{s}")
+        for p in self.paths: printer(f"  {_shown_path(p)}")
+        if self.more: printer(f"  … et {self.more} autre{'s' if self.more>1 else ''}")
+
+class _NullErr:
+    """Flux jeté (sondes qui ne doivent rien afficher)."""
+    def write(self,x): return len(x)
+    def flush(self): pass
+
+_CLASH_HEAD='collision de noms imprévue : '   # row 15 (revue 2, texte décidé) : `[WARN] collision de noms imprévue : N fichiers non écrits`
+
+def _restore_plan_warn(deep,pmode,no_overwrite=False):
+    """Story 113 : [WARN] du rangement d'un -W (après l'export) — collisions rangées sous le dossier parent ; liste non vérifiable
+    (indisponible, `pmode` 'liste' : le dernier de même nom gagne, ou le premier gardé avec `no_overwrite`)."""
+    if deep is not None: printer("[WARN] collisions de noms : fichiers rangés sous leur dossier parent")
+    if pmode=='liste': printer("[WARN] collisions non vérifiables : le premier de même nom est gardé" if no_overwrite else "[WARN] collisions non vérifiables : le dernier de même nom gagne")
+
+_FLAT_LEVEL=2   # -W avec collisions : « dossier parent/nom » (les deux derniers composants)
+
+def _flat_levels(many):
+    """1.0.221 (story 113, décision 3) : `many` = {nom: [chemins (tuples de composants) de ce nom]} (au moins 2 chemins par nom) ->
+    {chemin: nombre de derniers composants à garder} pour les seuls fichiers dont « dossier parent/nom » collisionne encore ; les
+    autres fichiers sont rangés sous leur dossier parent (_FLAT_LEVEL). On remonte d'un niveau pour les fichiers concernés jusqu'à
+    ce que plus rien ne collisionne (des chemins distincts finissent toujours distincts, au plus tard entiers)."""
+    deep={}; cur=list(dict.fromkeys(p for ps in many.values() for p in ps)); lvl=_FLAT_LEVEL   # chemins distincts : la boucle se termine
+    while cur:
+        groups={}
+        for p in cur: groups.setdefault(p[-lvl:],[]).append(p)
+        cur=[p for g in groups.values() if len(g)>1 for p in g]; lvl+=1
+        for p in cur: deep[p]=lvl
+    return deep
+
+_SURR=re.compile(r'[\udc80-\udcff]')
+
+def _rs(s):
+    """Forme LISTÉE d'un nom (revue 2, row 16) : `borg list` remplace chaque octet non UTF-8 d'un nom (caractère \\udc80-\\udcff une
+    fois décodé en surrogateescape) par « ? » (remove_surrogates) ; le flux d'export-tar garde les octets. Les deux côtés sont
+    comparés sous cette forme ; la destination garde les vrais octets."""
+    return s if s.isascii() else _SURR.sub('?',s)
+
+def _flat_rel(key,deep):
+    """Chemin de destination (composants) d'un fichier à plat : le nom seul sans collision (deep None), sinon ses `deep.get(key, 2)`
+    derniers composants — `deep` est indexé par la forme listée (_rs) des composants ; le chemin rendu garde les vrais octets."""
+    if deep is None: return list(key[-1:])
+    return list(key[-deep.get(tuple(_rs(c) for c in key),_FLAT_LEVEL):])
+
+class _FlatNames:
+    """1.0.221 (story 113, décision 3) : noms de fichiers de la sélection d'un -W — détecte les collisions de noms sans garder tous les
+    chemins : un chemin par nom distinct (`first`), tous les chemins d'un nom vu au moins deux fois (`many`). Noms sous leur forme
+    listée (_rs : « ? » pour un octet non UTF-8), comme `deep` est relu par _flat_rel (revue 2, row 16)."""
+    def __init__(self): self.first={}; self.many={}; self.rows=0
+    def add(self,path):
+        self.rows+=1
+        path=_rs(path)
+        parts=_restore_norm(path)
+        if not parts or '/log/' in path: return   # non normalisé : sauté à l'écriture ; */log/* : exclu de la sélection (--exclude)
+        k=tuple(parts); n=k[-1]
+        if n in self.many: self.many[n].append(k)
+        elif n in self.first:
+            if self.first[n]!=k: self.many[n]=[self.first.pop(n),k]
+        else: self.first[n]=k
+    def levels(self): return _flat_levels(self.many) if self.many else None
+
 def _argv_batches(items,limit=65536):
     """Arguments en lots dont la taille cumulée (octets) reste sous `limit` — jamais E2BIG (revue 1, row 9)."""
     out=[]; n=0
@@ -2532,14 +2611,21 @@ class _SafeWriter:
     Propriétaires : uid/gid numériques de l'archive (défaut), ou noms de l'archive cherchés sur la machine (`by_name`, numérique si
     inconnu) ; compte ordinaire : jamais de chown (fichiers à lui). Lien physique dont le premier nom n'a pas été écrit (zone,
     lien…) : noté dans `broken` (seconde lecture par Restore, décision 14)."""
-    def __init__(self,root,zones,flat=False,by_name=False,links_as_dirs=False,root_label=None):
+    def __init__(self,root,zones,flat=False,by_name=False,links_as_dirs=False,root_label=None,deep=None,no_overwrite=False,last_wins=False):
         self.zones=zones; self.flat=flat; self.by_name=by_name; self.links_as_dirs=links_as_dirs
+        # 1.0.221 (story 113) : `deep` = niveaux de rangement d'un -W avec collisions (_flat_levels ; None : fichiers à la racine) ;
+        # `no_overwrite` (--sans-ecraser) : un existant différent est gardé, jamais ouvert en écriture ; sinon remplacé et dit
+        self.deep=deep; self.no_overwrite=no_overwrite
+        # `last_wins` (-W, liste de la sélection indisponible et dite) : un doublon de cette restauration remplace le précédent ; sinon
+        # (liste vérifiée) il n'est PAS écrit : `clash`, [WARN] « collision de noms imprévue », code 1 — jamais d'écrasement silencieux
+        self.last_wins=last_wins; self.clash=_PathLog(); self.replaced_d=_PathLog(); self.kept_d=_PathLog(); self._fresh=False
+        self.replaced=_PathLog(); self.kept=_PathLog(); self.same=0; self._repl=False
         self.root_label=root_label   # destination elle-même dans une zone : tout sauté, rien ouvert ni créé
         # revue 1 (row 5) : formes compactes — clés jointes (« a/b »), identité en UN entier (st_dev<<64)|st_ino (revue 2, row 23 : jamais
         # deux ensembles indépendants, leur produit accepterait un fichier d'un autre système de fichiers) ; la mémoire reste
         # proportionnelle au nombre de dossiers, de liens et de fichiers écrits (limite documentée)
         self.skips=_SkipLog(); self.n_ok=0; self.last=None; self.dirs=[]; self.made_links=set(); self.converted=0; self.made_dirs=[]
-        self.inos=set(); self.occupant={}; self.broken=[]; self.only=None; self.done_only=set(); self.seen_only=set(); self.chain=[]; self.tmp=None
+        self.inos=set(); self.occupant={}; self.broken=[]; self.only=None; self.done_only=set(); self.same_only=set(); self.seen_only=set(); self.chain=[]; self.tmp=None
         self.is_root=os.geteuid()==0; self._uid={}; self._gid={}
         self.zid={}
         for label,_,zi in zones:
@@ -2678,7 +2764,7 @@ class _SafeWriter:
             self.seen_only.add(key)   # revue 2 (row 35) : vu à la seconde lecture (écrit ou sauté) : jamais recompté _RZ_HARD
         if self.flat:
             if ti.isdir(): return
-            parts=[parts[-1]]
+            parts=_flat_rel(key,self.deep)   # story 113 : à plat sans collision = le nom seul ; sinon sous son dossier parent
         shown='/'.join(key)
         if self.root_label: self.skips.add(self.root_label,'',True); return
         if ti.ischr() or ti.isblk():
@@ -2720,14 +2806,36 @@ class _SafeWriter:
                     os.unlink(leaf,dir_fd=pfd); self.made_links.discard(shown); self.converted+=1; st=None
                 else:
                     self.skips.add(_RZ_UNDER if shown in self.made_links else _RZ_LINK,shown,True); return
-            if st is not None and not stat.S_ISDIR(st.st_mode): os.unlink(leaf,dir_fd=pfd); st=None
+            if st is not None and not stat.S_ISDIR(st.st_mode):
+                if self.no_overwrite: self.kept.add('/'.join(parts)); return   # story 113 : fichier présent à la place du dossier, gardé
+                os.unlink(leaf,dir_fd=pfd); st=None; self.replaced.add('/'.join(parts))
             if st is None: os.mkdir(leaf,0o700,dir_fd=pfd)
+            elif self.no_overwrite: return   # dossier déjà présent, fusionné : ses droits et sa date ne sont pas touchés (story 113)
             uid,gid=self._owner(ti)
             self.dirs.append((shown,ti.mode&0o7777,uid,gid,ti.mtime))
             self.n_ok+=1; self.last=shown; return
+        dest='/'.join(parts); self._repl=False
+        # -W : nom de destination déjà écrit par CETTE restauration (collision que la liste n'a pas prévue, ou liste non vérifiable) —
+        # jamais un « existant » : doublon NON écrit et dit (clash), sauf liste indisponible dite (last_wins : le dernier gagne)
+        self._fresh=self.flat and dest in self.occupant
+        if self._fresh:
+            if self.occupant[dest]==shown:
+                # revue 2 (row 14) : MÊME chemin d'archive rendu deux fois (racines BORG_ROOTBKP imbriquées : borg create ::t /x /x/y
+                # l'archive deux fois, mesuré) — pas une collision : le dernier remplace sans rien dire (1.0.214) ; --sans-ecraser :
+                # le premier est gardé, sans rien dire non plus (même chemin d'archive, même contenu)
+                if self.no_overwrite: return
+            elif not (self.last_wins and not self.no_overwrite): self.clash.add(shown); return
         if st is not None and stat.S_ISDIR(st.st_mode):
+            if self.no_overwrite: self.kept_d.add(dest); return
             try: os.rmdir(leaf,dir_fd=pfd)   # dossier vide remplacé (comme borg extract) ; non vide : jamais retiré
             except OSError: self.skips.add(_RZ_FULLDIR,shown); return
+            self.replaced_d.add(dest)
+        elif st is not None and not ti.islnk() and not self._fresh:
+            # story 113 (décisions 1, 2) : existant — identique : ni réécrit ni dit ; différent : remplacé et dit, ou gardé
+            # (--sans-ecraser, rien ouvert en écriture)
+            if self._same(st,ti,pfd,leaf): self._kept_same(st,ti,parts,key,shown); return
+            if self.no_overwrite: self.kept.add(dest); return
+            self._repl=True
         tmp=self._tmpname(leaf)
         if ti.isreg():
             fd=self._mk(pfd,tmp,lambda: os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|getattr(os,'O_CLOEXEC',0),0o600,dir_fd=pfd))
@@ -2753,12 +2861,38 @@ class _SafeWriter:
             if not self._hardlink(ti,pfd,tmp,parts,key,shown): return
         self._commit(pfd,tmp,leaf)
         self.n_ok+=1; self.last=shown
+        if self._repl: self.replaced.add(dest)
         if self.only is not None: self.done_only.add(key)
         if not ti.issym() and not ti.isdir():
             try: nst=os.stat(leaf,dir_fd=pfd,follow_symlinks=False); self.inos.add((nst.st_dev<<64)|nst.st_ino)   # revue 2 (row 23) : la PAIRE
             except OSError: pass
-        if self.flat: self.occupant[leaf]=shown
+        if self.flat: self.occupant[dest]=shown
         elif ti.issym(): self.made_links.add(shown)
+
+    def _same(self,st,ti,pfd,leaf):
+        """Story 113 (décision 2) : l'existant (`st`, lstat sans suivre de lien) est IDENTIQUE à l'entrée de l'archive — même type,
+        même taille, même date à la seconde (comme tar), mêmes droits (et, en root, mêmes uid/gid : le mode sûr les pose) ; lien symbolique : même cible (lue sans suivre rien) ;
+        fifo, périphérique : type, droits, date (et numéros pour un périphérique)."""
+        m=st.st_mode
+        if ti.issym():
+            if not stat.S_ISLNK(m): return False
+            try: return os.readlink(leaf,dir_fd=pfd)==ti.linkname and (not self.is_root or (st.st_uid,st.st_gid)==self._owner(ti))
+            except OSError: return False
+        if ti.isreg(): ok=stat.S_ISREG(m) and st.st_size==ti.size
+        elif ti.isfifo(): ok=stat.S_ISFIFO(m)
+        elif ti.ischr() or ti.isblk():
+            ok=(stat.S_ISCHR(m) if ti.ischr() else stat.S_ISBLK(m)) and st.st_rdev==os.makedev(ti.devmajor,ti.devminor)
+        else: return False
+        return bool(ok and stat.S_IMODE(m)==ti.mode&0o7777 and st.st_mtime_ns//1000000000==int(ti.mtime//1)
+                    and (not self.is_root or (st.st_uid,st.st_gid)==self._owner(ti)))
+
+    def _kept_same(self,st,ti,parts,key,shown):
+        """Existant identique : rien écrit, compté comme restauré (pas comme remplacé) ; sert de premier nom à un lien physique."""
+        self.n_ok+=1; self.same+=1; self.last=shown
+        if self.only is not None: self.done_only.add(key); self.same_only.add(key)   # revue 2 (row 24) : laissé, pas écrit
+        if not ti.issym(): self.inos.add((st.st_dev<<64)|st.st_ino)
+        if self.flat: self.occupant['/'.join(parts)]=shown
+        elif ti.issym() and not self.no_overwrite: self.made_links.add(shown)   # comme un lien écrit : --liens-en-dossiers le convertit à la relance — jamais sous --sans-ecraser (revue 2, row 17 : un lien présent n'est pas converti en dossier)
 
     def _hardlink(self,ti,pfd,tmp,parts,key,shown):
         """Lien physique : second nom lié au fichier écrit par CETTE restauration pour le premier nom ; sinon (premier nom sauté,
@@ -2767,8 +2901,8 @@ class _SafeWriter:
         mp=_restore_norm(ti.linkname)
         if mp is None or not mp: self.skips.add(_RZ_ODD,shown); return False
         if self.flat:
-            tparts=[mp[-1]]
-            ok=self.occupant.get(mp[-1])=='/'.join(mp)
+            tparts=_flat_rel(tuple(mp),self.deep)
+            ok=self.occupant.get('/'.join(tparts))=='/'.join(mp)
         else: tparts=mp; ok=True
         mfd=self._walk(tparts[:-1]) if ok else None
         if mfd is None:
@@ -2789,6 +2923,13 @@ class _SafeWriter:
             if cur is not None and (cur.st_dev,cur.st_ino)==(mst.st_dev,mst.st_ino):   # revue 1 (row 12) : déjà ce lien, rien à faire
                 self.n_ok+=1; self.last=shown
                 return False
+            if cur is not None and not self._fresh:   # story 113 : un autre fichier à la place du second nom
+                if (stat.S_ISREG(cur.st_mode) and stat.S_ISREG(mst.st_mode) and cur.st_size==mst.st_size and stat.S_IMODE(cur.st_mode)==stat.S_IMODE(mst.st_mode)
+                        and cur.st_mtime_ns//1000000000==mst.st_mtime_ns//1000000000 and (not self.is_root or (cur.st_uid,cur.st_gid)==(mst.st_uid,mst.st_gid))):
+                    self.n_ok+=1; self.same+=1; self.last=shown   # fichier ordinaire identique au premier nom (non lié) : laissé, comme un identique
+                    return False
+                if self.no_overwrite: self.kept.add('/'.join(parts)); return False   # remplacé et dit, ou gardé (--sans-ecraser)
+                self._repl=True
             self._mk(pfd,tmp,lambda: os.link(tparts[-1],tmp,src_dir_fd=mfd,dst_dir_fd=pfd,follow_symlinks=False))
             return True
         finally: os.close(mfd)
@@ -2819,6 +2960,15 @@ class _SafeWriter:
                     finally: os.close(fd)
                 finally: os.close(pfd)
         finally: self.close()
+
+    def exit1(self):
+        """Story 113 : de quoi finir en code 1 — sautés, liens rompus, existants gardés, doublons de nom non écrits."""
+        return bool(self.skips or self.broken or self.kept or self.kept_d or self.clash)
+
+    def report(self):
+        """Story 113 : existants remplacés (code 0), existants gardés (--sans-ecraser, code 1), puis éléments sautés."""
+        self.replaced.report('remplacé'); self.replaced_d.report('remplacé',noun='dossier'); self.kept.report('gardé'); self.kept_d.report('gardé',noun='dossier')
+        self.clash.report('non écrit',adj='',head=_CLASH_HEAD); self.skips.report()
 
     def rm_made_dirs(self):
         """Revue 1 (row 14) : rien restauré -> dossiers créés comme parents par cette restauration retirés s'ils sont vides (le plus
@@ -2874,21 +3024,38 @@ def _stdout_discard(fd=None):
         os.set_blocking(fd,True)
     except (OSError,AttributeError,ValueError): pass
 
-def _restore_tar_entry(ti,flat):
+def _restore_tar_entry(ti,flat,deep=None):
     """Mode sûr, sortie tar/tgz/stdout (décision 9) : entrée du flux réécrite telle quelle, chemin normalisé — None si sautée
     (non normalisée ; à plat : dossier). À plat : nom seul ; lien physique vers le nom seul de son premier nom (comme
-    tarfile.add de 1.0.212)."""
+    tarfile.add de 1.0.212). Story 113 : `deep` (_flat_levels) non None = collisions de noms dans la sélection, chaque fichier
+    (et la cible de ses liens physiques) sous son dossier parent, un niveau de plus au besoin (_flat_rel)."""
     parts=_restore_norm(ti.name)
     if not parts: return None
     if flat:
         if ti.isdir(): return None
-        ti.name=parts[-1]
+        ti.name='/'.join(_flat_rel(tuple(parts),deep))
     else: ti.name='/'.join(parts)
     if ti.islnk():
         mp=_restore_norm(ti.linkname)
         if not mp: return None
-        ti.linkname=mp[-1] if flat else '/'.join(mp)
+        ti.linkname='/'.join(_flat_rel(tuple(mp),deep)) if flat else '/'.join(mp)
     return ti
+
+def _tar_flat_clash(emitted,nm,ln,t,pmode):
+    """Story 113 (revue 1 row 1, revue 2 rows 13 et 14), sortie tar à plat : `t` (retourné par _restore_tar_entry) est-il un membre à NE PAS
+    émettre ? `emitted` = {nom émis: chemin d'archive}, tenu à jour ici ; `nm`, `ln` : nom et cible d'origine du membre dans le flux
+    (ln : lien physique seulement). Doublon de nom d'un AUTRE chemin d'archive (liste vérifiée, pmode None) : oui, dit ; MÊME chemin
+    d'archive rendu deux fois (racines BORG_ROOTBKP imbriquées, mesuré) : non, pas une collision. Lien physique : sa cible émise doit
+    être le chemin d'origine du lien — sinon (premier nom écarté, homonyme émis à sa place) il lierait un autre fichier : oui.
+    Rend True (collision : non émis et dit), 'dup' (même chemin d'archive revu en lien vers lui-même : non émis, rien dit) ou False."""
+    ap='/'.join(_restore_norm(nm))
+    if t.islnk():
+        lp='/'.join(_restore_norm(ln))
+        if lp==ap and emitted.get(t.name)==ap: return 'dup'   # un lien physique de borg vers le même chemin : l'entrée déjà émise
+        if t.name==t.linkname or emitted.get(t.linkname)!=lp: return True
+    if pmode!='liste' and emitted.get(t.name,ap)!=ap: return True
+    emitted[t.name]=ap
+    return False
 
 _BORG_ALWAYS=('Platform','Borg:')   # écartés de toute ligne (1.0.173, inchangé)
 _BORG_SYSINFO=('Platform','Linux:','Borg:','PID:','sys.argv:','SSH_ORIGINAL_COMMAND:','Borg server:')   # sysinfo() de borg 1.2 : après une trace
@@ -3706,7 +3873,7 @@ def _lower_priority():
 # _CLI_OPTAB[cmd] (ou de _CLI_EARLY[cmd]) hors communes -C -c -d -P, ni plus ni moins (contrôlé par CodecSelfTest) ; chaque
 # exemple est accepté par l'analyseur de main (_help_example_error : getopt, _cli_options, _cli_required).
 _CLI_SHORTOPTS="c:hH:s:n:k:p:r:m:b:B:f:w:W:A:dvjlILC:FSN:ox:DP:RyKXt:T:"
-_CLI_LONGOPTS=["help","rebuild","keys","history","fidele","creux","liens-en-dossiers","par-nom"]
+_CLI_LONGOPTS=["help","rebuild","keys","history","fidele","creux","liens-en-dossiers","par-nom","sans-ecraser"]
 # Options acceptées par commande (seule source des options) — contenu inchangé depuis _cli_main (déplacé en 1.0.206).
 _CLI_OPTAB={k:v+'P' for k,v in {
     'stats':'Ccdn','login':'Ccdsnkprm','mount':'Ccdnb','umount':'Ccdn',
@@ -3720,8 +3887,8 @@ _CLI_OPTAB={k:v+'P' for k,v in {
     'storage':'Ccdnj'}.items()}
 # Options longues de commande : réservées à une seule commande (_cli_options).
 _CLI_LONG_OWNER={'--rebuild':'index','--keys':'borgcleanup','--history':'borgcleanup',
-                 '--fidele':'restore','--creux':'restore','--liens-en-dossiers':'restore','--par-nom':'restore'}   # Restore : 1.0.214 (story 114)
-_RESTORE_LONG=('--fidele','--creux','--liens-en-dossiers','--par-nom')
+                 '--fidele':'restore','--creux':'restore','--liens-en-dossiers':'restore','--par-nom':'restore','--sans-ecraser':'restore'}   # Restore : 1.0.214 (story 114), --sans-ecraser : story 113
+_RESTORE_LONG=('--fidele','--creux','--liens-en-dossiers','--par-nom','--sans-ecraser')
 # Commandes traitées par _cli_main AVANT _CLI_OPTAB (aucune base, aucun rc) : options lues par leur branche.
 _CLI_EARLY={'codecselftest':'fl','perfbench':'nK'}
 _CLI_COMMON='CcdP'
@@ -3827,13 +3994,14 @@ _HELP={
         (("démonte MOUNTPOINT du nick","borgHelper -c UMount -n mon-serveur"),
          ("nick qui porte le nom de la machine","borgHelper -c UMount"))),
     'restore':_H('Restore',1,"Restaure un fichier ou une arborescence depuis une archive",
-        "-c Restore [-n nick] [-b archive|last] -f chemin (-w dest | -W dest | -L) [--liens-en-dossiers | --fidele [--creux]] [--par-nom]",
+        "-c Restore [-n nick] [-b archive|last] -f chemin (-w dest | -W dest | -L) [[--liens-en-dossiers] [--sans-ecraser] | --fidele [--creux]] [--par-nom]",
         (_HN,('-b <archive|last>',"archive (défaut et last : la dernière de la base qui contient -f, sinon la dernière)"),
          ('-f <chemin>',"chemin exact ou glob (* et ? ; ** franchit /) — obligatoire"),
          ('-w <dest>',"restaure avec les sous-répertoires : répertoire, .tar/.tgz, ou - (tar sur stdout)"),
-         ('-W <dest>',"restaure à plat : fichiers à la racine de dest (mêmes formes)"),
+         ('-W <dest>',"restaure à plat : fichiers à la racine de dest (mêmes formes) ; noms en collision : chaque fichier sous son dossier parent"),
          ('-L',"liste droits et propriétaires, sans restaurer"),
          ('--liens-en-dossiers',"mode sûr : lien de l'archive avec des éléments dessous -> vrai dossier, éléments écrits dedans"),
+         ('--sans-ecraser',"mode sûr, vers un dossier : les fichiers existants différents sont gardés (dits, code 1) au lieu d'être remplacés"),
          ('--fidele',"mode fidèle : borg extract brut (attributs étendus, ACL) — AUCUNE protection (bases, dépôt, rc)"),
          ('--creux',"avec --fidele : fichiers creux restaurés creux (un fichier préalloué revient creux aussi)"),
          ('--par-nom',"propriétaires par nom de l'archive (numériques si inconnus ; défaut : uid/gid numériques)")),
@@ -3845,7 +4013,13 @@ _HELP={
         long=("Défaut, mode sûr : chaque fichier écrit par borgHelper depuis borg export-tar, jamais à travers un lien ;",
               "attributs étendus et ACL non restaurés (avis à chaque Restore) ; rien écrit dans les bases, les dépôts locaux,",
               "les clés et dossiers de borg, le rc : éléments sautés, [WARN], code 1 ; élément sous un lien : sauté, code 1.",
-              "Flux interrompu (borg, réseau, disque plein) : fichiers finis gardés, code 2. --fidele : borg extract, CLI seulement.",
+              "Fichier existant différent : remplacé et dit ([WARN] N fichiers existants remplacés, code 0) ; identique (taille, date,",
+              "droits) : laissé, rien dit ; --sans-ecraser : gardé et dit, code 1. -W avec collision de noms : [WARN], chaque fichier rangé",
+              "sous son dossier parent (un niveau de plus si le nom collisionne encore) ; collision imprévue : doublon non écrit,",
+              "[WARN] « collision de noms imprévue », code 1 ; collisions non vérifiables (liste indisponible) : [WARN], code 1.",
+              "--sans-ecraser exclut --fidele.",
+              "Flux interrompu (borg, réseau, disque plein) : fichiers finis gardés, code 2. --fidele : borg extract, CLI seulement",
+              "(existants remplacés sans rien dire, comme borg).",
               "Destination répertoire absente : créée ; inutilisable, ou fichier tar dans une zone : refus, code 3, avant borg.",
               "Un Index en cours se met en pause pendant la restauration. Code 2 aussi : erreur d'arguments.")),
     # ── INDEX ET RECHERCHE ──
@@ -4231,14 +4405,16 @@ def _cli_required(cmd,options,fs=True):
         if '-f' not in options: return "-f <chemin> obligatoire"
         if '-L' not in options and '-w' not in options and '-W' not in options: return "-w <dest> ou -W <dest> obligatoire (ou -L)"
         # 1.0.214 (story 114, décisions 8 et 16) : --creux avec --fidele seulement ; --liens-en-dossiers : mode sûr seulement
-        if '-L' in options and any(o in options for o in _RESTORE_LONG): return "--fidele, --creux, --liens-en-dossiers, --par-nom : sans objet avec -L"
+        if '-L' in options and any(o in options for o in _RESTORE_LONG): return "--fidele, --creux, --liens-en-dossiers, --par-nom, --sans-ecraser : sans objet avec -L"
         if '--creux' in options and '--fidele' not in options: return "--creux seulement avec --fidele"
         if '--liens-en-dossiers' in options and '--fidele' in options: return "--liens-en-dossiers : mode sûr seulement (sans --fidele)"
+        if '--sans-ecraser' in options and '--fidele' in options: return "--sans-ecraser : mode sûr seulement (sans --fidele)"   # story 113, décision 5
         # revue 1 de la story 114 (rows 2 et 17)
         if '-b' in options and not options['-b'].strip(): return "-b vide refusé : nom d'archive exact attendu"
         dst=options.get('-W',options.get('-w'))
         if dst is not None and (dst=='-' or _is_tar_dest(dst)):
             if '--liens-en-dossiers' in options: return "--liens-en-dossiers : sans objet vers un tar ou stdout"
+            if '--sans-ecraser' in options: return "--sans-ecraser : sans objet vers un tar ou stdout"
             if '--par-nom' in options and '--fidele' not in options: return "--par-nom : sans objet vers un tar ou stdout en mode sûr"
     elif cmd=='diffbkp':
         if '-b' in options and options['-b'].count(',')>1: return f"-b {options['-b']!r} : une ou deux archives (a ou a,b)"
@@ -10110,30 +10286,36 @@ class BorgHelper:
         lab=_restore_zone_of(tarpath,zones if zones is not None else self._restore_zones(nick))
         if lab: printer(f"[ERREUR] destination {tarpath} : dans une zone protégée ({lab}) — fichier tar refusé, rien écrit"); sys.exit(3)
 
-    def restore(self,nick,bid,ftor,where,flat=False,debug=0,fidele=False,sparse=False,links_as_dirs=False,by_name=False):
+    def restore(self,nick,bid,ftor,where,flat=False,debug=0,fidele=False,sparse=False,links_as_dirs=False,by_name=False,no_overwrite=False):
         """Restore -w/-W (dossier, .tar/.tgz, `-` : tar sur stdout). 1.0.214 (story 114, décision 16) : défaut = mode SÛR
         (borg export-tar lu en flux, chaque entrée écrite par borgHelper, zones protégées sautées) ; `fidele` = borg extract brut de
         1.0.212, sans aucune protection (`sparse` : --sparse, seulement avec `fidele`). `links_as_dirs` (mode sûr) : lien de
         l'archive avec des éléments dessous remplacé par un vrai dossier ; `by_name` : propriétaires par nom (deux modes).
         Codes : 0 tout restauré, 1 éléments sautés (ou avertissement de borg), 2 refus d'options ou flux interrompu, 3 destination
-        inutilisable ou erreur d'écriture du tar (comme avant)."""
+        inutilisable ou erreur d'écriture du tar (comme avant).
+        1.0.221 (story 113) : mode sûr — un fichier existant différent est REMPLACÉ et dit (`[WARN] N fichiers existants remplacés`,
+        code 0), un identique laissé sans rien dire ; `no_overwrite` (--sans-ecraser, mode sûr vers un dossier seulement) : les
+        existants sont gardés et dits, code 1 ; -W : collisions de noms rangées sous le dossier parent. --fidele : borg extract brut
+        (existants remplacés sans rien dire, comme borg)."""
         cfg=self.borg.cfgreaded(nick,debug=debug)
         stdout_mode=(where=='-')
         out=sys.stderr if stdout_mode else sys.stdout
         # 1.0.214 (story 114, décisions 3, 8, 16) : combinaisons refusées aussi pour la bibliothèque (la CLI les refuse avant, _cli_required)
         if sparse and not fidele: printer("[ERREUR] Restore : --creux seulement avec --fidele"); sys.exit(2)
         if links_as_dirs and fidele: printer("[ERREUR] Restore : --liens-en-dossiers : mode sûr seulement (sans --fidele)"); sys.exit(2)
+        if no_overwrite and fidele: printer("[ERREUR] Restore : --sans-ecraser : mode sûr seulement (sans --fidele)"); sys.exit(2)   # story 113, décision 5
         # revue 1 (rows 2 et 17) : nom d'archive vide ou blanc (« :: » viserait le dépôt) ; options sans objet vers un tar ou stdout
         if bid is not None and (not isinstance(bid,str) or not bid.strip()):
             printer("[ERREUR] Restore : -b vide refusé : nom d'archive exact attendu"); sys.exit(2)
         if where=='-' or _is_tar_dest(where):
             if links_as_dirs: printer("[ERREUR] Restore : --liens-en-dossiers : sans objet vers un tar ou stdout"); sys.exit(2)
+            if no_overwrite: printer("[ERREUR] Restore : --sans-ecraser : sans objet vers un tar ou stdout"); sys.exit(2)
             if by_name and not fidele: printer("[ERREUR] Restore : --par-nom : sans objet vers un tar ou stdout en mode sûr"); sys.exit(2)
         if self.borg.repoLocalAbsent(nick): self._borg_stop(nick)   # 1.0.172 (A60) : avant tout verrou
         # revue 3 (row 49) : aucun gestionnaire de signal ici (bibliothèque) — la CLI pose _restore_sigterm autour de la commande
-        return self._restore_run(nick,bid,ftor,where,flat,debug,fidele,sparse,links_as_dirs,by_name,None)
+        return self._restore_run(nick,bid,ftor,where,flat,debug,fidele,sparse,links_as_dirs,by_name,None,no_overwrite)
 
-    def _restore_run(self,nick,bid,ftor,where,flat,debug,fidele,sparse,links_as_dirs,by_name,zones):
+    def _restore_run(self,nick,bid,ftor,where,flat,debug,fidele,sparse,links_as_dirs,by_name,zones,no_overwrite=False):
         """Suite de restore() (destination, zones, sélection d'archive, avis, verrou, écriture)."""
         stdout_mode=(where=='-')
         out=sys.stderr if stdout_mode else sys.stdout
@@ -10163,14 +10345,14 @@ class BorgHelper:
         if fidele: printer(_RESTORE_FIDELE_NOTE)
         else:
             printer(_RESTORE_SAFE_NOTE)
-            printer(_RESTORE_FIDELE_CMD
+            printer((_RESTORE_FIDELE_CMD.replace('rc) : ','rc ; écrase les existants) : ') if no_overwrite else _RESTORE_FIDELE_CMD)   # row 25 (revue 2) : la commande proposée ne garde pas les existants
                     +_restore_cli_line(self.borg.cfgfile,nick,bid,ftor,where,flat,fidele=True,extra=['--par-nom'] if by_name else ()))
         self.db.set_priority_lock(nick)
         try:
             self.db.wait_index_idle(nick)   # revue 3 (row 41) : dans le try — verrou rendu même interrompu pendant l'attente
             if fidele: self._restore_fidele(nick,bid,ftor,where,flat=flat,debug=debug,sparse=sparse,by_name=by_name)
             elif tar_dest: self._restore_safe_tar(nick,bid,ftor,where,flat=flat,debug=debug,zones=zones)
-            else: self._restore_safe_dir(nick,bid,ftor,where,flat=flat,debug=debug,links_as_dirs=links_as_dirs,by_name=by_name,zones=zones)
+            else: self._restore_safe_dir(nick,bid,ftor,where,flat=flat,debug=debug,links_as_dirs=links_as_dirs,by_name=by_name,zones=zones,no_overwrite=no_overwrite)
         except SystemExit as x:   # revue 4 (row 55) : sortie de fin de Restore (son code gardé par _restore_sigterm si SIGTERM suit)
             x._bh_restore_end=True; raise
         finally:
@@ -10189,25 +10371,98 @@ class BorgHelper:
         résultat boex + 'stream_exc'."""
         return self.borg.boex(nick,args,debug=debug,retjson=False,stream=consume,on_abort=on_abort)
 
-    def _restore_safe_dir(self,nick,bid,ftor,where,flat=False,debug=0,links_as_dirs=False,by_name=False,zones=None):
+    def _restore_snap_names(self,nick,bid,ftor,names):
+        """Story 113 (Open Question, coût) : noms de fichiers de la sélection lus dans le snapshot de l'archive (aucun appel borg) —
+        seulement si le snapshot est complet pour cette sélection : chemin exact canonique (ni joker, ni style de motif `re:`/`sh:`/`fm:`/
+        `pp:`/`pf:`, ni `.`/`..` que borg normalise autrement que la base ; `//etc` est accepté : normalisé de même des deux côtés), archive indexée (sentinelle), ni IDX_INCLUDE/IDX_EXCLUDE
+        au rc ni AUCUN exclu enregistré pour le nick (l'Index incrémental n'en enregistre pas), colonne `mode` renseignée (dossiers
+        reconnus), au moins une ligne lue. Faux au moindre doute : borg list. Sonde en lecture seule (aucun chemin créateur de base :
+        pas d'[ERREUR] ni d'avis de base non chiffrée de cette sonde)."""
+        if '*' in ftor or '?' in ftor or re.match(r'[A-Za-z0-9]{2}:',ftor): return False
+        import posixpath
+        if _norm_lp(posixpath.normpath(ftor))!=_norm_lp(ftor) or '\x00' in ftor: return False
+        conn=None; rows=0
+        try:
+            with contextlib.redirect_stderr(_NullErr()):
+                cfg=self.borg.cfgreaded(nick)
+                if (cfg.get('IDX_INCLUDE') or '').strip() or (cfg.get('IDX_EXCLUDE') or '').strip(): return False
+                db_path=self.db.get_diff_db(nick)
+                if not os.path.exists(db_path) or not _db_has_schema(db_path,_READER_WRITE_WAIT): return False
+                conn=_open_db(db_path,nick=nick,role='read')
+                if not _snap_present(conn,nick,bid): return False
+                if conn.execute("SELECT 1 FROM snap_excluded_stats WHERE nick=? AND file_count>0 LIMIT 1",(nick,)).fetchone() is not None: return False
+                psql,pprm,_=_psel_under(conn,_norm_lp(ftor),self_too=True)
+                for stored,mode in conn.execute("SELECT path,mode FROM archive_snapshot_v WHERE nick=? AND archive=?"+_wh(psql),[nick,bid]+pprm):
+                    rows+=1
+                    if mode is None: return False
+                    if mode[:1]!='d': names.add(_path_decode(conn,stored))
+            return rows>0
+        except (Exception,SystemExit): return False   # base absente, illisible, chiffrée sans clé… : la liste de borg répond
+        finally: _close_quiet(conn)
+
+    def _restore_list_names(self,nick,bid,ftor,names,debug=0):
+        """Story 113 : noms de fichiers de la sélection par `borg list` (même sélection et même exclusion `*/log/*` que export-tar),
+        lus en flux — None, ou la cause de l'échec (liste indisponible)."""
+        args=['list','--exclude','*/log/*','--format','{type}{NUL}{path}{NUL}',f'::{_borg_literal(bid)}']
+        args+=_borg_glob_args(ftor) if ('*' in ftor or '?' in ftor) else [ftor]
+        def consume(fh):
+            buf=b''; typ=None
+            try:
+                while True:
+                    b=fh.read(1<<16)
+                    if not b: break
+                    items=(buf+b).split(b'\0'); buf=items.pop()
+                    for it in items:
+                        if typ is None: typ=it
+                        else:
+                            if typ!=b'd': names.add(it.decode('utf-8','surrogateescape'))
+                            typ=None
+            except OSError as e: return e
+            return ValueError('liste tronquée') if (buf or typ is not None) else None
+        r=self._restore_stream(nick,args,consume,debug=debug); e=r.get('stream_exc')
+        if e is None and _borg_ok(r): return None
+        return _etxt(e) if e is not None and (r.get('killed') or _borg_ok(r)) else _rb_errmsg(r,'borg list')
+
+    def _restore_flat_plan(self,nick,bid,ftor,debug=0):
+        """Story 113 (décision 3) : collisions de noms d'un -W, connues AVANT d'écrire — liste de la sélection : snapshot de l'archive si
+        possible, sinon un `borg list` de plus -> (deep, mode) ; `deep` None : aucune collision (fichiers à la racine) ; `mode` : None
+        (liste vérifiée) ou 'liste' (liste indisponible : le dernier de même nom gagne, dit). Revue 2 (row 16) : noms comparés sous leur
+        forme listée (_rs : « ? » pour un octet non UTF-8) des deux côtés — plus de mode « noms » ; deux noms distincts de même forme
+        sont rangés par précaution, une collision que la liste ne voit pas reste attrapée à l'écriture (doublon non écrit, dit).
+        Rien n'est dit ici : `_restore_plan_warn` après l'export."""
+        names=_FlatNames()
+        if not self._restore_snap_names(nick,bid,ftor,names):
+            names=_FlatNames()
+            if self._restore_list_names(nick,bid,ftor,names,debug=debug) is not None: return None,'liste'
+        return names.levels(),None
+
+    def _restore_safe_dir(self,nick,bid,ftor,where,flat=False,debug=0,links_as_dirs=False,by_name=False,zones=None,no_overwrite=False):
         """Mode sûr, destination dossier (-w arborescence, -W à plat) : zones relues juste avant l'écriture ; destination dans une
         zone, par chemin ou par identité (elle ou un parent existant : montage bind de CACHE_DIR…) -> aucun borg, rien créé,
         `[WARN] rien restauré`, code 1 (revue 1, rows 1 et 7) ; sinon créée (retirée, avec les parents créés par l'écrivain, si rien
         n'est restauré) puis _SafeWriter. Flux interrompu (borg en échec, tué, réseau ; disque plein) : fichiers finis gardés,
         [ERREUR] avec le dernier élément écrit et le nombre restauré, code 2 (décision 12). Liens physiques dont le premier nom n'a
         pas été écrit : seconde lecture de ces seuls chemins, par lots (borg les rend alors en fichiers complets), [WARN] « lien
-        physique rompu » pour chaque nom écrit, les autres listés sautés ; échec de cette lecture : flux interrompu, code 2 (décision 14)."""
+        physique rompu » pour chaque nom écrit, les autres listés sautés ; échec de cette lecture : flux interrompu, code 2 (décision 14).
+        Story 113 : existant identique laissé (ni réécrit ni dit), existant différent REMPLACÉ et dit (`[WARN] N fichiers existants
+        remplacés`, code 0) ou, avec `no_overwrite` (--sans-ecraser), GARDÉ et dit (code 1) ; -W : collisions de noms connues avant
+        d'écrire (_restore_flat_plan), rangement sous le dossier parent ; liste indisponible : `[WARN]` et code 1."""
         import tarfile as tf_mod
         # revue 3 (row 43) : zones RECALCULÉES juste avant l'écrivain (le contrôle en tête de Restore précède borg list et l'attente de
         # l'Index : une zone apparue entre-temps est vue) ; [WARN] des nicks déjà dits en tête (`quiet`), sauf appel direct
         zones=self._restore_zones(nick,quiet=zones is not None)
         wl=_restore_zone_of(where,zones)
         if wl: printer(f"[WARN] rien restauré : destination dans une zone protégée ({wl})"); sys.exit(1)
+        deep=None; pmode=None
+        if flat:   # story 113 : collisions de noms connues AVANT d'écrire (la destination n'est pas encore créée)
+            deep,pmode=self._restore_flat_plan(nick,bid,ftor,debug=debug)
+        def warn_unver():   # dit APRÈS l'export (jamais devant l'échec d'un borg qui n'a rien écrit) : règle de rangement, liste non vérifiable
+            _restore_plan_warn(deep,pmode,no_overwrite)
         made=[]
         try: made=_makedirs_tracked(where)
         except OSError as e:
             printer(f"[ERREUR] destination {where} : création impossible ({e.strerror or e})"); sys.exit(3)
-        try: w=_SafeWriter(where,zones,flat=flat,by_name=by_name,links_as_dirs=links_as_dirs)
+        try: w=_SafeWriter(where,zones,flat=flat,by_name=by_name,links_as_dirs=links_as_dirs,deep=deep,no_overwrite=no_overwrite,last_wins=(pmode=='liste'))
         except OSError as e:
             _rmdirs_if_empty(made); printer(f"[ERREUR] destination {where} : {e.strerror or e}"); sys.exit(3)
         def consume(fh):
@@ -10235,11 +10490,12 @@ class BorgHelper:
                     if f2: bad=(r2,e2); break
                     if r2['exitcode']==1: _print_boex_stderr(r2)
             for k,m in w.broken:   # revue 1 (row 4) : dit APRÈS la seconde lecture, pour les noms écrits seulement
-                if k in w.done_only: printer(f"[WARN] lien physique rompu : {_shown_path('/'.join(k))} écrit comme fichier indépendant (premier nom {_shown_path(m)} non restauré)")
+                if k in w.same_only: printer(f"[WARN] lien physique rompu : {_shown_path('/'.join(k))} laissé (déjà identique, non lié) — premier nom {_shown_path(m)} non restauré")   # row 24 (revue 2) : rien écrit
+                elif k in w.done_only: printer(f"[WARN] lien physique rompu : {_shown_path('/'.join(k))} écrit comme fichier indépendant (premier nom {_shown_path(m)} non restauré)")
                 elif k not in w.seen_only: w.skips.add(_RZ_HARD,'/'.join(k))   # revue 2 (row 35) : vu et sauté : déjà compté
             if bad is not None and not w.n_ok:
                 w.rm_made_dirs(); w.close(); _rmdirs_if_empty(made)
-                if not w.skips:
+                if not (w.skips or w.kept or w.kept_d or w.clash):
                     if isinstance(bad[1],_RestoreStop): printer(f"[ERREUR] flux interrompu : {bad[1]} — rien restauré")   # borg arrêté par nous : pas son échec
                     else: printer(self._borg_fail_msg(nick,'borg export-tar',cause(*bad)))
                     sys.exit(2)
@@ -10249,15 +10505,17 @@ class BorgHelper:
         finally: w.close()
         if bad is not None:
             n=w.n_ok; s='s' if n>1 else ''
+            warn_unver()
             where_=f" après « {_shown_path(w.last)} »" if w.last else ''   # revue 1 (row 14) : jamais « après « None » »
             printer(f"[ERREUR] flux interrompu{where_} : {n} élément{s} restauré{s} (fichiers finis gardés) — {cause(*bad)}")
-            w.skips.report(); sys.exit(2)
+            w.report(); sys.exit(2)
         _print_boex_stderr(rb)
+        warn_unver()
         if w.converted: print(f"{w.converted} lien{'s' if w.converted>1 else ''} de l'archive remplacé{'s' if w.converted>1 else ''} par un dossier (--liens-en-dossiers)",flush=True)
         if w.n_ok: print(f"Restauré {'(plat) ' if flat else ''}dans {where} : {w.n_ok} élément{'s' if w.n_ok>1 else ''}",flush=True)
-        elif not w.skips: print(f"Rien restauré : aucun élément de la sélection ({where} non créé s'il n'existait pas)",flush=True)   # row 45
-        w.skips.report()
-        sys.exit(max(rb['exitcode'],1 if (w.skips or w.broken) else 0))
+        elif not (w.skips or w.kept or w.kept_d or w.clash): print(f"Rien restauré : aucun élément de la sélection ({where} non créé s'il n'existait pas)",flush=True)   # row 45
+        w.report()
+        sys.exit(max(rb['exitcode'],1 if (w.exit1() or pmode is not None) else 0))
 
     def _restore_safe_tar(self,nick,bid,ftor,tarpath,flat=False,debug=0,zones=None):
         """Mode sûr, sortie tar/tgz ou stdout (décision 9) : flux de borg export-tar réécrit entrée par entrée (tarfile en écriture,
@@ -10340,12 +10598,19 @@ class BorgHelper:
                 if mode=='a': printer(f"[ERREUR] {tarpath} : tar existant illisible ({_etxt(e)}) — rien écrit")
                 else: print(f"[ERREUR] Écriture impossible : {e}",file=sys.stderr)
                 sys.exit(3)
+            deep=None; pmode=None; emitted={}; clash=_PathLog()
+            if flat:   # story 113 : collisions de noms connues avant d'écrire (liste de la sélection : snapshot, sinon borg list)
+                deep,pmode=self._restore_flat_plan(nick,bid,ftor,debug=debug)
             wexc=[]
             def consume(fh):
                 try:
                     src=tf_mod.open(fileobj=fh,mode='r|')
                     for ti in src:
-                        nm=ti.name; t=_restore_tar_entry(ti,flat)
+                        nm=ti.name; ln=ti.linkname if ti.islnk() else None; t=_restore_tar_entry(ti,flat,deep)
+                        g=_tar_flat_clash(emitted,nm,ln,t,pmode) if (t is not None and flat and not t.isdir()) else False
+                        if g:
+                            if g is True: clash.add(nm)
+                            src.members=[]; continue
                         if t is None:
                             if not (flat and ti.isdir()) and _restore_norm(nm)!=[]: skips.add(_RZ_ODD,nm)
                             src.members=[]; continue
@@ -10385,9 +10650,10 @@ class BorgHelper:
         except BaseException:
             drop(); raise
         _print_boex_stderr(rb)
+        _restore_plan_warn(deep,pmode); clash.report('non écrit',adj='',head=_CLASH_HEAD)   # dit APRÈS l'export, seulement si le tar est écrit
         if not stdout_mode: print(f"Restauré {'(plat) ' if flat else ''}dans {tarpath} : {cnt[0]} élément{'s' if cnt[0]>1 else ''}",flush=True)
         skips.report()
-        sys.exit(max(rb['exitcode'],1 if skips else 0))
+        sys.exit(max(rb['exitcode'],1 if (skips or clash or pmode is not None) else 0))
 
     def _extract_fail(self,nick,rb):
         """1.0.175 (story 38, A70) : borg extract en échec (code >= 2) -> une ligne « nick: borg extract a échoué : … » (cause
@@ -15440,7 +15706,7 @@ def _sqlite_close_scan(src,extra=(),tests=('codec_selftest','perf_bench','push_s
 # Liste blanche et compte exact de borgHelper ; ceux de borgHelperWWW sont SES constantes (_SCG_WL_WWW, _SCG_SEEN_WWW, 1.0.204 :
 # un changement de WWW seul ne touche plus borgHelper), lues par la garde de borgHelper dans sa source (_src_literal).
 _SCG_WL={'borgHelper':{'_open_db':5,'ensure_cache_db':1,'ensure_diff_db':1,'ensure_history_db':1,'_audit_witness':1}}
-_SCG_SEEN={'borgHelper':122}   # nombre EXACT d'ouvertures analysées (1.0.203 ; 1.0.207, story 85 : +3 — _index_old_snaps, _snap_meta_put, _direct_marker, forme (b) ; 1.0.208, story 87a : +2 — get_storage_measures, storage_unmigrated, forme (b) ; 1.0.209, story 87b : +2 — store_storage_space, get_storage_space, forme (b) ; 1.0.211, story 88 (revue 88-2 row 25) : −2 — idxtop et difftop, une seule connexion chacun ; décision 6 : +1 — _hl_store_pass, forme (b) ; revue 88-3 row 51 : +1 — _hl_write, connexion neuve par écriture, forme (b) ; 1.0.217, story 118 : +2 — last_bkp_absent, first_bkp_absent, forme (b))
+_SCG_SEEN={'borgHelper':123}   # nombre EXACT d'ouvertures analysées (1.0.203 ; 1.0.207, story 85 : +3 — _index_old_snaps, _snap_meta_put, _direct_marker, forme (b) ; 1.0.208, story 87a : +2 — get_storage_measures, storage_unmigrated, forme (b) ; 1.0.209, story 87b : +2 — store_storage_space, get_storage_space, forme (b) ; 1.0.211, story 88 (revue 88-2 row 25) : −2 — idxtop et difftop, une seule connexion chacun ; décision 6 : +1 — _hl_store_pass, forme (b) ; revue 88-3 row 51 : +1 — _hl_write, connexion neuve par écriture, forme (b) ; 1.0.217, story 118 : +2 — last_bkp_absent, first_bkp_absent, forme (b) ; 1.0.221, story 113 : +1 — _restore_snap_names, forme (b))
 def _sqlite_close_file(nm,src,extra,wl,seen_want):
     """Partie fichier de la garde : sites non prouvés hors liste blanche `wl` ({fonction: nombre}), liste blanche au nombre exact
     par fonction, nombre exact d'ouvertures analysées `seen_want` (ouverture ajoutée ou retirée, ouvreur devenu invisible : liste à
@@ -25583,6 +25849,7 @@ if mode=='prunefail' and sub=='prune': sys.stderr.write('Failed to create/acquir
 if mode=='prunefail': sys.exit(0)
 if mode=='kill' and sub=='prune': os.kill(os.getpid(),signal.SIGKILL)
 if mode=='kill': sys.exit(0)
+if sub=='list' and '{{type}}{{NUL}}{{path}}{{NUL}}' in a and mode not in ('crash','fail','json'): sys.exit(0)   # story 113 : liste de la sélection d'un -W — aucun fichier
 if mode=='extract' and sub=='list':
     print(json.dumps(dict(archives=[dict(name='a',start='2026-01-01T00:00:00'),dict(name='b',start='2026-01-02T00:00:00')]))); sys.exit(0)
 if mode=='extract' and sub=='extract': open('restored','w').write('x'); sys.exit(0)
@@ -30340,8 +30607,10 @@ print(json.dumps(dict(pw=pw)))
             res['lots d\'arguments']=([len(x) for x in _argv_batches(['a'*40000,'b'*40000,'c'])]==[1,2],)
             p=os.path.join(tmp,'s114plat')
             w,exc=_s114_feed(p,[],[('a','d'),('a/n','f',b'1'),('b/n','f',b'2'),('b/l','l','../a/n'),('b/h','h','b/n')],flat=True)
-            res['à plat']=(sorted(os.listdir(p))==['h','l','n'] and open(os.path.join(p,'n')).read()=='2' and os.readlink(os.path.join(p,'l'))=='../a/n'
-                          and os.stat(os.path.join(p,'h')).st_ino==os.stat(os.path.join(p,'n')).st_ino and not w.skips,sorted(os.listdir(p)),_s114_skips(w))
+            # story 113 (revue 1, row 1) : même nom (a/n, b/n) hors collision prévue -> le second n'est PAS écrit (jamais d'écrasement
+            # silencieux) ; son lien physique (b/h -> b/n) : premier nom non écrit -> rompu
+            res['à plat']=(sorted(os.listdir(p))==['l','n'] and open(os.path.join(p,'n')).read()=='1' and os.readlink(os.path.join(p,'l'))=='../a/n'
+                          and w.clash.paths==['b/n'] and w.broken==[(('b','h'),'b/n')] and not w.skips,sorted(os.listdir(p)),_s114_skips(w),w.clash.paths)
             bad={k:v for k,v in res.items() if not v[0]}
             if bad: print(f"  {bad}")
             return not bad
@@ -30354,9 +30623,12 @@ print(json.dumps(dict(pw=pw)))
             d,rc,calls,cli=_bf_env('s114opts'); res={}
             for a,msg in ((['-w',os.path.join(d,'o'),'--creux'],'--creux seulement avec --fidele'),
                           (['-w',os.path.join(d,'o'),'--fidele','--liens-en-dossiers'],'--liens-en-dossiers : mode sûr seulement'),
-                          (['-L','--par-nom'],'--fidele, --creux, --liens-en-dossiers, --par-nom : sans objet avec -L'),
+                          (['-L','--par-nom'],'--fidele, --creux, --liens-en-dossiers, --par-nom, --sans-ecraser : sans objet avec -L'),
                           (['-w',os.path.join(d,'o.tar'),'--liens-en-dossiers'],'--liens-en-dossiers : sans objet vers un tar ou stdout'),
                           (['-w','-','--par-nom'],'--par-nom : sans objet vers un tar ou stdout en mode sûr'),
+                          (['-w',os.path.join(d,'o'),'--fidele','--sans-ecraser'],'--sans-ecraser : mode sûr seulement (sans --fidele)'),   # story 113
+                          (['-w',os.path.join(d,'o.tgz'),'--sans-ecraser'],'--sans-ecraser : sans objet vers un tar ou stdout'),
+                          (['-W','-','--sans-ecraser'],'--sans-ecraser : sans objet vers un tar ou stdout'),
                           (['-w',os.path.join(d,'o'),'-b',' '],"-b vide refusé : nom d'archive exact attendu")):
                 if os.path.exists(calls): os.unlink(calls)
                 code,out,err=cli('-c','Restore','-n','zw','-b','b','-f','x',*a)
@@ -30371,6 +30643,8 @@ print(json.dumps(dict(pw=pw)))
                                 (dict(fidele=True,links_as_dirs=True),'o2','--liens-en-dossiers : mode sûr seulement (sans --fidele)'),
                                 (dict(links_as_dirs=True),'o2.tgz','--liens-en-dossiers : sans objet vers un tar ou stdout'),
                                 (dict(by_name=True),'o2.tar','--par-nom : sans objet vers un tar ou stdout en mode sûr'),
+                                (dict(fidele=True,no_overwrite=True),'o2','--sans-ecraser : mode sûr seulement (sans --fidele)'),   # story 113
+                                (dict(no_overwrite=True),'o2.tar','--sans-ecraser : sans objet vers un tar ou stdout'),
                                 (dict(bid=''),'o2',"-b vide refusé : nom d'archive exact attendu")):
                 e=io.StringIO(); c='aucun'; kw=dict(kw); bid=kw.pop('bid','b')
                 with mock.patch.object(BorgHelperDB,'set_priority_lock',nolock),contextlib.redirect_stderr(e),contextlib.redirect_stdout(io.StringIO()):
@@ -30398,6 +30672,258 @@ print(json.dumps(dict(pw=pw)))
             if bad: print(f"  {bad}")
             return not bad
         check("Restore : options --fidele, --creux, --liens-en-dossiers, --par-nom (refus code 2 avant borg, bibliothèque comprise) ; commande CLI équivalente",_s114_opts)
+        # ── 1.0.221 (story 113) : Restore, existants remplacés et dits, --sans-ecraser, -W avec collisions de noms ──
+        def _s113_unit():
+            """Écrivain du mode sûr sur flux fabriqué : existant différent (contenu, droits seuls, date seule, lien retourné, dossier vide,
+            fichier à la place d'un dossier, second nom d'un lien physique) REMPLACÉ et noté (`replaced`, y compris un 0444), identique
+            (taille, date, droits ; lien : cible) laissé sans rien dire (même inode, même date en ns) ; relancé : plus rien ; no_overwrite :
+            existants gardés et notés, AUCUN os.open d'un existant, contenu et date intacts ; -W : `_flat_levels` (table), rangement sous le
+            dossier parent puis un niveau de plus, lien physique vers un nom rangé, collision non vérifiée -> le dernier gagne sans « existant »
+            (--sans-ecraser : le premier gardé) ; _FlatNames (exclusion */log/*, non normalisés) ; [WARN] : singulier, pluriel, 50 chemins
+            puis « … et N autres ».
+            Revue 2 : même chemin d'archive rendu deux fois (dossier et tar, `_tar_flat_clash`), lien physique d'un tar à plat (premier nom
+            écarté ; rangé), noms « ? » et non UTF-8 (forme listée, vrais octets), --sans-ecraser --liens-en-dossiers (lien présent gardé),
+            dossier seul gardé (code 1), -W relancé, date à la seconde (nanosecondes tronquées), propriétaire (fichier et lien) et numéros
+            d'un périphérique comparés, lien physique d'une autre taille remplacé, textes de `_restore_plan_warn`."""
+            d=os.path.join(tmp,'s113u'); res={}
+            ent=[('a','f',b'archive'),('b','f',b'archive'),('c','f',b'archive'),('l','l','cible'),('s','l','autre'),('p','p')]
+            r=os.path.join(d,'r1'); w,_=_s114_feed(r,[],ent)
+            res['première restauration : rien d\'existant']=(not w.replaced and not w.kept and w.same==0 and w.n_ok==6,len(w.replaced),w.same)
+            pa=os.path.join(r,'a'); pb=os.path.join(r,'b'); pc=os.path.join(r,'c'); pl=os.path.join(r,'l')
+            os.chmod(pa,0o644); open(pa,'w').write('autre contenu!'); os.chmod(pa,0o444); os.utime(pa,(1500000000,1500000000))   # a : taille et droits
+            os.utime(pc,(1500000123,1500000123))   # c : date seule
+            os.unlink(pl); os.symlink('ailleurs',pl)   # l : cible
+            st_b=os.stat(pb); os.chmod(pb,0o644)
+            os.utime(pb,(1500000000,1500000000))
+            w,_=_s114_feed(r,[],ent)
+            res['remplacés et dits']=(sorted(w.replaced.paths)==['a','c','l'] and not w.kept and w.same==3 and w.n_ok==6 and not w.skips
+                                      and open(pa).read()=='archive' and stat.S_IMODE(os.stat(pa).st_mode)==0o644
+                                      and int(os.stat(pc).st_mtime)==1500000000 and os.readlink(pl)=='cible',sorted(w.replaced.paths),w.same,_s114_skips(w))
+            ino_b=os.stat(pb).st_ino; ns_b=os.stat(pb).st_mtime_ns
+            w,_=_s114_feed(r,[],ent)
+            res['relancée : rien d\'avertissement, rien réécrit']=(not w.replaced and not w.kept and w.same==6 and os.stat(pb).st_ino==ino_b
+                                                              and os.stat(pb).st_mtime_ns==ns_b,len(w.replaced),w.same)
+            # --sans-ecraser : gardé, jamais ouvert (aucun os.open du nom `a`), contenu et date intacts
+            open(pa,'w').write('a garder'); os.utime(pa,(1400000000,1400000000)); os.unlink(pl); os.symlink('ailleurs',pl)
+            opened=[]
+            def spying(fn_name):   # revue 1 (G7) : AUCUN appel qui écrit (ouverture en écriture, renommage, droits, date, retrait…) quand tout existe
+                real=getattr(os,fn_name)
+                def spy(*a,**k):
+                    if fn_name!='open' or (len(a)>1 and isinstance(a[1],int) and a[1]&(os.O_ACCMODE|os.O_CREAT)): opened.append((fn_name,a[0] if a else None))
+                    return real(*a,**k)
+                return mock.patch(f'os.{fn_name}',spy)
+            with contextlib.ExitStack() as stk:
+                for fn_ in ('open','replace','rename','chmod','fchmod','utime','unlink','rmdir','symlink','link','mkfifo','chown','fchown'): stk.enter_context(spying(fn_))
+                w,_=_s114_feed(r,[],ent,no_overwrite=True)
+            res['--sans-ecraser']=(sorted(w.kept.paths)==['a','l'] and not w.replaced and w.same==4 and open(pa).read()=='a garder'
+                                   and int(os.stat(pa).st_mtime)==1400000000 and os.readlink(pl)=='ailleurs' and not opened,sorted(w.kept.paths),opened)
+            # revue 1 (G6) : taille SEULE et droits SEULS font aussi la différence (mutants : st_size ou S_IMODE retirés)
+            r6=os.path.join(d,'r6'); e6=[('s1','f',b'12345'),('m1','f',b'x')]; w,_=_s114_feed(r6,[],e6)
+            with open(os.path.join(r6,'s1'),'w') as f: f.write('abcdefg')
+            os.utime(os.path.join(r6,'s1'),(1500000000,1500000000)); os.chmod(os.path.join(r6,'m1'),0o600)
+            w,_=_s114_feed(r6,[],e6)
+            res['taille seule, droits seuls']=(sorted(w.replaced.paths)==['m1','s1'] and open(os.path.join(r6,'s1')).read()=='12345'
+                                              and stat.S_IMODE(os.stat(os.path.join(r6,'m1')).st_mode)==0o644 and w.same==0,sorted(w.replaced.paths))
+            # revue 1 (G7) : dossier présent sous --sans-ecraser : droits et date de l'archive jamais posés (la date change seulement par
+            # l'écriture de D/f), ses fichiers absents écrits ; dossier neuf : droits de l'archive
+            r7=os.path.join(d,'r7'); os.makedirs(os.path.join(r7,'D')); os.chmod(os.path.join(r7,'D'),0o700)
+            w,_=_s114_feed(r7,[],[('D','d'),('D/f','f',b'f')],no_overwrite=True); sd=os.stat(os.path.join(r7,'D'))
+            r7b=os.path.join(d,'r7b'); w2,_=_s114_feed(r7b,[],[('D','d')])
+            res['--sans-ecraser : dossier présent intact']=(stat.S_IMODE(sd.st_mode)==0o700 and int(sd.st_mtime)!=1500000000 and open(os.path.join(r7,'D','f')).read()=='f'
+                                                           and not w.kept_d and stat.S_IMODE(os.stat(os.path.join(r7b,'D')).st_mode)==0o750,oct(sd.st_mode),sd.st_mtime)
+            # revue 1 (row 5) : --liens-en-dossiers à la relance — lien identique déjà présent converti ; sans l'option : même étiquette
+            r8=os.path.join(d,'r8'); e8=[('x','l','real'),('x/f','f',b'f')]; w,_=_s114_feed(r8,[],e8)
+            w1,_=_s114_feed(r8,[],e8)
+            w2,_=_s114_feed(r8,[],e8,links_as_dirs=True)
+            res['relance : lien identique, --liens-en-dossiers']=(_s114_skips(w)=={_RZ_UNDER:['x/…']} and _s114_skips(w1)=={_RZ_UNDER:['x/…']}
+                                                                 and w2.converted==1 and not w2.skips and os.path.isdir(os.path.join(r8,'x')) and not os.path.islink(os.path.join(r8,'x'))
+                                                                 and open(os.path.join(r8,'x','f')).read()=='f',_s114_skips(w1),w2.converted,_s114_skips(w2))
+            # revue 1 (row 6) : en root, uid/gid différents = pas identique (is_root simulé, _owner de l'archive)
+            wr=_SafeWriter(d,[]); wr.is_root=True
+            ti_=_s114_tf.TarInfo('o'); ti_.size=1; ti_.mode=0o644; ti_.mtime=1500000000; ti_.uid=os.getuid(); ti_.gid=os.getgid()
+            ro_=os.path.join(d,'o'); open(ro_,'w').write('x'); os.chmod(ro_,0o644); os.utime(ro_,(1500000000,1500000000))
+            same_own=wr._same(os.lstat(ro_),ti_,wr.rootfd,'o'); ti_.uid=os.getuid()+1; diff_own=wr._same(os.lstat(ro_),ti_,wr.rootfd,'o'); wr.is_root=False
+            nonroot=wr._same(os.lstat(ro_),ti_,wr.rootfd,'o')
+            # revue 2 (G2-9) : même règle pour un lien symbolique (cible identique, propriétaire de l'archive différent)
+            rl_=os.path.join(d,'olk'); os.symlink('cible',rl_)
+            tl_=_s114_tf.TarInfo('olk'); tl_.type=_s114_tf.SYMTYPE; tl_.linkname='cible'; tl_.mode=0o777; tl_.mtime=1500000000; tl_.uid=os.getuid(); tl_.gid=os.getgid()
+            wr.is_root=True; l_same=wr._same(os.lstat(rl_),tl_,wr.rootfd,'olk'); tl_.uid=os.getuid()+1; l_diff=wr._same(os.lstat(rl_),tl_,wr.rootfd,'olk')
+            wr.is_root=False; l_nonroot=wr._same(os.lstat(rl_),tl_,wr.rootfd,'olk'); wr.close()
+            res['root : propriétaire comparé']=(same_own is True and diff_own is False and nonroot is True and l_same is True and l_diff is False and l_nonroot is True,
+                                               same_own,diff_own,nonroot,l_same,l_diff,l_nonroot)
+            # revue 2 (G2-9) : périphérique — numéros comparés (stat fabriqué : pas de /dev/null, dont la date peut bouger) ; type chr/blk
+            wd_=_SafeWriter(d,[]); wd_.is_root=False
+            def fst_(mode_,rdev_): return os.stat_result((mode_,1,1,1,os.getuid(),os.getgid(),0,0,0,0),{'st_rdev':rdev_,'st_mtime_ns':1500000000*10**9})
+            tc_=_s114_tf.TarInfo('dv'); tc_.type=_s114_tf.CHRTYPE; tc_.devmajor=1; tc_.devminor=3; tc_.mode=0o644; tc_.mtime=1500000000
+            dev_ok=wd_._same(fst_(stat.S_IFCHR|0o644,os.makedev(1,3)),tc_,wd_.rootfd,'dv')
+            dev_minor=wd_._same(fst_(stat.S_IFCHR|0o644,os.makedev(1,5)),tc_,wd_.rootfd,'dv')
+            dev_major=wd_._same(fst_(stat.S_IFCHR|0o644,os.makedev(2,3)),tc_,wd_.rootfd,'dv')
+            dev_blk=wd_._same(fst_(stat.S_IFBLK|0o644,os.makedev(1,3)),tc_,wd_.rootfd,'dv'); wd_.close()
+            res['périphérique : numéros comparés']=(dev_ok is True and dev_minor is False and dev_major is False and dev_blk is False,dev_ok,dev_minor,dev_major,dev_blk)
+            # revue 1 (row 6) : second nom de lien physique déjà là, fichier ordinaire identique non lié -> laissé (aussi --sans-ecraser)
+            r9=os.path.join(d,'r9'); w,_=_s114_feed(r9,[],[('h1','f',b'h'),('h2','f',b'h')])
+            w,_=_s114_feed(r9,[],[('h1','f',b'h'),('h2','h','h1')],no_overwrite=True)
+            res['lien physique identique non lié, --sans-ecraser']=(not w.kept and not w.replaced and os.stat(os.path.join(r9,'h2')).st_nlink==1 and w.n_ok==2,w.kept.paths)
+            # dossier vide à la place d'un fichier / fichier à la place d'un dossier / second nom d'un lien physique
+            r2=os.path.join(d,'r2'); os.makedirs(os.path.join(r2,'e')); open(os.path.join(r2,'dd'),'w').write('fichier'); open(os.path.join(r2,'h2'),'w').write('x')
+            ent2=[('e','f',b'e'),('dd','d'),('dd/in','f',b'in'),('h1','f',b'h'),('h2','h','h1')]
+            r2b=os.path.join(d,'r2b'); shutil.copytree(r2,r2b)
+            w,_=_s114_feed(r2,[],ent2)
+            res['dossier/fichier/lien physique remplacés']=(sorted(w.replaced.paths)==['dd','h2'] and w.replaced_d.paths==['e'] and open(os.path.join(r2,'e')).read()=='e'
+                                                           and open(os.path.join(r2,'dd','in')).read()=='in'
+                                                           and os.stat(os.path.join(r2,'h1')).st_ino==os.stat(os.path.join(r2,'h2')).st_ino and not w.skips,sorted(w.replaced.paths),_s114_skips(w))
+            w,_=_s114_feed(r2,[],ent2)
+            res['lien physique relancé : déjà ce lien']=(not w.replaced and not w.kept and not w.skips,len(w.replaced))
+            w,_=_s114_feed(r2b,[],ent2,no_overwrite=True)
+            res['--sans-ecraser : dossier, fichier, lien physique gardés']=(sorted(w.kept.paths)==['dd','h2'] and w.kept_d.paths==['e'] and os.path.isdir(os.path.join(r2b,'e'))
+                                                                        and open(os.path.join(r2b,'dd')).read()=='fichier' and open(os.path.join(r2b,'h2')).read()=='x'
+                                                                        and not w.replaced,sorted(w.kept.paths),_s114_skips(w))
+            # -W : table de _flat_levels, rangement, lien physique vers un nom rangé
+            T=lambda *ps: tuple(x.split('/') for x in ps)
+            fl=_flat_levels({'config':[('etc','a','config'),('etc','b','config')]})
+            res['_flat_levels : un niveau suffit']=(fl=={},fl)
+            fl=_flat_levels({'log':[('x','a','log'),('y','a','log')]})
+            res['_flat_levels : un niveau de plus']=(fl=={('x','a','log'):3,('y','a','log'):3},fl)
+            fl=_flat_levels({'f':[('p','a','f'),('q','a','f'),('f',)]})
+            res['_flat_levels : nom à la racine']=(fl=={('p','a','f'):3,('q','a','f'):3},fl)
+            fl=_flat_levels({'n':[('a','b','c','n'),('a','x','c','n'),('z','b','c','n')]})
+            res['_flat_levels : trois niveaux']=(fl=={('a','b','c','n'):4,('a','x','c','n'):3,('z','b','c','n'):4},fl)
+            names=_FlatNames()
+            for p in ('etc/a/config','etc/b/config','etc/c/other','p/log/f','q/log/f','log/top','/abs','a/../b','x/a/log','y/a/log'): names.add(p)
+            res['_FlatNames']=(sorted(names.many)==['config','log'] and 'f' not in names.first and 'f' not in names.many and 'top' in names.first
+                               and 'b' not in names.first and names.levels()=={('x','a','log'):3,('y','a','log'):3},sorted(names.many),sorted(names.first))
+            res['_FlatNames sans collision']=(_FlatNames().levels() is None,)
+            p1=os.path.join(d,'plat'); fe=[('etc/a/config','f',b'1'),('etc/b/config','f',b'2'),('etc/c/other','f',b'3'),('x/a/log','f',b'4'),('y/a/log','f',b'5'),
+                                           ('top','f',b'6'),('etc/c/h','h','etc/c/other'),('etc/a/ln','l','config')]
+            nm=_FlatNames()
+            for e in fe: nm.add(e[0])
+            w,_=_s114_feed(p1,[],fe,flat=True,deep=nm.levels())
+            got=sorted(os.path.relpath(os.path.join(a,b),p1) for a,_ds,fs in os.walk(p1) for b in fs)
+            res['-W avec collisions : sous le dossier parent']=(got==['a/config','a/ln','b/config','c/h','c/other','top','x/a/log','y/a/log']
+                                                              and open(os.path.join(p1,'a/config')).read()=='1' and open(os.path.join(p1,'b/config')).read()=='2'
+                                                              and open(os.path.join(p1,'x/a/log')).read()=='4' and open(os.path.join(p1,'y/a/log')).read()=='5'
+                                                              and os.stat(os.path.join(p1,'c/h')).st_ino==os.stat(os.path.join(p1,'c/other')).st_ino
+                                                              and os.readlink(os.path.join(p1,'a/ln'))=='config' and not w.skips and not w.replaced,got,_s114_skips(w))
+            nm=_FlatNames()
+            for e in [('p/a/f',),('q/a/f',),('p/a/g',)]: nm.add(e[0])
+            p2=os.path.join(d,'plat2')
+            w,_=_s114_feed(p2,[],[('p/a/f','f',b'1'),('q/a/f','f',b'2'),('p/a/g','h','p/a/f')],flat=True,deep=nm.levels())
+            res['-W : lien physique vers un nom rangé plus haut']=(open(os.path.join(p2,'p/a/f')).read()=='1' and open(os.path.join(p2,'q/a/f')).read()=='2'
+                                                                  and os.stat(os.path.join(p2,'a/g')).st_ino==os.stat(os.path.join(p2,'p/a/f')).st_ino and not w.skips,w.broken,_s114_skips(w))
+            # collision NON prévue par la liste (deep None, liste vérifiée) : le doublon n'est PAS écrit, dit, code 1 (revue 1, row 1) ;
+            # liste indisponible dite (last_wins) : le dernier gagne sans « existant » ; --sans-ecraser : le premier gardé, doublon non écrit
+            fl_=[('a/n','f',b'1'),('b/n','f',b'2')]
+            p3=os.path.join(d,'plat3'); w,_=_s114_feed(p3,[],fl_,flat=True,last_wins=True)
+            p4=os.path.join(d,'plat4'); w4,_=_s114_feed(p4,[],fl_,flat=True,no_overwrite=True,last_wins=True)
+            p3b=os.path.join(d,'plat3b'); w3b,_=_s114_feed(p3b,[],fl_,flat=True)
+            res['-W : collision imprévue, doublon non écrit']=(open(os.path.join(p3b,'n')).read()=='1' and w3b.clash.paths==['b/n'] and not w3b.replaced
+                                                              and not w3b.kept and w3b.exit1() and w3b.n_ok==1,w3b.clash.paths)
+            res['-W liste indisponible : dernier gagne ; --sans-ecraser : premier gardé']=(open(os.path.join(p3,'n')).read()=='2' and not w.replaced and not w.kept and not w.clash and not w.exit1()
+                                                                                      and open(os.path.join(p4,'n')).read()=='1' and w4.clash.paths==['b/n'] and not w4.kept and w4.exit1(),
+                                                                                      w.replaced.paths,w4.clash.paths)
+            # un vrai existant à plat est remplacé et dit sous son chemin de destination
+            p5=os.path.join(d,'plat5'); os.makedirs(os.path.join(p5,'a')); open(os.path.join(p5,'a','config'),'w').write('ancien')
+            w,_=_s114_feed(p5,[],fe[:2],flat=True,deep=_flat_levels({'config':[('etc','a','config'),('etc','b','config')]}))
+            res['-W : existant remplacé, chemin de destination']=(w.replaced.paths==['a/config'] and open(os.path.join(p5,'a','config')).read()=='1',w.replaced.paths)
+            # ── revue 2 (rows 13, 14, 16, 17 ; G2-5 à G2-10) ──
+            # row 14 : MÊME chemin d'archive rendu deux fois (racines BORG_ROOTBKP imbriquées) : pas une collision — le dernier remplace
+            # sans rien dire ; --sans-ecraser : le premier gardé, sans rien dire non plus
+            p14=os.path.join(d,'plat14'); w14,_=_s114_feed(p14,[],[('x/y/f','f',b'1'),('x/y/f','f',b'2')],flat=True)
+            p14b=os.path.join(d,'plat14b'); w14b,_=_s114_feed(p14b,[],[('x/y/f','f',b'1'),('x/y/f','f',b'2')],flat=True,no_overwrite=True)
+            res['-W : même chemin d\'archive rendu deux fois']=(open(os.path.join(p14,'f')).read()=='2' and not w14.clash and not w14.replaced and not w14.kept and not w14.exit1()
+                                                               and open(os.path.join(p14b,'f')).read()=='1' and not w14b.clash and not w14b.kept and not w14b.exit1(),
+                                                               w14.clash.paths,w14b.clash.paths)
+            # sortie tar à plat : `_tar_flat_clash` (le même appel que le consommateur de _restore_safe_tar) sur un flux fabriqué
+            def tflat(entries,pmode=None,deep=None):
+                emitted={}; out=[]; cl=[]
+                src_=_s114_tf.open(fileobj=io.BytesIO(_s114_tar(entries)),mode='r|')
+                for ti in src_:
+                    nm_=ti.name; ln_=ti.linkname if ti.islnk() else None; t_=_restore_tar_entry(ti,True,deep)
+                    g_=_tar_flat_clash(emitted,nm_,ln_,t_,pmode) if (t_ is not None and not t_.isdir()) else False
+                    if g_:
+                        if g_ is True: cl.append(nm_)
+                        continue
+                    out.append((t_.name,t_.linkname if t_.islnk() else None))
+                return out,cl
+            # row 13 : lien physique dont le premier nom a été écarté (homonyme déjà émis) : non émis et dit, jamais lié à l'homonyme
+            r13a=tflat([('a/n','f',b'1'),('b/n','f',b'2'),('b/h','h','b/n')])
+            r13b=tflat([('a/n','f',b'1'),('b/n','f',b'2'),('b/h','h','b/n')],pmode='liste')   # liste indisponible : le dernier gagne, h lié au bon n
+            r13c=tflat([('a/n','f',b'1'),('b/n','f',b'2'),('a/h','h','a/n')],pmode='liste')   # ... mais h vers le premier n : lié à un autre fichier -> dit
+            res['tar à plat : lien physique d\'un nom écarté']=(r13a==([('n',None)],['b/n','b/h']) and r13b==([('n',None),('n',None),('h','n')],[])
+                                                               and r13c==([('n',None),('n',None)],['a/h']),r13a,r13b,r13c)
+            r14a=tflat([('x/y/f','f',b'1'),('x/y/f','f',b'1')]); r14c=tflat([('x/y/f','f',b'1'),('x/y/f','h','x/y/f')]); r14d=tflat([('x/y/f','f',b'1'),('x/z/f','f',b'2')])
+            res['tar à plat : même chemin d\'archive rendu deux fois']=(r14a==([('f',None),('f',None)],[]) and r14c==([('f',None)],[]) and r14d==([('f',None)],['x/z/f']),r14a,r14c,r14d)
+            # G2-5 : lien physique d'un tar rangé : nom ET cible sous leur dossier parent
+            th_=_s114_tf.TarInfo('etc/c/h'); th_.type=_s114_tf.LNKTYPE; th_.linkname='etc/c/other'
+            th_=_restore_tar_entry(th_,True,{})
+            nmh=_FlatNames()
+            for e in fe: nmh.add(e[0])
+            r5t=tflat(fe,deep=nmh.levels())
+            res['tar à plat : lien physique rangé']=(th_ is not None and (th_.name,th_.linkname)==('c/h','c/other')
+                                                    and r5t==([('a/config',None),('b/config',None),('c/other',None),('x/a/log',None),('y/a/log',None),('top',None),('c/h','c/other'),('a/ln',None)],[]),
+                                                    th_ and (th_.name,th_.linkname),r5t)
+            # row 16 : « ? » légitime (page?id=1) et octets non UTF-8 (forme listée « ? » de borg list) — comparaison sur la MÊME forme, destination aux vrais octets
+            nq=_FlatNames()
+            for p_ in ('etc/a/config','etc/b/config','etc/c/page?id=1'): nq.add(p_)
+            lq=nq.levels()
+            nu=_FlatNames()
+            for p_ in ('x/a?/log','y/a?/log','v1?/n','v2?/n'): nu.add(p_)
+            lu=nu.levels(); pn=os.path.join(d,'plat16'); ent16=[('x/a\udce9/log','f',b'1'),('y/a\udce8/log','f',b'2'),('v1\udce9/n','f',b'3'),('v2\udce9/n','f',b'4')]
+            w16,_=_s114_feed(pn,[],ent16,flat=True,deep=lu); pbn=os.fsencode(pn)
+            got16=sorted(os.path.relpath(os.path.join(a_,b_),pbn) for a_,_ds,fs_ in os.walk(pbn) for b_ in fs_)
+            res['noms « ? » et non UTF-8 : forme listée']=(lq=={} and _flat_rel(('etc','c','page?id=1'),lq)==['c','page?id=1']
+                                                          and lu=={('x','a?','log'):3,('y','a?','log'):3} and _flat_rel(('x','a\udce9','log'),lu)==['x','a\udce9','log']
+                                                          and got16==[b'v1\xe9/n',b'v2\xe9/n',b'x/a\xe9/log',b'y/a\xe8/log'] and not w16.clash and not w16.skips,lq,lu,got16)
+            # row 17 : --sans-ecraser --liens-en-dossiers : un lien présent identique n'est jamais converti en dossier (ligne Never)
+            r8b=os.path.join(d,'r8b'); w,_=_s114_feed(r8b,[],e8)
+            w3,_=_s114_feed(r8b,[],e8,no_overwrite=True,links_as_dirs=True)
+            res['relance : lien identique, --sans-ecraser --liens-en-dossiers']=(os.path.islink(os.path.join(r8b,'x')) and os.readlink(os.path.join(r8b,'x'))=='real' and w3.converted==0
+                                                                                and w3.same==1 and _s114_skips(w3)=={_RZ_LINK:['x/…']} and not os.path.exists(os.path.join(r8b,'real')),
+                                                                                w3.converted,_s114_skips(w3))
+            # G2-8 : un dossier présent à la place d'un fichier, SEUL, gardé : code 1 (exit1) — rien d'autre ne le fait finir en 1
+            r16=os.path.join(d,'r16'); os.makedirs(os.path.join(r16,'e'))
+            w,_=_s114_feed(r16,[],[('e','f',b'e')],no_overwrite=True)
+            res['--sans-ecraser : dossier seul gardé']=(w.kept_d.paths==['e'] and not w.kept and not w.replaced and not w.skips and not w.broken and not w.clash and w.exit1()
+                                                       and os.path.isdir(os.path.join(r16,'e')),w.kept_d.paths,w.exit1())
+            # G2-6 : -W relancé sur la restauration précédente (p1, fe) : tout identique, lien physique déjà lié, rien dit
+            w,_=_s114_feed(p1,[],fe,flat=True,deep=_flat_levels(nmh.many))
+            res['-W relancé']=(w.n_ok==8 and w.same==7 and not w.replaced and not w.broken and not w.clash and not w.skips and not w.exit1(),w.n_ok,w.same,w.broken,w.clash.paths)
+            # G2-7 : date « à la seconde, comme tar » — l'existant d'origine a des nanosecondes (troncature, jamais l'arrondi)
+            r20=os.path.join(d,'r20'); w,_=_s114_feed(r20,[],[('t','f',b'1')]); pt=os.path.join(r20,'t')
+            os.utime(pt,ns=(1500000000*10**9+900000000,)*2); s20=os.stat(pt)
+            w,_=_s114_feed(r20,[],[('t','f',b'1')])
+            res['date à la seconde (ns tronquées)']=(w.same==1 and not w.replaced and os.stat(pt).st_ino==s20.st_ino and os.stat(pt).st_mtime_ns==s20.st_mtime_ns,w.same,w.replaced.paths)
+            # G2-10 : second nom d'un lien physique de MÊME date et mêmes droits mais d'une autre taille : remplacé et lié (jamais pris pour identique)
+            r23=os.path.join(d,'r23'); os.makedirs(r23)
+            for n_,c_ in (('h1','hh'),('h2','xyz')):
+                open(os.path.join(r23,n_),'w').write(c_); os.chmod(os.path.join(r23,n_),0o644); os.utime(os.path.join(r23,n_),(1500000000,1500000000))
+            w,_=_s114_feed(r23,[],[('h1','f',b'hh'),('h2','h','h1')])
+            res['lien physique : autre taille remplacée']=(w.replaced.paths==['h2'] and open(os.path.join(r23,'h2')).read()=='hh'
+                                                          and os.stat(os.path.join(r23,'h1')).st_ino==os.stat(os.path.join(r23,'h2')).st_ino and w.same==1,w.replaced.paths,w.same)
+            # [WARN] : singulier, pluriel, bornes
+            def said(fn):
+                e=io.StringIO()
+                with contextlib.redirect_stderr(e): fn()
+                return [l.split('  [borgHelper')[0] for l in e.getvalue().splitlines()]
+            one=_PathLog(); one.add('a')
+            two=_PathLog(); two.add('x\ny'); two.add('b')
+            big=_PathLog()
+            for i in range(53): big.add(f"f{i}")
+            res['[WARN] collision imprévue, dossier']=(said(w3b.report)==['[WARN] collision de noms imprévue : 1 fichier non écrit','  b/n']
+                                                      and said(lambda: _restore_plan_warn(None,'liste'))==['[WARN] collisions non vérifiables : le dernier de même nom gagne']
+                                                      and said(lambda: _restore_plan_warn({},'liste',True))==['[WARN] collisions de noms : fichiers rangés sous leur dossier parent',
+                                                                                                                   '[WARN] collisions non vérifiables : le premier de même nom est gardé']
+                                                      and said(lambda: _restore_plan_warn({},None))==['[WARN] collisions de noms : fichiers rangés sous leur dossier parent']
+                                                      and said(lambda: _PathLog().report('remplacé',noun='dossier'))==[]
+                                                      and said(lambda: (lambda l: (l.add('d'),l.report('gardé',noun='dossier')))(_PathLog()))==['[WARN] 1 dossier existant gardé','  d'],said(w3b.report))
+            res['[WARN] singulier']=(said(lambda: one.report('remplacé'))==['[WARN] 1 fichier existant remplacé','  a'],)
+            res['[WARN] pluriel, caractères de contrôle échappés']=(said(lambda: two.report('gardé'))==['[WARN] 2 fichiers existants gardés','  x\\x0ay','  b'],)
+            lines=said(lambda: big.report('remplacé'))
+            res['[WARN] bornés à 50']=(lines[0]=='[WARN] 53 fichiers existants remplacés' and len(lines)==52 and lines[-1]=='  … et 3 autres' and lines[1]=='  f0',lines[:2],lines[-2:])
+            bad={k:v for k,v in res.items() if not v[0]}
+            if bad: print(f"  {bad}")
+            return not bad
+        check("Restore mode sûr : existants différents remplacés et dits, identiques laissés, --sans-ecraser, -W avec collisions de noms (rangement sous le dossier parent)",_s113_unit)
         def _s114_flux():
             """Revue 1 (rows 3, 4, 13, 14 ; M13) — de bout en bout, borg factice (_bf_env) : disque plein (ENOSPC simulé sur le 2e
             fichier) -> SystemExit 2, « [ERREUR] flux interrompu après « a » : 1 élément restauré (fichiers finis gardés) — … », a
@@ -30684,6 +31210,21 @@ print(json.dumps(dict(pw=pw)))
                 with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,_h=h,**k: hz(_h)): c,o=lib(h)
                 res['lien physique rompu : noms piégés']=(c==1 and '[WARN] lien physique rompu : ok2/h\\x1b2 écrit comme fichier indépendant (premier nom cache/h\\x0a1 non restauré)' in o
                                                           and '\x1b' not in o and 'h\n1' not in o,c,o[-300:])
+            with sec('lien physique rompu : second nom identique'):
+                # story 113 (revue 2, row 24) : seconde lecture — le second nom est déjà là, identique : laissé, le [WARN] ne dit pas « écrit »
+                mode('tarhard2'); h=os.path.join(d,'h5d'); os.makedirs(os.path.join(h,'ok2')); p_=os.path.join(h,'ok2','h2')
+                with open(p_,'w') as f_: f_.write('H2')
+                os.chmod(p_,0o644); os.utime(p_,(0,0))   # le borg factice rend le second nom de la seconde lecture avec la date 0 (TarInfo sans mtime)
+                with mock.patch.object(BorgHelper,'_restore_zones',lambda self,nick=None,_h=h,**k: hz(_h)): c,o=lib(h)
+                res['lien physique rompu : second nom identique']=(c==1 and '[WARN] lien physique rompu : ok2/h2 laissé (déjà identique, non lié) — premier nom cache/h1 non restauré' in o
+                                                                  and 'écrit comme fichier indépendant' not in o and open(p_).read()=='H2',c,o[-300:])
+            with sec('avis du mode fidèle sous --sans-ecraser'):
+                # story 113 (revue 2, row 25) : la commande --fidele proposée écrase les existants — dit sous --sans-ecraser, pas sans
+                mode('tar2'); oa=os.path.join(d,'o25a'); ob=os.path.join(d,'o25b')
+                ca,_,ea=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',oa,'--sans-ecraser')
+                cb,_,eb=cli('-c','Restore','-n','zw','-b','b','-f','x','-w',ob)
+                res['avis du mode fidèle sous --sans-ecraser']=(ca==0 and cb==0 and any(l.startswith('  mode fidèle (aucune protection des bases, du dépôt et du rc ; écrase les existants) : ') and l.endswith('--fidele') for l in ea.splitlines())
+                                                               and 'écrase les existants' not in eb and any(l.startswith(_RESTORE_FIDELE_CMD) for l in eb.splitlines()),ca,cb,ea[-300:],eb[-300:])
             with sec('rien restauré : parents retirés'):
                 mode('tarsub'); e3=os.path.join(d,'e3')
                 c,o=lib(e3,err=_errno.EFBIG,data=b'f')
@@ -35351,6 +35892,216 @@ print(json.dumps(dict(pw=pw)))
             for x in fails: print(f"  {x}")
             return not fails
         _rbc("Restore mode sûr sur vrai borg : = --fidele (sauf xattr/ACL), seul export-tar lancé, zones, racines imbriquées, flux coupé, tar",_s114_real)
+        def _s113_real():
+            """1.0.221 (story 113) : Restore sur vrai borg (dépôt neuf, archives par borg create) — existant différent (même 0444) remplacé
+            et dit (code 0) ; relancé : aucun [WARN], rien réécrit (même inode, même date) ; --sans-ecraser : gardé et dit, code 1 ;
+            -W avec collisions (etc/a/config, etc/b/config, etc/c/other ; glob ?/a/log) : chaque fichier sous son dossier parent, un niveau
+            de plus au besoin, [WARN], code 0, aussi vers un tgz ; noms en collision seulement sous */log/* (exclus de la sélection) : aucun
+            avertissement ; -W sans collision = --fidele ; liste de la sélection : snapshot (nick indexé, chemin exact : aucun borg list),
+            borg list (joker, nick non indexé, IDX_EXCLUDE) ; liste indisponible : [WARN] collisions non vérifiables, le dernier gagne,
+            code 1 ; --fidele : existants remplacés sans rien dire, collisions : le dernier gagne.
+            Revue 2 : snapshot sur base CHIFFRÉE (nick ixe), snapshot sans ligne pour la sélection, snapshot périmé (dossier et tgz : doublon
+            non écrit, « collision de noms imprévue », code 1), noms non UTF-8 et « ? » légitime (rangés, code 0, vrais octets), export en
+            échec (aucun [WARN] de collisions) ; les échecs sont affichés en un dict { libellé : détail } (comme _s113_unit)."""
+            import tarfile as tfm
+            d=os.path.join(tmp,'s113real'); src=os.path.join(d,'src'); bb=os.path.join(d,'bb'); repo=os.path.join(d,'repo')
+            log=os.path.join(d,'borg.log'); w=os.path.join(d,'borgw'); wnl=os.path.join(d,'borgw-nolist')
+            os.makedirs(src)
+            def put(p,data,mode=0o644,mt=1500000000):
+                os.makedirs(os.path.dirname(os.path.join(src,p)),exist_ok=True)
+                with open(os.path.join(src,p),'w') as f: f.write(data)
+                os.chmod(os.path.join(src,p),mode); os.utime(os.path.join(src,p),(mt,mt))
+            put('etc/a/config','cfg a\n'); put('etc/b/config','cfg b\n'); put('etc/c/other','autre\n'); put('x/a/log','log x\n'); put('y/a/log','log y\n')
+            put('d/a','contenu a\n'); put('d/sub/b','b\n'); put('lg/p/log/f','f p\n'); put('lg/q/log/f','f q\n'); put('lg/u','u\n')
+            env=_rb_env(bb,BORG_PASSPHRASE='pw-s113'); borg=shutil.which('borg')
+            for cmd in (['init','-e','repokey',repo],['create',repo+'::arch1','.'],['create',repo+'::arch2','.']):
+                r=subprocess.run([borg]+cmd,env=env,cwd=src,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+                if r.returncode!=0: print(f"  borg {cmd[0]} : {r.stderr[-200:]}"); return False
+            _rb_wrapper(w,bb,f"echo \"$*\" >> {shlex.quote(log)}\n")
+            _rb_wrapper(wnl,bb,f"echo \"$*\" >> {shlex.quote(log)}\nif [ \"$1\" = list ]; then echo 'liste en panne' >&2; exit 2; fi\n")
+            wnx=os.path.join(d,'borgw-noexport')   # revue 2 (G2-11) : la liste passe, l'export échoue (code 2)
+            _rb_wrapper(wnx,bb,f"echo \"$*\" >> {shlex.quote(log)}\nif [ \"$1\" = export-tar ]; then echo 'export en panne' >&2; exit 2; fi\n")
+            rc=os.path.join(d,'rc')
+            base=f"BORG_REPO={repo}\nBORG_PASSPHRASE=pw-s113\nBORG_RELOCATED_REPO_ACCESS_IS_OK=yes\n"
+            with open(rc,'w') as f:
+                f.write(f"[DEFAULT]\nCACHE_DIR={os.path.join(d,'cache')}\nDB_ENCRYPT=false\nSTORAGE_ALERT=off\n\n[s]\n{base}BORG_EXE={w}\n\n"
+                        f"[ix]\nEXTERNAL=true\n{base}BORG_EXE={w}\n\n[ixf]\nEXTERNAL=true\n{base}BORG_EXE={w}\nIDX_EXCLUDE=zz-aucun-chemin\n\n"
+                        f"[ixe]\nEXTERNAL=true\n{base}BORG_EXE={w}\nDB_ENCRYPT=true\nDB_KDF=light\n\n"   # revue 2 (G2-2) : base CHIFFRÉE (le défaut de borgHelper)
+                        f"[nolist]\n{base}BORG_EXE={wnl}\n\n[noexp]\n{base}BORG_EXE={wnx}\n")
+            os.chmod(rc,0o600)
+            me=os.path.realpath(__file__); cenv=_rb_cli_env(bb); fails={}   # revue 2 (G2-1) : dict affiché d'un bloc (forme lue par mutrun_lib._verdict_vise)
+            def bad(label,detail): fails[label]=detail
+            def cli(nick,*a):
+                try: os.unlink(log)
+                except OSError: pass
+                p=_rb_run([me,'-C',rc,'-c','Restore','-n',nick,'-b','arch2',*a],300,env=cenv)
+                try: lg=[l.split()[0]+(' pp' if ' pp:' in l else '') for l in open(log).read().splitlines() if l]
+                except OSError: lg=[]
+                return p.returncode,p.stdout,p.stderr,lg
+            for nk in ('ix','ixf','ixe'):
+                p=_rb_run([me,'-C',rc,'-c','Index','-n',nk],300,env=cenv)
+                if p.returncode not in (0,1): print(f"  Index {nk} : {p.returncode} {(p.stdout+p.stderr)[-300:]!r}"); return False
+            warn=lambda e,t: any(l.startswith(f"[WARN] {t}") for l in e.splitlines())
+            nowarn=lambda e: '[WARN]' not in e
+            COLL='collisions de noms : fichiers rangés sous leur dossier parent'
+            o=os.path.join(d,'out')
+            rd=lambda p: open(p).read()
+            # AC1-AC3 : existant différent remplacé (0444), relancé, --sans-ecraser
+            r1=os.path.join(o,'r1'); os.makedirs(os.path.join(r1,'d')); pa=os.path.join(r1,'d','a')
+            with open(pa,'w') as f: f.write('ancien')
+            os.chmod(pa,0o444)
+            c,so,e,lg=cli('s','-f','d','-w',r1)
+            if not (c==0 and rd(pa)=='contenu a\n' and stat.S_IMODE(os.stat(pa).st_mode)==0o644 and int(os.stat(pa).st_mtime)==1500000000
+                    and warn(e,'1 fichier existant remplacé') and '  d/a' in e.splitlines() and e.count('[WARN]')==1):
+                bad("remplacé",f"code {c} {e[-300:]!r}")
+            s0=os.stat(pa)
+            c,so,e,lg=cli('s','-f','d','-w',r1)
+            s1=os.stat(pa)
+            if not (c==0 and nowarn(e) and (s0.st_ino,s0.st_mtime_ns)==(s1.st_ino,s1.st_mtime_ns) and 'Restauré dans' in so and 'identique' not in so):
+                bad("relancé",f"code {c} {e[-300:]!r} {so[-200:]!r} {(s0.st_ino,s0.st_mtime_ns)} {(s1.st_ino,s1.st_mtime_ns)}")
+            with open(pa,'w') as f: f.write('ancien 2')
+            os.unlink(os.path.join(r1,'d','sub','b'))   # revue 2 (G2-15) : absent AVANT la commande — restauré par elle, existants gardés
+            c,so,e,lg=cli('s','-f','d','-w',r1,'--sans-ecraser')
+            if not (c==1 and rd(pa)=='ancien 2' and warn(e,'1 fichier existant gardé') and '  d/a' in e.splitlines() and e.count('[WARN]')==1
+                    and rd(os.path.join(r1,'d','sub','b'))=='b\n'):
+                bad("--sans-ecraser",f"code {c} {rd(pa)!r} {e[-300:]!r}")
+            # AC4 : -W avec collisions ; liste par borg list (nick non indexé)
+            r2=os.path.join(o,'r2'); c,so,e,lg=cli('s','-f','etc','-W',r2)
+            if not (c==0 and sorted(os.listdir(r2))==['a','b','c'] and rd(os.path.join(r2,'a','config'))=='cfg a\n' and rd(os.path.join(r2,'b','config'))=='cfg b\n'
+                    and rd(os.path.join(r2,'c','other'))=='autre\n' and warn(e,COLL) and e.count('[WARN]')==1 and lg==['list','export-tar']):
+                bad("-W collisions",f"code {c} {sorted(os.listdir(r2)) if os.path.isdir(r2) else None} {lg} {e[-300:]!r}")
+            r3=os.path.join(o,'r3'); c,so,e,lg=cli('s','-f','?/a/log','-W',r3)
+            if not (c==0 and sorted(os.listdir(r3))==['x','y'] and rd(os.path.join(r3,'x','a','log'))=='log x\n' and rd(os.path.join(r3,'y','a','log'))=='log y\n'
+                    and warn(e,COLL)):
+                bad("-W un niveau de plus",f"code {c} {e[-300:]!r}")
+            r4=os.path.join(o,'r4'); c,so,e,lg=cli('s','-f','lg','-W',r4)
+            if not (c==0 and os.listdir(r4)==['u'] and nowarn(e)):
+                bad("-W : noms sous */log/* exclus, aucune collision",f"code {c} {os.listdir(r4) if os.path.isdir(r4) else None} {e[-300:]!r}")
+            # -W sans collision : comme --fidele
+            r5,r5f=os.path.join(o,'r5'),os.path.join(o,'r5f')
+            c,so,e,lg=cli('s','-f','d','-W',r5); c2,_,e2,lg2=cli('s','-f','d','-W',r5f,'--fidele')
+            if not (c==0 and c2==0 and sorted(os.listdir(r5))==sorted(os.listdir(r5f))==['a','b'] and rd(os.path.join(r5,'a'))==rd(os.path.join(r5f,'a'))
+                    and nowarn(e) and lg==['list','export-tar'] and lg2==['extract']):
+                bad("-W sans collision",f"codes {c}/{c2} {os.listdir(r5)} {lg} {lg2} {e[-200:]!r}")
+            # liste de la sélection : snapshot (nick indexé, chemin exact), sinon borg list (joker, IDX_EXCLUDE)
+            r6=os.path.join(o,'r6'); c,so,e,lg=cli('ix','-f','etc','-W',r6)
+            if not (c==0 and sorted(os.listdir(r6))==['a','b','c'] and warn(e,COLL) and lg==['export-tar'] and e.count('[WARN]')==1 and '[ERREUR]' not in e):   # G2-12 : sonde muette
+                bad("snapshot",f"code {c} {lg} {e[-300:]!r}")
+            # revue 2 (G2-2) : snapshot lu sur une base CHIFFRÉE (le défaut) — noms décodés, aucun borg list, sonde muette
+            rxe=os.path.join(o,'r6e'); c,so,e,lg=cli('ixe','-f','etc','-W',rxe)
+            if not (c==0 and sorted(os.listdir(rxe))==['a','b','c'] and warn(e,COLL) and lg==['export-tar'] and e.count('[WARN]')==1 and '[ERREUR]' not in e):
+                bad("snapshot sur base chiffrée",f"code {c} {lg} {sorted(os.listdir(rxe)) if os.path.isdir(rxe) else None} {e[-300:]!r}")
+            r7=os.path.join(o,'r7'); c,so,e,lg=cli('ix','-f','?/a/log','-W',r7)
+            r8=os.path.join(o,'r8'); c2,so2,e2,lg2=cli('ixf','-f','etc','-W',r8)
+            if not (c==0 and lg==['list','export-tar'] and warn(e,COLL) and c2==0 and lg2==['list','export-tar'] and sorted(os.listdir(r8))==['a','b','c']):
+                bad("borg list (joker, IDX_EXCLUDE)",f"{c}/{c2} {lg} {lg2} {e[-200:]!r}")
+            # liste indisponible : collisions non vérifiables, le dernier gagne, code 1 (dossier et tgz)
+            r9=os.path.join(o,'r9'); c,so,e,lg=cli('nolist','-f','etc','-W',r9)
+            if not (c==1 and sorted(os.listdir(r9))==['config','other'] and rd(os.path.join(r9,'config')) in ('cfg a\n','cfg b\n')   # le dernier du flux (ordre de borg create)
+                    and warn(e,'collisions non vérifiables : le dernier de même nom gagne') and lg==['list','export-tar'] and 'non écrit' not in e):   # G2-3 : dernier gagne, jamais « non écrit »
+                bad("liste indisponible",f"code {c} {os.listdir(r9) if os.path.isdir(r9) else None} {lg} {e[-300:]!r}")
+            c,so,e,lg=cli('nolist','-f','etc','-W',os.path.join(o,'nl.tgz'))
+            with tfm.open(os.path.join(o,'nl.tgz')) as x: nlm=sorted(m.name for m in x.getmembers())   # G2-15 : les deux `config` (le dernier gagne à l'extraction)
+            if not (c==1 and warn(e,'collisions non vérifiables : le dernier de même nom gagne') and nlm==['config','config','other'] and 'non écrit' not in e):
+                bad("liste indisponible, tgz",f"code {c} {nlm} {e[-200:]!r}")
+            # tgz avec collisions : noms rangés
+            tg=os.path.join(o,'r10.tgz'); c,so,e,lg=cli('s','-f','etc','-W',tg)
+            with tfm.open(tg) as x: names=sorted(m.name for m in x.getmembers())
+            if not (c==0 and names==['a/config','b/config','c/other'] and warn(e,COLL)): bad("tgz collisions",f"code {c} {names} {e[-200:]!r}")
+            # revue 1 (row 2) : -f non canonique (./etc, etc/../etc) sur nick indexé -> snapshot REFUSÉ (borg list), collisions rangées
+            for k_,f_ in enumerate(('./etc','etc/../etc','re:^etc/')):
+                rr=os.path.join(o,f'r6n{k_}'); c,so,e,lg=cli('ix','-f',f_,'-W',rr)
+                if not (c==0 and sorted(os.listdir(rr))==['a','b','c'] and warn(e,COLL) and 'list' in lg and (f_.startswith('re:') or lg==['list','export-tar'])):
+                    bad(f"-f {f_} sur nick indexé",f"code {c} {lg} {sorted(os.listdir(rr)) if os.path.isdir(rr) else None} {e[-300:]!r}")
+            # revue 1 (row 1) : snapshot PÉRIMÉ (archive supprimée puis recréée sous le même nom) -> collision imprévue : doublon NON écrit, dit, code 1
+            s3=os.path.join(d,'s3src'); os.makedirs(os.path.join(s3,'etc','a'))
+            with open(os.path.join(s3,'etc','a','config'),'w') as f: f.write('cfg a\n')
+            r=subprocess.run([borg,'create',repo+'::arch3','.'],env=env,cwd=s3,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            p=_rb_run([me,'-C',rc,'-c','Index','-n','ix'],300,env=cenv)
+            r2=subprocess.run([borg,'delete',repo+'::arch3'],env=env,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            r3=subprocess.run([borg,'create',repo+'::arch3','.'],env=env,cwd=src,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            if r.returncode or p.returncode not in (0,1) or r2.returncode or r3.returncode: bad("préparation arch3",f"{r.returncode} {p.returncode} {r2.returncode} {r3.returncode}")
+            CLASH='collision de noms imprévue : 1 fichier non écrit'   # revue 2 (row 15) : texte décidé
+            rs=os.path.join(o,'rs'); c,so,e,lg=cli('ix','-f','etc','-W',rs,'-b','arch3')
+            nw='etc/b/config' if '  etc/b/config' in e.splitlines() else 'etc/a/config'   # le second du flux (ordre de borg create) n'est pas écrit
+            if not (c==1 and lg==['export-tar'] and os.listdir(rs).count('config')==1 and rd(os.path.join(rs,'config'))==('cfg a\n' if nw=='etc/b/config' else 'cfg b\n')
+                    and 'a' not in os.listdir(rs) and warn(e,CLASH) and e.count('[WARN]')==1 and f'  {nw}' in e.splitlines() and not warn(e,COLL)):
+                bad("snapshot périmé",f"code {c} {lg} {os.listdir(rs) if os.path.isdir(rs) else None} {e[-300:]!r}")
+            # revue 2 (G2-4) : idem vers un tgz — le doublon n'est pas écrit (un seul `config` dans le tar) et le code 1 vient du doublon
+            # (liste vérifiée : pmode None, aucun sauté), jamais d'une liste non vérifiable
+            ts=os.path.join(o,'rs.tgz'); c,so,e,lg=cli('ix','-f','etc','-W',ts,'-b','arch3')
+            with tfm.open(ts) as x: tsm=sorted(m.name for m in x.getmembers() if m.isfile())
+            if not (c==1 and lg==['export-tar'] and tsm==['config','other'] and warn(e,CLASH) and e.count('[WARN]')==1 and 'non vérifiables' not in e):
+                bad("tgz : snapshot périmé",f"code {c} {lg} {tsm} {e[-300:]!r}")
+            # revue 2 (G2-3) : snapshot SANS AUCUNE ligne pour la sélection (archive indexée quand elle ne contenait que zz/f, puis recréée
+            # sous le même nom depuis src) -> refusé, borg list : rangement, code 0 (pas un faux « liste complète et vide » : doublons non écrits)
+            s5=os.path.join(d,'s5src'); os.makedirs(os.path.join(s5,'zz'))
+            with open(os.path.join(s5,'zz','f'),'w') as f: f.write('zz\n')
+            r=subprocess.run([borg,'create',repo+'::arch5','.'],env=env,cwd=s5,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            p=_rb_run([me,'-C',rc,'-c','Index','-n','ix'],300,env=cenv)
+            r2=subprocess.run([borg,'delete',repo+'::arch5'],env=env,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            r3=subprocess.run([borg,'create',repo+'::arch5','.'],env=env,cwd=src,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            if r.returncode or p.returncode not in (0,1) or r2.returncode or r3.returncode: bad("préparation arch5",f"{r.returncode} {p.returncode} {r2.returncode} {r3.returncode}")
+            r5s=os.path.join(o,'r5s'); c,so,e,lg=cli('ix','-f','etc','-W',r5s,'-b','arch5')
+            if not (c==0 and lg==['list','export-tar'] and sorted(os.listdir(r5s))==['a','b','c'] and warn(e,COLL) and 'non écrit' not in e):
+                bad("snapshot sans ligne pour la sélection",f"code {c} {lg} {sorted(os.listdir(r5s)) if os.path.isdir(r5s) else None} {e[-300:]!r}")
+            # revue 1 (row 4) : un exclu enregistré pour le nick (l'Index incrémental n'en écrit pas) -> snapshot refusé, borg list
+            dbp=os.path.join(d,'cache','rc-ix-diff.db'); x_=sqlite3.connect(dbp)
+            try: x_.execute("INSERT INTO snap_excluded_stats (nick,archive,file_count,total_size) VALUES ('ix','arch1',1,1)"); x_.commit()
+            finally: x_.close()
+            rx=os.path.join(o,'rx'); c,so,e,lg=cli('ix','-f','etc','-W',rx)
+            x_=sqlite3.connect(dbp)
+            try: x_.execute("DELETE FROM snap_excluded_stats WHERE nick='ix' AND archive='arch1'"); x_.commit()
+            finally: x_.close()
+            if not (c==0 and lg==['list','export-tar'] and warn(e,COLL)): bad("exclu enregistré",f"code {c} {lg} {e[-200:]!r}")
+            # revue 2 (row 16) : noms non UTF-8 (borg list les rend avec « ? ») et « ? » LÉGITIME (page?id=1) — comparés sous la même forme,
+            # collisions réelles rangées (code 0), noms écrits sous leurs vrais octets ; jamais de mode « liste non vérifiable » pour un « ? »
+            ns=os.path.join(d,'nsrc'); nb=os.fsencode(ns)
+            for dn,fn in ((b'u1',b'caf\xe9'),(b'u2',b'caf\xe8'),(b'v1\xe9',b'n'),(b'v2\xe9',b'n'),(b'w/a',b'config'),(b'w/b',b'config'),(b'w/c',b'page?id=1'),(b'x1/a\xe9',b'log'),(b'y1/a\xe9',b'log')):
+                os.makedirs(os.path.join(nb,dn),exist_ok=True)
+                with open(os.path.join(nb,dn,fn),'w') as f: f.write(fn.decode('latin1')+'\n')
+            r=subprocess.run([borg,'create',repo+'::arch4','.'],env=env,cwd=ns,capture_output=True,text=True,timeout=300,stdin=subprocess.DEVNULL)
+            if r.returncode: bad("préparation arch4",r.stderr[-200:])
+            ru=os.path.join(o,'ru'); c,so,e,lg=cli('s','-f','u*','-W',ru,'-b','arch4')
+            ru_=[(a_[len(os.fsencode(ru))+1:],b_) for a_,_ds,fs_ in os.walk(os.fsencode(ru)) for b_ in fs_] if os.path.isdir(ru) else None
+            if not (c==0 and sorted(ru_ or [])==[(b'u1',b'caf\xe9'),(b'u2',b'caf\xe8')] and warn(e,COLL) and 'non écrit' not in e and 'non vérifiables' not in e):
+                bad("noms non UTF-8 distincts",f"code {c} {ru_} {e[-300:]!r}")
+            rv=os.path.join(o,'rv'); c,so,e,lg=cli('s','-f','v*','-W',rv,'-b','arch4')
+            if not (c==0 and sorted(os.listdir(os.fsencode(rv)))==[b'v1\xe9',b'v2\xe9'] and rd(os.path.join(rv,os.fsdecode(b'v1\xe9'),'n'))=='n\n'
+                    and warn(e,COLL) and 'non écrit' not in e and 'non vérifiables' not in e):
+                bad("noms non UTF-8, collision réelle",f"code {c} {sorted(os.listdir(os.fsencode(rv))) if os.path.isdir(rv) else None} {e[-300:]!r}")
+            rw=os.path.join(o,'rw'); c,so,e,lg=cli('s','-f','w','-W',rw,'-b','arch4')
+            if not (c==0 and sorted(os.listdir(rw))==['a','b','c'] and rd(os.path.join(rw,'a','config'))=='config\n' and rd(os.path.join(rw,'b','config'))=='config\n'
+                    and rd(os.path.join(rw,'c','page?id=1'))=='page?id=1\n' and warn(e,COLL) and e.count('[WARN]')==1):
+                bad("nom avec « ? » légitime : collision réelle rangée",f"code {c} {sorted(os.listdir(rw)) if os.path.isdir(rw) else None} {e[-300:]!r}")
+            tv=os.path.join(o,'rv.tgz'); c,so,e,lg=cli('s','-f','v*','-W',tv,'-b','arch4')
+            with tfm.open(tv) as x: nv=sorted(os.fsencode(m.name) for m in x.getmembers() if m.isfile())
+            if not (c==0 and nv==[b'v1\xe9/n',b'v2\xe9/n'] and warn(e,COLL) and 'non écrit' not in e): bad("tgz : noms non UTF-8, collision réelle",f"code {c} {nv} {e[-300:]!r}")
+            # revue 2 (fullcheck 221, M9) : un nom non UTF-8 dont la collision demande UN NIVEAU DE PLUS (x1/a<E9>/log, y1/a<E9>/log : « a? / log »
+            # collisionne sous la forme listée de borg list) — le niveau n'est retrouvé que si la clé du flux (octets) est ramenée à la forme listée (_rs) ;
+            # nick NON indexé : liste par `borg list`. Les cas précédents (niveau 2 par défaut) ne distinguent pas une forme non ramenée.
+            rl=os.path.join(o,'rl'); c,so,e,lg=cli('s','-f','?1/*/log','-W',rl,'-b','arch4')
+            rl_=sorted(os.path.relpath(os.path.join(a_,b_),os.fsencode(rl)) for a_,_ds,fs_ in os.walk(os.fsencode(rl)) for b_ in fs_) if os.path.isdir(rl) else None
+            if not (c==0 and lg==['list','export-tar'] and rl_==[b'x1/a\xe9/log',b'y1/a\xe9/log'] and warn(e,COLL) and 'non écrit' not in e and 'non vérifiables' not in e):
+                bad("noms non UTF-8, collision réelle : un niveau de plus",f"code {c} {lg} {rl_} {e[-300:]!r}")
+            tl=os.path.join(o,'rl.tgz'); c,so,e,lg=cli('s','-f','?1/*/log','-W',tl,'-b','arch4')
+            with tfm.open(tl) as x: nl_=sorted(os.fsencode(m.name) for m in x.getmembers() if m.isfile())
+            if not (c==0 and nl_==[b'x1/a\xe9/log',b'y1/a\xe9/log'] and warn(e,COLL) and 'non écrit' not in e):
+                bad("tgz : noms non UTF-8, collision réelle : un niveau de plus",f"code {c} {nl_} {e[-300:]!r}")
+            # revue 2 (G2-11) : export en échec — le [WARN] de rangement n'est dit qu'APRÈS un export réussi (jamais devant l'échec d'un borg qui n'a rien écrit)
+            rne=os.path.join(o,'rne'); c,so,e,lg=cli('noexp','-f','etc','-W',rne)
+            if not (c==2 and lg==['list','export-tar'] and not warn(e,COLL) and e.count('[WARN]')==0 and 'borg export-tar a échoué' in e and 'export en panne' in e and not os.path.exists(rne)):
+                bad("export en échec : aucun [WARN] de collisions",f"code {c} {lg} {e[-300:]!r}")
+            # --fidele : borg extract brut — existants remplacés sans rien dire, collisions : le dernier gagne, aucune liste
+            r11=os.path.join(o,'r11'); os.makedirs(os.path.join(r11,'d'))
+            with open(os.path.join(r11,'d','a'),'w') as f: f.write('ancien')
+            c,so,e,lg=cli('s','-f','d','-w',r11,'--fidele'); r12=os.path.join(o,'r12'); c2,_,e2,lg2=cli('s','-f','etc','-W',r12,'--fidele')
+            if not (c==0 and rd(os.path.join(r11,'d','a'))=='contenu a\n' and nowarn(e) and lg==['extract'] and c2==0 and sorted(os.listdir(r12))==['config','other']
+                    and nowarn(e2) and lg2==['extract']):
+                bad("--fidele",f"codes {c}/{c2} {lg} {lg2} {e[-200:]!r} {e2[-200:]!r}")
+            if fails: print(f"  {fails}")   # revue 2 (G2-1) : dict d'un bloc, comme _s113_unit — la forme lue par mutrun_lib._verdict_vise
+            return not fails
+        _rbc("Restore sur vrai borg : existants remplacés et dits, relancé sans avertissement, --sans-ecraser, -W avec collisions (snapshot, borg list, liste indisponible), --fidele brut",_s113_real)
         def _s116_real():
             """1.0.215 (story 116, décision de l'utilisateur du 2026-11-09) : trace -d sans passphrase, tous modes — CLI réelle avec -d
             sur vrai borg (BORG_EXE de bac qui exporte BORG_BASE_DIR, HOME de bac, Sentry neutralisé) : Bkp local, Bkp tiré
@@ -36776,7 +37527,8 @@ sys.exit(subprocess.run(['sh','-c',cmd],input=data,env=env).returncode)
                 left=sorted(mei_ls()-before)
                 one=next(iter(meis)) if len(meis)==1 else ''
                 res[tag]=(child is not None and len(meis)==1 and bool(_MEI_NAME.fullmatch(os.path.basename(one)))
-                          and os.path.dirname(one)==parent and parent in tmps and not os.path.exists(one) and left==[],
+                          and os.path.dirname(one)==parent and parent in tmps and not os.path.exists(one)
+                          and (left==[] or tag=='sans TMPDIR'),   # 1.0.221 : /tmp est partagé (runs parallèles de la story 124, autres borg) : un _MEI* nouveau d'un autre processus n'est pas un reste de CE borg ; son dossier (relevé par _mei_mapped) est prouvé retiré
                           child,sorted(meis),parent,left)
             bad={k:v for k,v in res.items() if not v[0]}
             if bad: print(f"  {bad}")
@@ -37723,7 +38475,7 @@ def _cli_main():
             # par BorgHelper.restore() (bibliothèque)
             with (contextlib.nullcontext() if '--fidele' in options else _restore_sigterm()):
                 bh.restore(nick,bid,options['-f'],where,flat=flat,debug=debug,fidele='--fidele' in options,sparse='--creux' in options,
-                           links_as_dirs='--liens-en-dossiers' in options,by_name='--par-nom' in options)
+                           links_as_dirs='--liens-en-dossiers' in options,by_name='--par-nom' in options,no_overwrite='--sans-ecraser' in options)
     elif cmd=='delbkp':
         bh.delbkp(nick,options['-b'],debug=debug)
     elif cmd=='bkp':

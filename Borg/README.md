@@ -1711,10 +1711,11 @@ borgHelper -c Restore -n mon-serveur -f 'home/user' -w /tmp/r --fidele  # mode f
 | `-f` | Chemin exact ou glob (`*`, `?`) — glob réellement fonctionnel depuis 1.0.122 ; style shell de borg : `*` ne franchit pas `/`, `**` si (`'home/*/*.log'`, `'var/**/*.conf'`) |
 | `-w <dest>` | Restauration avec sous-répertoires (répertoire ou `.tar`/`.tgz`) ; 1.0.173 : répertoire absent créé (comme `-W` ; retiré s'il reste vide après un échec de borg) ; destination vide, qui n'est pas un répertoire, non traversable, ou création impossible : `[ERREUR] destination … : …`, code 3, avant tout appel à borg (avant : trace Python). Cible `.tar` : son dossier doit exister |
 | `-w -` | Tar non-compressé vers stdout (pipeable) |
-| `-W <dest>` | Restauration plate — fichiers à la racine ; 1.0.173 : mêmes refus que `-w`, code 3 (avant : trace Python vers un fichier ou sans droits) |
+| `-W <dest>` | Restauration plate — fichiers à la racine ; 1.0.173 : mêmes refus que `-w`, code 3 (avant : trace Python vers un fichier ou sans droits) ; 1.0.221 (mode sûr) : deux fichiers de même nom dans la sélection ne s'écrasent plus — chacun est rangé sous son dossier parent, `[WARN]` (voir « Existants et collisions ») |
 | `-W -` | Tar plat non-compressé vers stdout |
 | `-L` | Affiche droits/propriétaires sans restaurer |
 | `--liens-en-dossiers` | (1.0.214, mode sûr) lien de l'archive qui a des éléments dessous : remplacé par un vrai dossier, éléments écrits dedans |
+| `--sans-ecraser` | (1.0.221, mode sûr, vers un dossier) les fichiers existants **différents** sont gardés au lieu d'être remplacés : `[WARN] N fichiers existants gardés` + liste, code 1 ; refusé avec `--fidele` ou vers un tar/stdout (code 2) |
 | `--fidele` | (1.0.214) mode fidèle : `borg extract` brut, comme 1.0.212 — attributs étendus et ACL restaurés, **aucune protection** ; CLI seulement |
 | `--creux` | (1.0.214) avec `--fidele` seulement (sinon refus, code 2) : `borg extract --sparse` — fichiers creux restaurés creux ; un fichier préalloué (fichier d'échange) ou de zéros écrits revient creux aussi |
 | `--par-nom` | (1.0.214) propriétaires par NOM de l'archive, cherché sur la machine (numérique si inconnu) ; défaut : uid/gid numériques de l'archive (comme `--numeric-ids`) ; en `--fidele` : `--numeric-ids` retiré de `borg extract` |
@@ -1743,8 +1744,8 @@ tar intermédiaire, mémoire bornée quelle que soit la taille des fichiers), ch
 - fichier écrit sous un nom temporaire voisin (`.<nom>.bhr<hasard>`, `O_EXCL|O_NOFOLLOW`), propriétaire (root seulement), droits
   (setuid compris), date, puis renommé : jamais de fichier à moitié écrit sous son nom final ; liens symboliques, fifo, liens
   physiques (liés au premier nom restauré) créés de même ; dossiers : droits et dates posés en fin de flux ; un dossier vide
-  existant à la place d'un fichier est remplacé, un dossier non vide jamais (sauté) ; fichier existant : remplacé (comme avant ;
-  écrasement : story 113) ;
+  existant à la place d'un fichier est remplacé, un dossier non vide jamais (sauté) ; fichier existant : remplacé et dit, ou laissé
+  s'il est identique, ou gardé avec `--sans-ecraser` (voir « Existants et collisions ») ;
 - lien physique dont le premier nom n'est pas restauré (zone, lien) : second nom écrit comme fichier **indépendant** avec le
   contenu de l'archive (une seconde lecture, `borg export-tar` de ces seuls chemins), `[WARN] lien physique rompu` ;
 - `-W` (à plat), `.tar`/`.tgz` et stdout : écrits **directement** depuis le flux (plus de dossier temporaire ni d'extraction) ;
@@ -1788,17 +1789,63 @@ physiques, fifo, noms non UTF-8, fichier de 600 Mo (mémoire de borgHelper incha
 mesure en root)** : propriétaires étrangers (chown numérique, ou par nom avec `--par-nom`), capacités, périphériques bloc et
 caractère (recréés par mknod en root ; compte ordinaire : sautés, `[WARN]`).
 
+**Existants et collisions** (1.0.221, story 113 ; mode sûr, vers un dossier). Un fichier **déjà présent** à la destination :
+
+- **différent** de celui de l'archive (type, taille, date à la seconde ou droits, ou lien symbolique à une autre cible) : **remplacé** —
+  restaurer, c'est revenir à la version de l'archive (même en lecture seule 0444 : remplacé, droits de l'archive ; écriture atomique,
+  un existant n'est jamais détruit à moitié) — et dit : `[WARN] N fichiers existants remplacés` (`1 fichier existant remplacé`) puis la
+  liste des chemins (de destination ; 50 au plus, puis `… et N autres`), **code 0** ; un fichier remplacé par un dossier et le second
+  nom d'un lien physique y sont comptés, un dossier vide remplacé par un fichier est dit à part (`[WARN] N dossiers existants
+  remplacés`, voir plus bas) ;
+- **identique** (même type, taille, date à la seconde, droits ; lien symbolique : même cible ; comparé par `lstat`, sans suivre de
+  lien) : ni réécrit (même inode, même date) ni dit — relancer une restauration ne produit aucun avertissement ; il compte parmi les
+  éléments restaurés (`Restauré dans <dest> : N éléments`) ; en root, uid/gid de l'archive aussi comparés (le mode sûr les pose) ;
+  un lien symbolique identique est tenu pour un lien créé par cette restauration (`--liens-en-dossiers` le convertit à la relance) ;
+  second nom d'un lien physique déjà présent comme fichier ordinaire identique au premier nom (non lié) : laissé. Limites : le
+  **contenu** n'est pas lu (même taille, date à la seconde et droits = identique) ; attributs étendus et ACL non comparés ; sur un
+  système de fichiers qui arrondit les dates (exFAT, vfat : 2 s) ou fixe les droits au montage, un existant n'est jamais identique :
+  il est remplacé et dit à chaque restauration ;
+- **`--sans-ecraser`** : les existants différents sont **gardés** (rien n'est ouvert en écriture, droits et date d'un dossier présent
+  non plus) : `[WARN] N fichiers existants gardés` + liste, **code 1** ; les fichiers absents sont restaurés, les identiques laissés.
+  Refusé (code 2) avec `--fidele` et vers un tar/stdout, sans objet avec `-L`. Avec `--liens-en-dossiers`, un lien symbolique déjà
+  présent n'est jamais remplacé par un dossier (ses éléments dessous sont sautés, code 1). La commande `--fidele` proposée à chaque
+  Restore est alors annotée « écrase les existants » : le mode fidèle ne garde rien ;
+- **`-W` (à plat)** : avant d'écrire, borgHelper lit la liste de la sélection — le **snapshot** de l'archive si elle est indexée et
+  que la sélection est un chemin exact (aucun appel borg ; refusé si le rc a `IDX_INCLUDE`/`IDX_EXCLUDE`, si des exclus sont
+  enregistrés pour le nick ou si la colonne des droits manque : le snapshot ne serait pas complet), sinon un **`borg list`** de
+  plus (joker, archive non indexée, ou chemin exact sans snapshot : même pour un seul fichier) de cette seule sélection, lu en
+  flux. Le snapshot est aussi refusé si `-f` n'est pas canonique (`./etc`, `etc/../etc` ; `//etc` est accepté : borg et la base le normalisent de même), commence par un style de motif
+  (`re:`, `sh:`, `fm:`, `pp:`, `pf:`), si le nick a le moindre exclu enregistré (`snap_excluded_stats`) ou si la lecture ne rend
+  aucune ligne. Dès qu'au moins deux fichiers de la sélection ont le même nom, `[WARN] collisions de noms : fichiers rangés sous leur dossier parent` (code 0) et **chaque** fichier est écrit sous son
+  dossier parent (`etc/a/config`, `etc/b/config`, `etc/c/other` -> `a/config`, `b/config`, `c/other`) ; si ce chemin collisionne
+  encore, on remonte d'un niveau pour les fichiers concernés (`x/a/log`, `y/a/log` -> `x/a/log`, `y/a/log`). Sans collision :
+  fichiers à la racine, comme avant. Les noms sous `*/log/*` (exclus de la sélection) ne comptent pas. Liste indisponible
+  (`borg list` en échec) : `[WARN] collisions non vérifiables : le dernier de même nom gagne`, code 1, fichiers à la racine (avec
+  `--sans-ecraser` : `[WARN] collisions non vérifiables : le premier de même nom est gardé`, le doublon non écrit). Un dossier existant remplacé par un fichier, ou gardé (`--sans-ecraser`), est dit à part : `[WARN] N dossiers existants remplacés|gardés`.
+  Vers un `.tar`/`.tgz`/stdout, mêmes noms rangés dans le tar (avant : les membres homonymes restaient dans le tar, la perte avait
+  lieu à l'extraction) ; `-W -` : `[WARN]` sur stderr. **Collision imprévue** (la liste ne l'avait pas vue : snapshot périmé — archive
+  supprimée puis recréée sous le même nom) : le doublon n'est **pas écrit** (jamais d'écrasement silencieux), `[WARN] collision de noms
+  imprévue : N fichiers non écrits` + liste des chemins de l'archive, code 1, aussi vers un tar (où un lien physique dont le premier
+  nom a été écarté n'est pas émis non plus : il aurait lié l'homonyme). Un **même chemin d'archive** rendu deux fois par borg
+  (racines imbriquées, `BORG_ROOTBKP` : `/etc` et `/etc/ssh`) n'est pas une collision : le dernier remplace sans rien dire, comme avant.
+  `borg list` rend « ? » à la place de chaque octet non UTF-8 d'un nom : la liste et les noms du flux sont comparés sous cette même
+  forme (un « ? » légitime, `page?id=1`, n'empêche donc rien), le rangement garde les vrais octets ; deux noms distincts de même forme
+  sont rangés par précaution. Les `[WARN]` de rangement sont dits après l'export. Mémoire : un chemin par nom distinct, plus les chemins
+  des noms en collision.
+
 **Mode fidèle** (`--fidele`, CLI seulement — jamais sous borgHelperWWW) : `borg extract` brut de 1.0.212 (dans la destination pour
 `-w`, dans un dossier temporaire pour `-W` et le tar), avis `mode fidèle : aucune protection des bases, du dépôt et du rc` ; aucune
-liste, aucune exclusion : une archive qui contient le dossier des bases, le rc ou un lien vers eux les écrase. Limite connue :
+liste, aucune exclusion : une archive qui contient le dossier des bases, le rc ou un lien vers eux les écrase. Les règles de « Existants
+et collisions » ne s'y appliquent pas (décision 5 de la story 113) : comportement de borg — existants remplacés sans rien dire, `-W` :
+le dernier fichier de même nom gagne. Limite connue :
 archive à racines imbriquées restaurée en `-W` ou en tar — borg suit dans le dossier temporaire les liens qu'il vient d'y créer.
 
-Codes : 0 tout restauré ; 1 éléments sautés (ou avertissement de borg) ; 2 erreur d'arguments (`--creux` sans `--fidele`,
-`--liens-en-dossiers` avec `--fidele` ou vers un tar/stdout, `--par-nom` vers un tar/stdout en mode sûr, option longue avec `-L`, `-b`
-vide), ou **flux interrompu** (borg en échec ou tué, réseau, disque plein ; seconde lecture des liens physiques comprise) :
+Codes : 0 tout restauré (existants remplacés compris) ; 1 éléments sautés, existants gardés (`--sans-ecraser`), doublons de nom non écrits (collision imprévue), collisions non vérifiables (ou avertissement de borg) ; 2 erreur d'arguments (`--creux` sans `--fidele`,
+`--liens-en-dossiers` ou `--sans-ecraser` avec `--fidele` ou vers un tar/stdout, `--par-nom` vers un tar/stdout en mode sûr, option
+longue avec `-L`, `-b` vide), ou **flux interrompu** (borg en échec ou tué, réseau, disque plein ; seconde lecture des liens physiques comprise) :
 fichiers déjà finis gardés, aucun temporaire, `[ERREUR] flux interrompu après « <dernier élément> » : N éléments restaurés
 (fichiers finis gardés) — <cause>` ; 3 destination inutilisable, fichier tar dans une zone ou écriture du tar impossible.
-Fin : `Restauré dans <dest> : N éléments` (`-w` aussi, 1.0.214), puis un `[WARN] N éléments sautés : <raison>` par raison
+Fin (vers un dossier) : les `[WARN]` de rangement et de collisions non vérifiables d'un `-W`, `Restauré dans <dest> : N éléments` (`-w` aussi, 1.0.214), puis, dans cet ordre, `N fichiers existants remplacés`, `N dossiers existants remplacés`, `N fichiers existants gardés`, `N dossiers existants gardés`, `collision de noms imprévue : N fichiers non écrits` et un `[WARN] N éléments sautés : <raison>` par raison (vers un tar : les `[WARN]` de rangement et de collision imprévue sortent avant `Restauré dans`)
 (zone, lien, chemin non normalisé, dossier non vide, périphérique, erreur d'écriture) et la liste des chemins — 50 au plus par
 raison, puis `… et N autres` ; caractères non imprimables d'un nom (saut de ligne, séquence ANSI, C1, U+2028…) écrits `\xNN`/`\uNNNN`,
 octet non UTF-8 `\xNN`.
@@ -3398,7 +3445,9 @@ quelqu'un qui peut y écrire. `/version` donne `restore_enabled` (faux si la rac
 (`restore_root`, à qui peut restaurer sur au moins un nick).
 **Mode sûr seul (borgHelperWWW ≥ 1.34.2, borgHelper ≥ 1.0.214)** : `POST /restore` lance toujours Restore en mode sûr (jamais
 `--fidele`, `--creux`, `--liens-en-dossiers`) ; avis et `[WARN]` de Restore relayés dans `stderr` (codes et statuts HTTP
-inchangés : 0 -> 200, éléments sautés, code 1 -> 400). La réponse ajoute `cli` = `{"sur": "…", "fidele": "…"}` : les commandes
+inchangés : 0 -> 200, éléments sautés, code 1 -> 400 ; 1.0.221, story 113 : `[WARN] N fichiers existants remplacés` et `[WARN] collisions de
+noms : fichiers rangés sous leur dossier parent` d'un `flat=true` relayés de même, code 0 -> 200 ; `--sans-ecraser` n'est pas passé : l'option n'existe qu'en CLI, et une
+destination non vide est déjà refusée par le `409` ci-dessus ; `flat=true` avec une liste de la sélection indisponible, ou une collision imprévue (doublon non écrit) : code 1, donc `400`, alors que les autres fichiers sont écrits (liste indisponible : dernier de même nom gagnant) ; après un `[WARN]` de collisions, `cli.fidele` aplatit sans rangement et écrase : à ne pas copier pour retrouver ce résultat). La réponse ajoute `cli` = `{"sur": "…", "fidele": "…"}` : les commandes
 CLI équivalentes, complètes et copiables (borgHelper exécuté par ce serveur, `-C` du rc du nick — mode dossier : rc du préfixe,
 nick nu —, archive exacte : `bid` ou celle que Restore a choisie — `bid=last` compris —, chemin demandé et destination résolue,
 cités pour le shell ; borgHelper précédé de l'interpréteur qui le lance, comme le serveur), jamais de passphrase ; la ligne

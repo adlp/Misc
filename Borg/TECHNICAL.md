@@ -3032,9 +3032,62 @@ pour `--creux`, `--numeric-ids` retiré par `--par-nom`), sans aucune protection
   qui écrit dans la destination) ; SIGHUP non converti ; signal reçu entre la création d'un temporaire et le relevé de son identité
   (temporaire laissé, jamais celui d'un autre) ; signal reçu pendant le `finally` de `_restore_sigterm` ou après lui (SIG_DFL
   remis) : fin par le signal (-15) au lieu de `sys.exit(143)`.
+- **Existants, `--sans-ecraser`, collisions de `-W` (1.0.221, story 113 ; mode sûr seulement — décision 5 : `--fidele` = borg extract brut)** :
+  `_SafeWriter(…, deep, no_overwrite)`. Existant sur le chemin de destination (`lstat` déjà faite par `_entry`) : `_same(st, ti, pfd, leaf)`
+  — type, taille (fichier), `st_mtime_ns // 10**9 == floor(ti.mtime)` (date à la seconde, comme tar), `S_IMODE == mode & 0o7777`,
+  lien symbolique : `os.readlink(…, dir_fd)` égal à `linkname`, fifo/périphérique : type, droits, date (et `st_rdev`) — identique ->
+  `_kept_same` (rien écrit, `n_ok` et `same` +1, identité notée dans `inos` pour les liens physiques, `occupant` à plat) ; différent ->
+  `no_overwrite` : `kept` (aucune ouverture, un `lstat` seul ; dossier déjà présent : fusionné sans toucher ses droits ni sa date),
+  sinon écriture atomique inchangée (temporaire + `os.replace`) puis `replaced.add(chemin de destination)` — un fichier à la place d'un
+  dossier et le second nom d'un lien physique (`_hardlink`, avant `_mk`) comptent aussi ; un dossier vide à la place d'un fichier va dans
+  `replaced_d` (dit à part, `dossier`) ; à plat, un fichier écrit par CETTE restauration (`occupant`) n'est jamais un « existant » (voir
+  « Revue 1 » : doublon non écrit). Rapport : `_PathLog` (50 chemins puis `more`, comme `_SkipLog`), `_SafeWriter.report()` : remplacés,
+  dossiers remplacés, gardés, dossiers gardés, non écrits (collision imprévue), sautés ; code de sortie `max(borg, 1 si exit1() ou liste
+  indisponible)`, `exit1()` = sautés, rompus, gardés (fichiers ou dossiers), doublons non écrits — les remplacés ne changent pas le code. `-W` : `BorgHelper._restore_flat_plan` AVANT de créer la destination (sous le verrou de priorité) -> `(deep, cause)` ;
+  noms par `_FlatNames` (`first` : un chemin par nom distinct, `many` : tous les chemins d'un nom vu deux fois ; non normalisés et
+  `'/log/' in chemin` écartés — équivalent mesuré de `--exclude */log/*` de borg 1.2.6, un nom `x/a/log` ou `log/top` n'est pas exclu) ;
+  liste : `_restore_snap_names` (chemin exact seulement : les motifs `sh:` de borg ne sont pas ceux de la base ; `_snap_present`,
+  aucun `IDX_INCLUDE`/`IDX_EXCLUDE` au rc, aucune ligne `snap_excluded_stats` non nulle pour le nick, `archive_snapshot_v` par
+  `_psel_under`, colonne `mode` renseignée — dossiers = `d` ; toute exception ou doute : faux, jamais d'échec) sinon
+  `_restore_list_names` : `borg list --exclude */log/* --format '{type}{NUL}{path}{NUL}' ::<archive> <sélection>` (mêmes arguments de
+  sélection qu'`_export_tar_args`) lu en flux par `_restore_stream`, dossiers (`d`) ignorés, `{NUL}` : un nom n'a jamais d'octet NUL ;
+  échec -> cause, `[WARN] collisions non vérifiables : le dernier de même nom gagne` et code 1. `_flat_levels(many)` -> `deep`
+  = {chemin: nombre de derniers composants} pour les seuls fichiers dont « dossier parent/nom » collisionne encore (boucle sur des
+  chemins distincts : termine) ; `_flat_rel(clé, deep)` : le nom seul (`deep` None) ou `deep.get(clé, 2)` derniers composants ;
+  indexé par la forme listée des composants (`_rs` : octet non UTF-8 -> « ? », revue 2), le chemin rendu garde les vrais octets ;
+  utilisé par l'écrivain (`parts`, cible d'un lien physique, `occupant`) et `_restore_tar_entry(ti, flat, deep)` (tar/tgz/stdout, la
+  liste se lit alors après l'ouverture du tar de sortie). Limite : un fichier rangé sous un chemin qui est aussi le dossier d'un autre
+  (`x/a` fichier, `y/x/a/b`) est sauté et dit (`dossier non vide`/`fichier à la place d'un dossier`), jamais silencieux.
+  **Revue 1 de la story 113** : `_SafeWriter(…, last_wins)` — en `-W`, un nom de destination déjà dans `occupant` (écrit par CETTE
+  restauration) n'est jamais un « existant » : doublon NON écrit (`clash`, `[WARN] collision de noms imprévue : N fichiers non écrits`,
+  `exit1()`), sauf liste indisponible dite (`last_wins` : le dernier gagne ; avec `--sans-ecraser` : le premier gardé, doublon non écrit,
+  `[WARN] … le premier de même nom est gardé`). `_restore_flat_plan` rend `(deep, pmode)` — `pmode` None (liste vérifiée) ou `'liste'`
+  (indisponible) — `_restore_plan_warn(deep, pmode, no_overwrite)` dit après l'export. Tar : `_tar_flat_clash(emitted, nm, ln, t, pmode)`,
+  `emitted` = {nom émis: chemin d'archive} — doublon d'un AUTRE chemin d'archive sauté sauf `pmode == 'liste'` ; lien physique dont la
+  cible émise n'est pas son chemin d'origine non émis (il lierait l'homonyme du premier nom écarté), dit.
+  **Revue 2 de la story 113** : un MÊME chemin d'archive rendu deux fois (racines `BORG_ROOTBKP` imbriquées : `borg create ::t /x /x/y`
+  rend `/x/y` deux fois dans `borg list` et dans `export-tar`, mesuré borg 1.2.6) n'est pas une collision (`occupant[dest] == shown` ;
+  tar : même chemin d'archive dans `emitted`) : le dernier remplace sans rien dire (1.0.214), `--sans-ecraser` : le premier gardé sans
+  rien dire ; en `-w`, le second rendu est comparé à ce qui vient d'être écrit (identique : `same`). Noms comparés sous la forme de
+  `borg list` (`_rs`, `remove_surrogates` : un « ? » par octet non UTF-8 ; `_FlatNames.add` ramène chaque nom listé à cette forme,
+  `_flat_rel` ramène la clé du flux à la même forme avant de chercher son niveau) : plus de mode « noms » — deux noms distincts de même
+  forme sont rangés par précaution, une collision que la liste ne verrait pas reste attrapée à l'écriture (`clash`). `_PathLog.report(…,
+  head)` : `_CLASH_HEAD`. `_kept_same` : un lien symbolique identique n'entre dans `made_links` que sans `no_overwrite` (`--sans-ecraser
+  --liens-en-dossiers` ne convertit jamais un lien présent). Seconde lecture des liens physiques : `same_only` (second nom laissé car
+  identique : « laissé (déjà identique, non lié) », pas « écrit »). `_restore_snap_names` : refus si `-f` non canonique
+  (`posixpath.normpath`), style de motif `^[A-Za-z0-9]{2}:`, un exclu enregistré pour le nick (`snap_excluded_stats`, l'Index
+  incrémental n'en écrit pas), 0 ligne ; sonde `_db_has_schema` + `_open_db(role='read')` sous `_NullErr` (aucun `ensure_diff_db`,
+  donc aucun `[ERREUR]` de base ni avis « base non chiffrée »). `_kept_same` : lien symbolique identique dans `made_links` (comme un lien
+  écrit, sauf sous `no_overwrite`) ; `_same` : uid/gid en root ; `_hardlink` : fichier ordinaire identique au premier nom (non lié) laissé. Dossier existant
+  remplacé/gardé : `replaced_d`/`kept_d` (`dossier`). `_SCG_SEEN` : +1 (`_restore_snap_names`). Limites : contenu non lu (xattr, ACL non
+  comparés) ; exFAT/vfat toujours « différent » ; les lignes d'exclus (`snap_excluded_stats`) sont purgées avec les snapshots et l'Index
+  incrémental n'en écrit jamais : un Index complet fait avec `IDX_EXCLUDE`, puis seulement de l'incrémental, puis `IDX_EXCLUDE` retiré du
+  rc, laisse un snapshot incomplet que rien ne signale — la liste manque alors des collisions, le filet de la revue 1 les attrape à
+  l'écriture (doublon non écrit et dit, code 1, aucune perte) au lieu de les ranger.
+  **Coût mesuré** : voir CHANGELOG 1.0.221.
 - Garde AST des ouvertures (`_FOG_WL`) : `_SafeWriter.*|os.open`, `_restore_safe_*` (flux et tar), `_restore_fidele|shutil.copy2`.
 - Contrôles : écrivain sur flux tar fabriqué (zones par chemin et par identité, liens, écriture atomique avec ENOSPC simulé,
-  chemins non normalisés, liens physiques, à plat), options, de bout en bout par borg factice (chaque sous-contrôle dans sa section
+  chemins non normalisés, liens physiques, à plat ; story 113 : existants remplacés/identiques/gardés, collisions de `-W`, tar à plat sur flux fabriqué, noms « ? » et non UTF-8, périphériques, date à la seconde), options, de bout en bout par borg factice (chaque sous-contrôle dans sa section
   `sec` : une exception le met en échec sans perdre les suivants ; `term_run` : vrais SIGTERM — fichier, stdout, rafale, SIG_IGN
   hérité, pendant la sélection —, borg factice toujours tué en fin par son PID vérifié ; SIGTERM désarmé à la réception et SIG_DFL
   rendu, Ctrl-C puis SIGTERM pendant le nettoyage ; marqueur de coupe rejeté par GNU tar ; refus d'un tar dans une zone par chacun
