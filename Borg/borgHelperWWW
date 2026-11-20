@@ -87,7 +87,7 @@ from borgHelper import (Version as BORGHELPER_VERSION, BorgRunner, BorgHelper, _
 # Version de borgHelperWWW lui-même (indépendante de celle de borgHelper qu'il exécute en
 # sous-processus) — à incrémenter uniquement quand le source de borgHelperWWW change, jamais
 # pour un commit qui ne touche que borgHelper ou borgHelperWWW_ui.html.
-WWW_VERSION="1.36.2"
+WWW_VERSION="1.36.3"
 
 def _etxt_rc(x):
     """1.34.1 (story 96, revue 96) : texte d'une exception pour le journal ou une réponse — erreur de lecture d'un rc (configparser,
@@ -2211,11 +2211,17 @@ def _cache_db_paths(nick: Optional[str]):
 def _cache_fingerprint(nick: Optional[str]) -> str:
     parts=[]
     for p in _cache_db_paths(nick):
-        try: parts.append(f"{p}:{os.path.getmtime(p)}")
+        # story 127 (revue 1, C-8) : date en ns ET taille du fichier principal — sur un système de fichiers à dates grossières, une écriture
+        # suivie d'un checkpoint TRUNCATE (le -wal revient à 0, donc « absent ») ne laisserait plus aucune trace dans la même seconde
+        try: m=os.stat(p); parts.append(f"{p}:{m.st_mtime_ns}:{m.st_size}")
         except OSError: parts.append(f"{p}:absent")
         # 1.31.1 (revue story 42) : -wal aussi — un Index écrit d'abord dans le journal WAL, le fichier principal ne bouge qu'au
         # checkpoint ; « Index vide » ([WARN], 1.0.179) est mis en cache et doit être renouvelé dès la 1re tranche (CAP-8)
-        try: w=os.stat(p+'-wal'); parts.append(f"-wal:{w.st_mtime_ns}:{w.st_size}")
+        # story 127 : un -wal de taille 0 = absent — un lecteur SQLite (mode=ro), un processus tué ou un outil externe en laissent un,
+        # la requête suivante le retire en fermant la base : l'empreinte changeait deux fois sans qu'aucune donnée n'ait bougé (réponse
+        # non rangée, tout le cache du nick périmé, mesuré) ; un -wal non vide garde mtime et taille (Index et Bkp invalident toujours)
+        try:
+            w=os.stat(p+'-wal'); parts.append(f"-wal:{w.st_mtime_ns}:{w.st_size}" if w.st_size>0 else "-wal:absent")
         except OSError: parts.append("-wal:absent")
     # 1.36.0 (story 121, revue 1) : le borgHelper qui calcule les réponses — une mise à jour qui change une sortie (vue d'une archive
     # épinglée) ne doit jamais être masquée par une ligne de scopecache.db écrite par l'ancien (persistante : le redémarrage ne la vide pas)
@@ -3787,30 +3793,110 @@ def _http_status(exitcode) -> int:
     """Statut HTTP d'un résultat CLI : 0 -> 200, 4 (opération refusée sur un dépôt externe, 1.28.0) -> 403, sinon 400."""
     return 200 if exitcode==0 else 403 if exitcode==4 else 400
 
+class _Flight:
+    """Calcul en cours d'une entrée de _RESPONSE_CACHE (story 127) : `ev` levé à la fin du chef de file (quoi qu'il arrive),
+    `res` = la réponse (dict de _mdump) qu'il partage — posée pour une réponse saine (code 0 ou 1, hors _never_cache), même si
+    l'empreinte a changé pendant le calcul (alors rien n'est rangé), jamais pour un échec ni un code >= 2 —, `exc` = le 504 de DÉLAI du chef
+    (revue 2, R2-1 : transmis aux suivantes, jamais rangé ; toute autre erreur : les suivantes relancent), `owner` = fil du chef de file
+    (ré-entrée : jamais d'attente sur soi-même)."""
+    __slots__=('ev','res','exc','owner')
+    def __init__(self): self.ev=threading.Event(); self.res=None; self.exc=None; self.owner=threading.get_ident()
+
+# Story 127 (audit 2026-11-19, rapport 3.3 a) : requêtes identiques simultanées regroupées — 3 requêtes = 3 borgHelper de 6 s
+# (Report -o ALL : 11,5 s chacun contre 8,6 s seul, mesuré). Clé = (clé du cache, empreinte à l'arrivée) : une requête arrivée après
+# un changement des bases ne rejoint jamais un calcul commencé sur l'ancien état. Un seul processus serveur : plusieurs workers
+# (--workers) = un regroupement chacun, comme le cache (la version autonome n'a qu'un processus).
+_FLIGHTS_LOCK=threading.Lock()
+_FLIGHTS={}   # (clé de _RESPONSE_CACHE, empreinte) -> _Flight ; retiré par le chef de file à sa fin, exceptions comprises
+# Revue 1 (C-3) : marge (s) de _run_group — au délai, SIGTERM, SIGKILL 10 s après, tubes 10 s de plus : le chef répond jusqu'à TIMEOUT + 30 s ;
+# revue 2 (R2-2) : 60 s, pour le travail du chef autour (argv, _MEI*, sondes de l'empreinte d'après exécution), hors _run_group
+_FLIGHT_WAIT_MARGIN=60
+
+def _flight_join(key,fp):
+    """(vol, chef) : chef = True -> ce fil calcule (vol inscrit, à retirer par _flight_end) ; False -> attendre `vol` (_flight_wait).
+    Ré-entrée du fil qui calcule déjà cette clé : (None, True), il calcule sans s'inscrire (jamais d'interblocage sur soi)."""
+    with _FLIGHTS_LOCK:
+        f=_FLIGHTS.get((key,fp))
+        if f is None:
+            f=_FLIGHTS[(key,fp)]=_Flight(); return f,True
+        if f.owner==threading.get_ident(): return None,True
+        return f,False
+
+def _flight_end(key,fp,f):
+    """Fin du chef de file : vol retiré (si c'est encore le sien) PUIS attente levée — la réponse `f.res` est posée avant. Appelée dès la
+    réponse connue (avant la sérialisation JSON du chef, revue 1 C-7) ET par le `finally` de run_borghelper (filet : exceptions) ; sans effet la 2e fois."""
+    with _FLIGHTS_LOCK:
+        if _FLIGHTS.get((key,fp)) is f: del _FLIGHTS[(key,fp)]
+    f.ev.set()
+
+def _flight_wait(f,cmd):
+    """Réponse du chef de file, ou None (échec, code >= 2, autre erreur : le fil relance alors sa propre exécution, sans nouveau regroupement).
+    Attente bornée par TIMEOUT + _FLIGHT_WAIT_MARGIN (× le nombre de rc en mode dossier, TIMEOUT s'y applique à chaque rc) ; expirée : 504 avec
+    le même `detail` que le chef de file, jamais de relance (revue 1 C-3 : un second borgHelper figé, jusqu'à 2 × TIMEOUT). Revue 2 (R2-1) :
+    le 504 de DÉLAI du chef de file est transmis (même statut, même `detail`) — relancer sur le même montage figé doublerait l'attente."""
+    bound=None if TIMEOUT is None else (TIMEOUT+_FLIGHT_WAIT_MARGIN)*(max(1,len(_rc_state().entries)) if DIR_MODE else 1)
+    if not f.ev.wait(bound): raise HTTPException(504,detail=f"Commande {cmd} : timeout après {TIMEOUT}s")
+    if f.exc is not None: raise HTTPException(f.exc.status_code,detail=f.exc.detail)
+    return f.res
+
+def _response_cache_hit(key,fp,cmd):
+    """Réponse rangée (dict de _mdump) de `key` si son empreinte est `fp` et son âge < _CACHE_TTL de `cmd` ; sinon None."""
+    cached=_RESPONSE_CACHE.get(key); ttl=_CACHE_TTL.get(cmd)
+    if (cached is not None and cached[0]==fp
+            and (ttl is None or time.monotonic()-cached[2]<ttl)):
+        return cached[1]
+    return None
+
 def run_borghelper(cmd: str, nick: Optional[str]=None, extra_args=(), passphrase: Optional[str]=None,
                     cacheable: bool=False) -> JSONResponse:
     pw_digest=_passphrase_digest(passphrase) if cacheable else None
     key=((cmd,nick,tuple(extra_args),pw_digest) if pw_digest is not None else (cmd,nick,tuple(extra_args))) \
         if cacheable else None
-    fp=None
+    fp=None; flight=None
     if key is not None:
         fp=_response_fingerprint(cmd,nick)   # avant l'exécution : un changement pendant celle-ci -> pas de mise en cache
-        cached=_RESPONSE_CACHE.get(key); ttl=_CACHE_TTL.get(cmd)
-        if (cached is not None and cached[0]==fp
-                and (ttl is None or time.monotonic()-cached[2]<ttl)):
-            result_dict=cached[1]
+        result_dict=_response_cache_hit(key,fp,cmd)
+        if result_dict is not None:
             return JSONResponse(status_code=_http_status(result_dict['exitcode']),content=result_dict)
-    result=_exec_borghelper(cmd,nick,extra_args,passphrase)
-    # 1.28.8 (story 36, A62, décisions de l'utilisateur) : codes 0 et 1 seulement — 1 = alerte ou erreur tirée des bases (Report
-    # -o : « diff.db absent », MAX_AGE_BKP ; lecteur : « Aucune archive indexée »), couverte par l'empreinte ; code >= 2 = état
-    # extérieur aux bases (« ⚠ dépôt absent », borg, ssh, dépôt externe) : jamais resservi après remontage.
-    # 1.29.0 (story 37) : arrêt d'un nick ([ERREUR]) exclu aussi (A67) ; entrée datée pour _CACHE_TTL (A66).
-    # Revue : empreinte identique avant et après l'exécution (disque démonté pendant un Report -o : jamais rangé sous « absent »).
-    if (key is not None and result.exitcode in (0,1) and not _never_cache(result)
-            and _response_fingerprint(cmd,nick)==fp):
-        if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
-        _RESPONSE_CACHE[key]=(fp,_mdump(result),time.monotonic())
-    return JSONResponse(status_code=_http_status(result.exitcode),content=_mdump(result))
+        # story 127 : même clé et même empreinte déjà en calcul -> attendre son résultat (rien n'est relancé) ; sans réponse
+        # partageable (échec, code >= 2…), ce fil calcule lui-même (flight=None : jamais un échec partagé, jamais de chaîne d'attentes)
+        flight,leader=_flight_join(key,fp)
+        if not leader:
+            result_dict=_flight_wait(flight,cmd)
+            if result_dict is not None:
+                return JSONResponse(status_code=_http_status(result_dict['exitcode']),content=result_dict)
+            flight=None
+            fp=_response_fingerprint(cmd,nick)   # revue 1 (C-2) : l'empreinte d'arrivée est périmée après l'attente — celle du calcul propre
+    try:
+        if flight is not None:   # chef de file : le précédent a pu ranger sa réponse entre notre lecture du cache et notre inscription
+            result_dict=_response_cache_hit(key,fp,cmd)
+            if result_dict is not None:
+                flight.res=result_dict
+                _flight_end(key,fp,flight)   # revue 2 (R2-5) : réveil avant la sérialisation JSON, comme au chemin normal
+                return JSONResponse(status_code=_http_status(result_dict['exitcode']),content=result_dict)
+        try: result=_exec_borghelper(cmd,nick,extra_args,passphrase)
+        except HTTPException as x:
+            if flight is not None and x.status_code==504: flight.exc=x   # revue 2 (R2-1) : le délai du chef est transmis aux suivantes (jamais rangé)
+            raise
+        # 1.28.8 (story 36, A62, décisions de l'utilisateur) : codes 0 et 1 seulement — 1 = alerte ou erreur tirée des bases (Report
+        # -o : « diff.db absent », MAX_AGE_BKP ; lecteur : « Aucune archive indexée »), couverte par l'empreinte ; code >= 2 = état
+        # extérieur aux bases (« ⚠ dépôt absent », borg, ssh, dépôt externe) : jamais resservi après remontage.
+        # 1.29.0 (story 37) : arrêt d'un nick ([ERREUR]) exclu aussi (A67) ; entrée datée pour _CACHE_TTL (A66).
+        # Revue : empreinte identique avant et après l'exécution (disque démonté pendant un Report -o : jamais rangé sous « absent »).
+        # Story 127 : la MÊME condition « saine » (codes 0 et 1, hors _never_cache) décide de ce que les requêtes en attente reçoivent
+        # (flight.res) — sinon elles relancent ; revue 1 (C-2, décision d'agent) : une réponse saine est partagée même si l'empreinte a changé
+        # pendant le calcul (Index, Bkp en cours : elle reflète un état au moins aussi récent que l'arrivée de chaque requête en attente),
+        # mais n'est rangée que si l'empreinte est la même avant et après.
+        if key is not None and result.exitcode in (0,1) and not _never_cache(result):
+            stored=_mdump(result)
+            if _response_fingerprint(cmd,nick)==fp:
+                if len(_RESPONSE_CACHE)>500: _RESPONSE_CACHE.clear()  # garde-fou anti-croissance illimitée
+                _RESPONSE_CACHE[key]=(fp,stored,time.monotonic())
+            if flight is not None: flight.res=stored
+        if flight is not None: _flight_end(key,fp,flight)   # revue 1 (C-7) : réveil avant la sérialisation JSON du chef
+        return JSONResponse(status_code=_http_status(result.exitcode),content=_mdump(result))
+    finally:
+        if flight is not None: _flight_end(key,fp,flight)
 
 # ── Filtrage a posteriori par périmètre (Story 1.3) ─────────────────────────
 # _run_scoped() : variante non-cacheable de run_borghelper() pour les 6 routes Search/FileHist/
@@ -6118,6 +6204,287 @@ def push_selftest():
             return res
         finally: shutil.rmtree(d,ignore_errors=True)
     check("empreinte des caches : version de borgHelper, date et taille du fichier lancé (une mise à jour ne ressert pas une réponse de l'ancien) (1.36.0)",_fingerprint_borghelper_121)
+    def _fingerprint_empty_wal_127():
+        """Story 127 : dans l'empreinte des caches, un -wal de taille 0 vaut « absent » — un lecteur SQLite (mode=ro), un processus tué ou un
+        outil externe en laissent un que la requête suivante retire : sans cette règle l'empreinte changeait deux fois sans qu'aucune donnée
+        ait bougé (réponse non rangée, cache du nick entier périmé). Un -wal non vide garde mtime et taille (Index et Bkp, qui écrivent
+        d'abord dans le journal, invalident toujours). Bout en bout : un -wal vide posé puis retiré entre deux requêtes n'en relance aucune.
+        Revue 1 (C-8) : le fichier principal est suivi par sa date en ns ET sa taille (chacune seule change l'empreinte)."""
+        d=tempfile.mkdtemp(prefix='bh127w-'); got={}
+        try:
+            db=os.path.join(d,'fp.db'); open(db,'w').write('x'); wal=db+'-wal'
+            res=CommandResult(exitcode=0,stdout='{"ok": 1}',stderr='')
+            cmd='selftest-wal127'
+            def drop(): [_RESPONSE_CACHE.pop(k,None) for k in [k for k in _RESPONSE_CACHE if k and k[0]==cmd]]
+            drop()
+            with mock.patch(f"{__name__}._cache_db_paths",lambda n: [db]):
+                f_abs=_cache_fingerprint('qz')
+                open(wal,'w').close(); f_vide=_cache_fingerprint('qz')
+                os.unlink(wal); f_abs2=_cache_fingerprint('qz')
+                got['vide = absent']=(f_vide==f_abs==f_abs2)
+                open(wal,'w').write('a'); m0=os.stat(wal).st_mtime_ns; os.utime(wal,ns=(m0,m0)); f_non=_cache_fingerprint('qz')
+                got['non vide != absent']=(f_non!=f_abs)
+                os.utime(wal,ns=(m0+7_000_000_000,m0+7_000_000_000)); f_mt=_cache_fingerprint('qz')   # même taille : la date seule change
+                got['non vide : mtime suivi']=(f_mt!=f_non)
+                open(wal,'a').write('b'); os.utime(wal,ns=(m0,m0)); f_sz=_cache_fingerprint('qz')   # même date : la taille seule change
+                got['non vide : taille suivie']=(f_sz!=f_non)
+                open(wal,'w').close(); f_tr=_cache_fingerprint('qz')
+                got['tronqué à 0 = absent']=(f_tr==f_abs)
+                os.unlink(wal)
+                with mock.patch(f"{__name__}._exec_borghelper",return_value=res) as ex:
+                    run_borghelper(cmd,nick='qz',cacheable=True)
+                    open(wal,'w').close(); run_borghelper(cmd,nick='qz',cacheable=True)
+                    os.unlink(wal); run_borghelper(cmd,nick='qz',cacheable=True)
+                    n_vide=ex.call_count
+                    open(wal,'w').write('x'); run_borghelper(cmd,nick='qz',cacheable=True)
+                    n_non=ex.call_count
+                got['bout en bout : -wal vide posé puis retiré = 1 lancement']=(n_vide==1)
+                got['bout en bout : -wal non vide = nouveau lancement']=(n_non==2)
+                os.unlink(wal)
+                md=os.stat(db).st_mtime_ns; os.utime(db,ns=(md,md)); g0=_cache_fingerprint('qz')
+                os.utime(db,ns=(md+7_000_000_000,md+7_000_000_000)); g1=_cache_fingerprint('qz')   # même taille : la date seule change
+                got['fichier principal : date en ns suivie']=(g1!=g0)
+                open(db,'w').write('xy'); os.utime(db,ns=(md,md)); g2=_cache_fingerprint('qz')   # même date : la taille seule change
+                got['fichier principal : taille suivie']=(g2!=g0)
+            drop()
+        finally: shutil.rmtree(d,ignore_errors=True)
+        bad=[k for k,v in got.items() if not v]
+        if bad: print(f"  { {k: False for k in bad} }")
+        return not bad and len(got)==9
+    check("empreinte des caches : un -wal de taille 0 = absent (ni apparition ni disparition ne périme), un -wal non vide garde mtime et taille, le fichier principal date en ns et taille (story 127)",_fingerprint_empty_wal_127)
+    def _flight127(effects,variants=None,n=3,follow=True,timeout=None,db=None,mid=None,again=False,json_wait=False):
+        """Banc des requêtes identiques simultanées (story 127) : n fils lancent run_borghelper (route cacheable) ; `_exec_borghelper` est
+        remplacé par un compteur — son 1er lancement (le chef de file) attend `gate` ; `effects[i]` = effet du i-ème lancement (CommandResult,
+        exception, 'echo' = réponse qui porte les arguments et la passphrase reçus, ou fonction (arguments, passphrase) rendant l'un ou
+        l'autre ; le dernier est répété). `mid` : fonction exécutée quand le chef de file calcule, avant le départ des autres fils.
+        TIMEOUT du banc : 30 s, marge d'attente nulle (un vol jamais levé fait échouer le contrôle par sa durée — les contrôles bornent
+        `secs` à 5 s —, jamais un blocage d'une heure). `follow` : on attend que n-1 fils soient entrés dans _flight_wait avant de lever
+        `gate` (jamais un délai en dur) ; sinon (clés distinctes, délai de l'attente) on attend d'abord la fin des autres fils. `again` : une
+        requête de plus, après les n, pour compter ses lancements. `json_wait` : la construction de la réponse du chef de file (sérialisation
+        JSON) attend, au plus 5 s, que les autres requêtes aient reçu la leur (revue 1, C-7). Rend {'count', 'count4', 'out' (statut, corps ;
+        ou nom d'exception, statut, detail), 'left' (vols restants), 'cached', 'secs', 'alive', 'json_timeout'}."""
+        cmd='selftest-flight127'
+        gate=threading.Event(); entered=threading.Event(); lock=threading.Lock(); calls=[0]; waiting=[0]
+        variants=variants or [{}]*n; out=[None]*n; followers_done=threading.Event(); done=[0]; json_timeout=[False]; leader_id=[None]
+        real_json=JSONResponse
+        def slow_json(*a,**k):
+            if threading.get_ident()==leader_id[0] and not followers_done.wait(5): json_timeout[0]=True
+            return real_json(*a,**k)
+        def fake(c,nick,extra,pw=None):
+            with lock: i=calls[0]; calls[0]+=1
+            if i==0: entered.set(); gate.wait(60)
+            e=effects[min(i,len(effects)-1)]
+            if e=='echo': e=CommandResult(exitcode=0,stdout=json.dumps({'args':list(extra),'pw':pw}),stderr='')
+            elif callable(e): e=e(extra,pw)
+            if isinstance(e,BaseException): raise e
+            return e
+        real_wait=_flight_wait
+        def counting_wait(f,c):
+            with lock: waiting[0]+=1
+            return real_wait(f,c)
+        def one(i):
+            v=variants[i]
+            if i==0: leader_id[0]=threading.get_ident()
+            try:
+                r=run_borghelper(cmd,nick='qz',extra_args=v.get('args',('-j',)),passphrase=v.get('pw'),cacheable=True)
+                out[i]=(r.status_code,json.loads(r.body))
+            except BaseException as e: out[i]=(type(e).__name__,getattr(e,'status_code',None),getattr(e,'detail',None))
+            if i>0:
+                with lock:
+                    done[0]+=1
+                    if done[0]>=n-1: followers_done.set()
+        own=db is None; d=tempfile.mkdtemp(prefix='bh127f-') if own else None
+        if own: db=os.path.join(d,'fp.db'); open(db,'w').write('x')
+        for k in [k for k in _RESPONSE_CACHE if k and k[0]==cmd]: _RESPONSE_CACHE.pop(k,None)
+        t0=time.monotonic(); count4=None
+        try:
+            with mock.patch(f"{__name__}._exec_borghelper",side_effect=fake), mock.patch(f"{__name__}._flight_wait",counting_wait), \
+                 mock.patch(f"{__name__}._cache_db_paths",lambda n_: [db]), mock.patch(f"{__name__}.TIMEOUT",timeout if timeout else 30), \
+                 mock.patch(f"{__name__}._FLIGHT_WAIT_MARGIN",0), \
+                 (mock.patch(f"{__name__}.JSONResponse",slow_json) if json_wait else contextlib.nullcontext()):
+                ths=[threading.Thread(target=one,args=(i,),daemon=True) for i in range(n)]
+                ths[0].start(); entered.wait(15)
+                if mid: mid()
+                for t in ths[1:]: t.start()
+                if follow:
+                    end=time.monotonic()+15
+                    while time.monotonic()<end:
+                        with lock:
+                            if waiting[0]>=n-1: break
+                        time.sleep(0.01)
+                else:
+                    for t in ths[1:]: t.join(12)
+                gate.set()
+                for t in ths: t.join(12)
+                alive=any(t.is_alive() for t in ths)
+                secs=time.monotonic()-t0; count=calls[0]
+                if again:
+                    run_borghelper(cmd,nick='qz',extra_args=variants[0].get('args',('-j',)),passphrase=variants[0].get('pw'),cacheable=True)
+                    count4=calls[0]
+            cached=[k for k in _RESPONSE_CACHE if k and k[0]==cmd]
+            for k in cached: _RESPONSE_CACHE.pop(k,None)
+            with _FLIGHTS_LOCK: left=len(_FLIGHTS)
+            return {'count':count,'count4':count4,'out':out,'left':left,'cached':len(cached),'secs':secs,'alive':alive,'json_timeout':json_timeout[0]}
+        finally:
+            gate.set()
+            if own: shutil.rmtree(d,ignore_errors=True)
+    def _flight_same_127():
+        """Story 127 (AC) : 3 requêtes identiques simultanées = 1 seul borgHelper (3 avant : 6 s chacun, mesuré), et elles ne l'attendent que le
+        temps de son calcul (borne 5 s : un réveil jamais donné les ferait attendre TIMEOUT) ; les trois reçoivent la même réponse (statut,
+        corps) que celle du cache ; code 1 (alerte tirée des bases, rangée comme avant) partagé aussi ; aucun vol ne reste inscrit ; une 4e
+        requête est servie par le cache (aucun lancement de plus). Revue 1 (C-2) : une réponse saine est partagée même si l'empreinte des
+        bases a changé pendant le calcul (Index ou Bkp en cours), sans être rangée."""
+        ok=CommandResult(exitcode=0,stdout='{"ok": 1}',stderr='')
+        warn=CommandResult(exitcode=1,stdout='',stderr="x: diff.db absent — lancez Index")
+        got={}
+        for nm,res,st in (('code 0',ok,200),('code 1',warn,400)):
+            r=_flight127([res],again=True)
+            same=all(o==(st,{'exitcode':res.exitcode,'stdout':res.stdout,'stderr':res.stderr}) for o in r['out'])
+            got[nm+' : un seul lancement, sans attendre']=(r['count']==1 and not r['alive'] and r['secs']<5)
+            got[nm+' : mêmes statut et corps pour les trois']=same
+            got[nm+' : réponse rangée, aucun vol restant']=(r['cached']==1 and r['left']==0)
+            got[nm+' : 4e requête servie par le cache']=(r['count4']==1)
+        r5=_flight127([ok],n=5); got['5 requêtes = 1 lancement']=(r5['count']==1 and r5['secs']<5)
+        dd=tempfile.mkdtemp(prefix='bh127h-')
+        try:
+            db=os.path.join(dd,'fp.db'); open(db,'w').write('x')
+            def bump(*_): open(db+'-wal','w').write('journal'); return ok
+            rc=_flight127([bump],db=db)
+        finally: shutil.rmtree(dd,ignore_errors=True)
+        got['empreinte changée pendant le calcul : réponse saine partagée, rien rangé']=(rc['count']==1 and rc['cached']==0 and rc['left']==0 and not rc['alive']
+                                                                                          and rc['secs']<5 and all(o[0]==200 and o[1]['stdout']==ok.stdout for o in rc['out']))
+        rj=_flight127([ok],json_wait=True)
+        got['réveil des requêtes en attente avant la sérialisation JSON du chef']=(rj['count']==1 and not rj['json_timeout'] and not rj['alive'] and rj['secs']<5
+                                                                                  and all(o[0]==200 for o in rj['out']))
+        bad=[k for k,v in got.items() if not v]
+        if bad: print(f"  { {k: False for k in bad} }")
+        return not bad and len(got)==11
+    check("cache des réponses : 3 requêtes identiques simultanées = 1 seul lancement de borgHelper, même réponse pour les trois, aucun vol resté inscrit (story 127)",_flight_same_127)
+    def _flight_failure_127():
+        """Story 127 : échec ou réponse non partageable du premier -> les suivantes relancent chacune (3 lancements, jamais un échec
+        partagé ni rangé) : code >= 2, exception du chef de file autre que le délai, « [ERREUR] » en code 0 (arrêt d'un nick),
+        DbKeyError. Revue 2 (R2-1) : le 504 de DÉLAI du chef est transmis aux suivantes (même statut et detail, 1 seul lancement, jamais
+        rangé). Revue 1 (C-2) : une suivante qui relance recalcule son empreinte (sa réponse est rangée même si les bases ont changé
+        pendant l'échec du chef). Revue 1 (C-3) : attente d'une suivante bornée par TIMEOUT + marge (× le nombre de rc en mode dossier) ;
+        expirée -> 504 avec le detail du chef de file, jamais de relance. Le vol est retiré dans tous les cas (aucun interblocage)."""
+        ok=CommandResult(exitcode=0,stdout='{"ok": 1}',stderr='')
+        r2=CommandResult(exitcode=2,stdout='',stderr="x: ⚠ dépôt absent (/r)")
+        got={}
+        c2=_flight127([r2])
+        got['code >= 2 : relancées par les 2 suivantes, rien rangé']=(c2['count']==3 and c2['cached']==0 and c2['left']==0 and c2['secs']<5
+                                                                    and all(o[0]==400 for o in c2['out']) and not c2['alive'])
+        ce=_flight127([HTTPException(504,detail="Commande x : timeout après 1s"),ok])
+        got['délai (504) du chef : transmis aux suivantes, jamais rangé, sans relance']=(ce['count']==1 and ce['left']==0 and ce['cached']==0 and ce['secs']<5
+                                                                                      and all(o==('HTTPException',504,"Commande x : timeout après 1s") for o in ce['out'])
+                                                                                      and not ce['alive'])
+        c4=_flight127([HTTPException(400,detail="x : refusé"),ok])
+        got['autre exception HTTP du chef (non 504) : suivantes relancent, leur succès rangé']=(c4['count']==3 and c4['left']==0 and c4['cached']==1 and c4['secs']<5
+                                                                                             and c4['out'][0]==('HTTPException',400,"x : refusé")
+                                                                                             and c4['out'][1][0]==200 and c4['out'][2][0]==200 and not c4['alive'])
+        cx=_flight127([RuntimeError('x'),ok])
+        got['exception inattendue du chef : vol retiré, suivantes servies']=(cx['count']==3 and cx['left']==0 and cx['out'][0][0]=='RuntimeError' and cx['secs']<5
+                                                                         and cx['out'][1][0]==200 and cx['out'][2][0]==200 and not cx['alive'])
+        cn=_flight127([CommandResult(exitcode=0,stdout='{}',stderr="[ERREUR] x: base occupée")])
+        got['[ERREUR] (code 0) : relancées, rien rangé']=(cn['count']==3 and cn['cached']==0 and cn['left']==0 and cn['secs']<5 and not cn['alive'])
+        ck=_flight127([CommandResult(exitcode=0,stdout='{}',stderr="[ERREUR] DbKeyError : x: passphrase incorrecte")])
+        got['DbKeyError : relancées, rien rangé']=(ck['count']==3 and ck['cached']==0 and ck['left']==0 and ck['secs']<5 and not ck['alive'])
+        dd=tempfile.mkdtemp(prefix='bh127g-')
+        try:
+            db=os.path.join(dd,'fp.db'); open(db,'w').write('x')
+            def bump(*_): open(db+'-wal','w').write('journal'); return r2
+            cf=_flight127([bump,ok],db=db)
+        finally: shutil.rmtree(dd,ignore_errors=True)
+        got['suivante qui relance après un échec : empreinte recalculée (sa réponse est rangée)']=(cf['count']==3 and cf['cached']==1 and cf['left']==0 and cf['secs']<5
+                                                                                                 and not cf['alive'] and cf['out'][0][0]==400
+                                                                                                 and cf['out'][1][0]==200 and cf['out'][2][0]==200)
+        ct=_flight127([ok],n=2,follow=False,timeout=0.4)
+        got['attente expirée : 504 comme le chef de file, sans relance']=(ct['count']==1 and ct['left']==0 and ct['secs']<10 and not ct['alive']
+                                                                        and ct['out'][1]==('HTTPException',504,"Commande selftest-flight127 : timeout après 0.4s")
+                                                                        and ct['out'][0][0]==200)
+        def waited(dir_rcs=None):
+            """Durée avant le 504 d'une attente sur un vol jamais levé (TIMEOUT 0,1 s, marge 0,1 s), dans un fil borné ; (durée, fil fini)."""
+            res=[None]
+            def w():
+                t=time.monotonic()
+                try: _flight_wait(_Flight(),'selftest-flight127')
+                except HTTPException: res[0]=time.monotonic()-t
+            with mock.patch(f"{__name__}.TIMEOUT",0.1), mock.patch(f"{__name__}._FLIGHT_WAIT_MARGIN",0.1), \
+                 mock.patch(f"{__name__}.DIR_MODE",bool(dir_rcs)), \
+                 mock.patch(f"{__name__}._rc_state",lambda: type('S',(),{'entries':{str(i):i for i in range(dir_rcs or 0)}})()):
+                t=threading.Thread(target=w,daemon=True); t.start(); t.join(10)
+            return res[0],not t.is_alive()
+        w1,e1=waited(); w3,e3=waited(3)
+        got['attente = TIMEOUT + marge ; mode dossier : x nombre de rc']=(e1 and e3 and w1 is not None and w3 is not None and w1>=0.19 and w3>=0.55)
+        bad=[k for k,v in got.items() if not v]
+        if bad: print(f"  { {k: False for k in bad} }")
+        return not bad and len(got)==9
+    check("cache des réponses : échec du premier (code >= 2, exception autre que le délai, [ERREUR], DbKeyError) -> les suivantes relancent (empreinte recalculée), jamais un échec partagé ni rangé ; délai (504) du chef transmis ; attente expirée = 504 sans relance, aucun interblocage (story 127)",_flight_failure_127)
+    def _flight_keys_127():
+        """Story 127 : seules les requêtes de MÊME clé (commande, nick, arguments, passphrase) et de même empreinte se regroupent :
+        arguments différents ou passphrases différentes = un lancement chacune, chacune sa propre réponse (jamais une réponse servie à qui ne
+        l'a pas demandée) ; deux passphrases identiques = un seul ; ré-entrée du même fil sur sa propre clé : aucun interblocage (calcule sans
+        s'inscrire) ; le chef de file qui relit le cache après son inscription resserre la réponse rangée entre-temps, aussi à la requête en attente."""
+        ok=CommandResult(exitcode=0,stdout='{"ok": 1}',stderr='')
+        got={}
+        def mine(o,args=None,pw=None): return o[0]==200 and json.loads(o[1]['stdout'])=={'args':list(args or ('-j',)),'pw':pw}
+        ra=_flight127(['echo'],variants=[{'args':('-j','a')},{'args':('-j','b')}],n=2,follow=False)
+        got['arguments différents : 2 lancements, sans attendre, chacune sa réponse']=(ra['count']==2 and ra['left']==0 and ra['cached']==2 and not ra['alive'] and ra['secs']<5
+                                                                                   and mine(ra['out'][0],('-j','a')) and mine(ra['out'][1],('-j','b')))
+        rp=_flight127(['echo'],variants=[{'pw':'un'},{'pw':'deux'}],n=2,follow=False)
+        got['passphrases différentes : 2 lancements, sans attendre, chacune sa réponse']=(rp['count']==2 and rp['left']==0 and rp['cached']==2 and not rp['alive'] and rp['secs']<5
+                                                                                         and mine(rp['out'][0],pw='un') and mine(rp['out'][1],pw='deux'))
+        rs=_flight127([ok],variants=[{'pw':'un'},{'pw':'un'},{'pw':'un'}])
+        got['même passphrase : 1 lancement']=(rs['count']==1 and rs['cached']==1 and not rs['alive'] and rs['secs']<5)
+        def nested(*_):
+            r=run_borghelper('selftest-flight127',nick='qz',extra_args=('-j',),cacheable=True)
+            return CommandResult(exitcode=0,stdout='{"ok": 1}',stderr='') if r.status_code==200 else CommandResult(exitcode=3,stdout='',stderr='x')
+        rr=_flight127([nested,ok],n=1)
+        got['ré-entrée du même fil : sans interblocage']=(rr['count']==2 and rr['left']==0 and not rr['alive'] and rr['out'][0][0]==200
+                                                         and rr['secs']<5)
+        dd=tempfile.mkdtemp(prefix='bh127k-')
+        try:
+            db=os.path.join(dd,'fp.db'); open(db,'w').write('x')
+            def bump(*_): open(db+'-wal','w').write('journal'); return ok
+            rf=_flight127([ok],n=2,follow=False,db=db,mid=bump)
+        finally: shutil.rmtree(dd,ignore_errors=True)
+        got["empreinte changée avant l'arrivée : ne rejoint pas le calcul de l'ancien état (2 lancements)"]=(rf['count']==2 and rf['left']==0 and not rf['alive'] and rf['secs']<5)
+        cmd='selftest-flight127'; leader=[None]; seen=[0]; real_hit=_response_cache_hit; real_wait=_flight_wait; waiter_in=threading.Event(); res2=[None,None]
+        def hit(k,fp,c):
+            if threading.get_ident()!=leader[0]: return None   # la requête en attente : cache manqué à son arrivée
+            seen[0]+=1
+            if seen[0]==1: return None   # 1re lecture du chef : manquée ; la 2e (après son inscription) attend la requête en attente
+            waiter_in.wait(10)
+            return real_hit(k,fp,c)
+        def cw(f,c): waiter_in.set(); return real_wait(f,c)
+        waiter_done=threading.Event(); jt=[False]; real_json=JSONResponse
+        def slow_json(*a,**k):   # revue 2 (R2-5) : la réponse du chef n'est construite qu'une fois la requête en attente servie (réveil avant la sérialisation)
+            if threading.get_ident()==leader[0] and not waiter_done.wait(5): jt[0]=True
+            return real_json(*a,**k)
+        def lead():
+            leader[0]=threading.get_ident(); res2[0]=run_borghelper(cmd,nick='qz',extra_args=('-j',),cacheable=True).status_code
+        def wait_one():
+            r=run_borghelper(cmd,nick='qz',extra_args=('-j',),cacheable=True); res2[1]=(r.status_code,json.loads(r.body)); waiter_done.set()
+        for k in [k for k in _RESPONSE_CACHE if k and k[0]==cmd]: _RESPONSE_CACHE.pop(k,None)
+        with mock.patch(f"{__name__}._exec_borghelper",return_value=ok) as ex, mock.patch(f"{__name__}._cache_db_paths",lambda n_: []):
+            run_borghelper(cmd,nick='qz',extra_args=('-j',),cacheable=True)   # range la réponse
+            t0=time.monotonic()
+            with mock.patch(f"{__name__}._response_cache_hit",hit), mock.patch(f"{__name__}._flight_wait",cw), mock.patch(f"{__name__}.TIMEOUT",30), \
+                 mock.patch(f"{__name__}.JSONResponse",slow_json):
+                t1=threading.Thread(target=lead,daemon=True); t1.start()
+                end=time.monotonic()+10
+                while seen[0]<2 and time.monotonic()<end: time.sleep(0.01)   # le chef est inscrit et relit : on lance la requête en attente
+                t2=threading.Thread(target=wait_one,daemon=True); t2.start()
+                t1.join(15); t2.join(15)
+            secs2=time.monotonic()-t0
+            n_ex=ex.call_count
+        for k in [k for k in _RESPONSE_CACHE if k and k[0]==cmd]: _RESPONSE_CACHE.pop(k,None)
+        with _FLIGHTS_LOCK: left=len(_FLIGHTS)
+        got["chef de file : réponse rangée entre la lecture du cache et l'inscription resservie, aussi à la requête en attente, sans lancement"]=(
+            n_ex==1 and res2[0]==200 and res2[1] is not None and res2[1][0]==200 and left==0 and seen[0]==2 and not t1.is_alive() and not t2.is_alive() and secs2<5 and not jt[0])
+        bad=[k for k,v in got.items() if not v]
+        if bad: print(f"  { {k: False for k in bad} }")
+        return not bad and len(got)==6
+    check("cache des réponses : seules les requêtes de même clé et de même empreinte se regroupent (arguments, passphrase), ré-entrée d'un fil sans interblocage (story 127)",_flight_keys_127)
     def _own_source_guards():
         """1.31.18 (story 83, D162a) : gardes de source de borgHelper appliquées à CE fichier par le module borgHelper importé —
         mutrun ne juge un mutant de borgHelperWWW que par ce push selftest. Même portée que la garde « compatibilité Python » de
@@ -7863,7 +8230,7 @@ def push_selftest():
                 check("cache des réponses : arrêt d'un nick ([ERREUR]) ou erreur SQLite en code 0 jamais en cache, trois sites (A67) ; borg create orphelin (1.31.14) jamais dans _RESPONSE_CACHE ; mesures d'avant 1.0.139 non migrées (1.31.16) jamais en cache",_cache_nick_error)
                 def _cache_index_empty_wal():
                     """1.31.1 (story 42, A89 + revue) : « Index vide » ([WARN], code 0 depuis borgHelper 1.0.179) est mis en cache comme
-                    toute réponse saine ; l'empreinte des bases suit aussi leur journal -wal (apparu, grossi, disparu) — un Index écrit
+                    toute réponse saine ; l'empreinte des bases suit aussi leur journal -wal (apparu non vide, grossi, disparu ; un -wal de taille 0 = absent, story 127) — un Index écrit
                     d'abord dans le -wal, le fichier principal ne change qu'au checkpoint : la réponse est renouvelée dès sa 1re écriture."""
                     warn=CommandResult(exitcode=0,stdout='Aucun résultat.\n',stderr='[WARN] Index vide pour qz — lancez : borgHelper -c Index -n qz  [borgHelper v1.0.179]')
                     for k in [k for k in _RESPONSE_CACHE if k and k[0]=='selftest-idxvide']: _RESPONSE_CACHE.pop(k,None)

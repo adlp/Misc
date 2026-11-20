@@ -2688,6 +2688,33 @@ la classe apparaît en sortie. `run_borghelper` n'écrit jamais dans `_RESPONSE_
 en erreur à chaque appel, jamais servi comme un succès obsolète après correction de la passphrase, ni comme une
 erreur périmée après un changement côté serveur.
 
+**Regroupement des requêtes identiques et `-wal` vide (1.36.3, story 127).** `run_borghelper` (route `cacheable`) : après le cache manqué,
+`_flight_join(key, fp)` inscrit sous `_FLIGHTS_LOCK` un `_Flight` (`ev` = `threading.Event`, `res`, `owner` = fil) dans `_FLIGHTS[(key, fp)]` — clé
+du cache ET empreinte relevée à l'arrivée. Le premier fil (chef de file) relit le cache une fois (une réponse rangée entre sa lecture et son
+inscription est resservie), exécute `_exec_borghelper`, et ne pose `flight.res` (le dict `_mdump` rangé) que sous la condition même qui range
+dans `_RESPONSE_CACHE` (code 0 ou 1, pas `_never_cache`) — mais, revue 1 (C-2), même si l'empreinte a changé pendant le calcul (la réponse reflète
+un état au moins aussi récent que l'arrivée de chaque suivante ; elle n'est alors pas rangée : `_response_fingerprint` identique avant et après reste
+la condition du rangement) : l'unique écriture de `_RESPONSE_CACHE` reste celle de `run_borghelper`. Les fils suivants de même `(key, fp)`
+appellent `_flight_wait(f, cmd)` : `ev.wait(bound)` avec `bound = (TIMEOUT + _FLIGHT_WAIT_MARGIN) x (nombre d'entrées de _rc_state() en mode dossier, 1 sinon)`,
+illimité si `TIMEOUT` est `None` (marge 60 s : arrêt du groupe de `_run_group` — SIGTERM, SIGKILL 10 s après, tubes 10 s de plus, 30 s au plus —
+et travail du chef autour : argv, `_MEI*`, sondes de l'empreinte d'après exécution) ; expirée :
+`HTTPException(504, "Commande <cmd> : timeout après <TIMEOUT>s")`, le detail du chef, jamais de relance (C-3). Délai du CHEF (R2-1) : le
+`except HTTPException` autour de `_exec_borghelper` pose `flight.exc` quand `status_code == 504` (délai de `_exec_borghelper` ou du 1er rc de
+`_exec_dir`), `_flight_wait` le relève pour les suivantes (même statut et detail), jamais rangé ; le code 124 du mode dossier (délai au k-ième rc, k > 1)
+n'est pas une réponse saine : les suivantes relancent. `res` absent (échec, code >= 2, autre exception du chef) : `flight=None`, le fil recalcule son empreinte et calcule lui-même, sans nouveau regroupement (pas de chaîne d'attentes derrière
+un échec). `_flight_end` est appelée dès la réponse connue, avant la sérialisation JSON du chef (C-7), et par le `finally` (filet : exceptions) : il
+retire le vol (s'il est encore le sien) PUIS lève `ev`, `res` étant posé avant — aucune sortie du chef de file ne laisse un vol inscrit. Ré-entrée : un fil qui
+rappelle sa propre `(key, fp)` (`owner`) reçoit `(None, True)` et calcule sans s'inscrire (jamais d'attente sur soi). Une empreinte différente
+à l'arrivée = autre clé de vol = autre calcul. Les caches par périmètre (`_run_scoped*`) ne sont pas concernés (déjà hors `_RESPONSE_CACHE`).
+Seulement threads (`threading`, `time`) : aucune API fastapi/starlette ajoutée, la couche de compat de `dist/` n'est pas touchée (la version
+autonome n'a qu'un processus, pool de 40 fils pour les routes synchrones : un seul regroupement ; `--workers N` de l'original : un par worker).
+`_cache_fingerprint` : fichier principal `(st_mtime_ns, st_size)` (C-8 ; avant : `getmtime` flottant) ; `-wal` de taille 0 -> `-wal:absent` (un lecteur `mode=ro`, un processus tué ou un outil externe en laissent un que la
+requête suivante supprime en fermant la base — l'empreinte changeait deux fois sans écriture de donnée) ; non vide -> `(mtime_ns, taille)` comme avant.
+Contrôles push selftest : `_fingerprint_empty_wal_127`, `_flight_same_127`, `_flight_failure_127`, `_flight_keys_127` (banc `_flight127` : compteur de
+lancements, premier lancement retenu par un `Event` jusqu'à ce que les suivants soient dans `_flight_wait`, jamais un délai en dur ; TIMEOUT du banc 30 s
+et durée bornée à 5 s dans chaque cas : un réveil jamais donné fait attendre TIMEOUT et échoue ; les sous-contrôles en échec s'impriment en dict, dont
+la clé est la `vise` des mutants).
+
 ### Sentry durci (`borgHelper`, AD-15)
 
 `sentry_sdk.init` reçoit `include_local_variables=False` (repli sur `with_locals=False` pour `sentry-sdk` < 1.26 où

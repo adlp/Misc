@@ -1,5 +1,50 @@
 # Changelog — borgHelper
 
+## borgHelperWWW 1.36.3 — Cache de réponses : -wal vide ignoré, requêtes identiques simultanées calculées une fois — 2026-11-20
+
+Story 127 (audit 2026-11-19, `work/audit/out/rapport.md` 3.3 et `work/perf/rapport.md`, décision de l'utilisateur, piste P6). Variabilité mesurée
+des temps de l'exploration et du Report hors ligne : deux défauts du cache de réponses de `borgHelperWWW` (`_RESPONSE_CACHE`).
+Numéro de version posé à la fusion (`WWW_VERSION` inchangée dans cette branche).
+
+- **`_cache_fingerprint` : un `-wal` de taille 0 vaut « absent ».** Un lecteur SQLite en `mode=ro`, un processus tué ou un outil externe
+  laissent un `-wal` vide ; la requête suivante le retire en fermant la base. L'empreinte changeait donc deux fois sans qu'aucune donnée
+  ait bougé : la réponse calculée à ce moment n'était pas rangée (empreinte différente avant et après) et toutes les entrées du nick
+  devenaient périmées (mesuré : 3 requêtes identiques recalculées au lieu d'être servies). Un `-wal` non vide garde sa date (mtime en ns)
+  et sa taille : un Index ou un Bkp, qui écrivent d'abord dans le journal, invalident toujours. Le fichier principal est suivi par sa date en
+  ns ET sa taille (avant : date en secondes flottantes seule ; sur un système de fichiers à dates grossières, une écriture suivie d'un
+  `wal_checkpoint(TRUNCATE)` ne laissait plus de trace dans la même seconde). Les empreintes de `scopecache.db` (persistantes) changent de
+  forme une fois à la mise à jour : leurs lignes sont recalculées, sans autre effet.
+- **Requêtes identiques simultanées regroupées.** Avant : 3 requêtes identiques arrivées ensemble sur un cache périmé lançaient 3 `borgHelper`
+  (6 s chacun ; Report `-o` ALL : 11,5 s chacun contre 8,6 s seul, mesuré). Maintenant, une clé de cache (commande, nick, arguments,
+  condensé de passphrase) **déjà en calcul avec la même empreinte** n'est pas relancée : les requêtes suivantes attendent le résultat de la
+  première et reçoivent la même réponse (corps, statut, en-têtes : celle que le cache aurait servie). Règles :
+  - l'attente est bornée par le délai des commandes plus 60 s (`--timeout`, `BORGHELPERWWW_TIMEOUT` ; 0 = illimité ; marge : arrêt du
+    groupe `borgHelper`/`borg` au délai, 30 s au plus, et travail du chef de file autour), multiplié par le nombre de rc en mode dossier
+    (le délai s'y applique à chaque rc) ; expirée : **504**, avec le même message que le chef de file, **jamais de relance** ;
+  - **délai du chef de file** (le 504 de `--timeout`, mode -C ou premier rc du mode dossier) : **transmis tel quel aux suivantes** (même
+    statut, même message), jamais rangé — relancer sur le même montage figé doublerait leur attente (jusqu'à 2 x le délai) ;
+  - ne sont partagées que les réponses saines (code 0 ou 1, hors `_never_cache`) : une réponse saine est partagée **même si l'empreinte des
+    bases a changé pendant le calcul** (Index ou Bkp en cours : elle reflète un état au moins aussi récent que l'arrivée de chaque requête en
+    attente), mais n'est rangée que si l'empreinte est inchangée — comme avant ; **autre échec ou erreur de la première** (code >= 2, autre
+    exception, `[ERREUR]`, `DbKeyError`, code 124 d'un délai au k-ième rc du mode dossier) -> chaque suivante relance son propre `borgHelper` et recalcule son empreinte, jamais un échec partagé
+    ni rangé ;
+  - les requêtes en attente sont réveillées dès la réponse connue, avant sa sérialisation JSON ;
+  - routes mises en cache seulement : un appelant à périmètre restreint (`_run_scoped*`) et Report en ligne gardent un lancement par requête ;
+  - la clé de regroupement porte l'empreinte à l'arrivée : une requête arrivée après un changement des bases ne rejoint jamais un
+    calcul commencé sur l'ancien état ; arguments ou passphrases différents = lancements distincts ;
+  - aucun interblocage : le vol (verrou par clé) est retiré par la première requête à sa fin, exceptions comprises (`finally`) ; un fil qui
+    rappelle sa propre clé calcule sans s'inscrire ;
+  - **un seul processus serveur** : avec plusieurs workers (`--workers N`, version non autonome), chacun a son cache et son regroupement ;
+    la version autonome de `dist/` n'a qu'un processus.
+- Réponses servies **identiques** à avant (mêmes corps, statuts et en-têtes) ; aucune route, option ni variable ajoutée.
+- **Mesure** (vrai serveur, bac local, 127.0.0.1, `lstbkp`/`report -o`) : 3 requêtes simultanées = 3 `borgHelper` avant, 1 après ; `-wal` vide
+  posé avant une requête à froid : 2 lancements pour 3 requêtes avant (la réponse du calcul n'était pas rangée), 1 après ; délai simulé
+  (`--timeout 5`, DuIdx figé) : 3 requêtes simultanées = 3 `borgHelper` avant, 1 après, 504 identique pour les trois, jamais rangé. Refait
+  sur le code final, serveur d'origine et version autonome générée hors du dépôt (mêmes résultats).
+- **Contrôles** (push selftest) : `empreinte des caches : un -wal de taille 0 = absent…`, `cache des réponses : 3 requêtes identiques
+  simultanées = 1 seul lancement…`, `cache des réponses : échec du premier… les suivantes relancent…`, `cache des réponses : seules les
+  requêtes de même clé et de même empreinte se regroupent…`.
+
 ## borgHelper 1.0.222, borgHelperWWW 1.36.2 — Exploration rapide (un clic lit le dossier), borghelper_version écrit seulement par une version plus récente — 2026-11-20
 
 Lot de deux stories (126, 129), vérifiées ensemble. Origine : audit de performance sur la base de production de l'utilisateur.
@@ -142,6 +187,7 @@ l'arborescence et, pour deux fichiers de même nom à des niveaux différents, l
 - Contrôle « _MEI* d'un vrai borg » : dans le cas sans TMPDIR (`/tmp` partagé), un `_MEI*` nouveau créé par un autre processus (runs complets en parallèle, story 124 ; autre borg de la machine) n'est plus pris pour un reste ; le dossier de CE borg, relevé par son mappage, est toujours prouvé retiré (échec vu au premier run complet parallèle, rejoué seul : OK).
 - Docs : README (`--sans-ecraser`, « Existants et collisions », codes), TECHNICAL, LIBRARY (`no_overwrite`), `-H Restore`. borgHelperWWW :
   inchangé — `POST /restore` relaie les `[WARN]` (code 0 -> 200) et ne passe pas `--sans-ecraser`.
+
 
 ## borgHelper 1.0.220, borgHelperWWW 1.36.1 — Report par date, IdxPurge conseille Index, noms d'archive littéraux — 2026-11-18
 

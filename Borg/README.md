@@ -4045,6 +4045,18 @@ au premier appel ; lecture du roster bornée à 1 s (montage figé : dernier ét
 sur un montage figé attend jusqu'à 1 s pour la présence et 1 s pour le roster, par nick). Limite : pour un nick voisin d'un
 dépôt distant (aucun `lock.roster` lisible), le passage « en attente » -> « en cours » du Bkp voisin peut retarder de 5 min.
 
+**Requêtes simultanées et `-wal` (borgHelperWWW 1.36.3)** : trois requêtes identiques (même commande, nick, arguments et passphrase) qui
+arrivent ensemble sur un cache périmé ne lancent plus trois `borgHelper` : la première calcule, les autres attendent son résultat et
+reçoivent la même réponse (aucun lancement de plus), même si les bases ont changé pendant le calcul (Index ou Bkp en cours : la réponse
+n'est alors pas mise en cache). L'attente est bornée par le délai des commandes plus 60 s (× le nombre de rc en mode dossier) ; expirée :
+504, comme la première, sans relance. Si la première dépasse le délai des commandes (504), les suivantes reçoivent le même 504 (relancer sur
+le même montage figé doublerait leur attente) ; pour tout autre échec (code >= 2, exception, `[ERREUR]`…), chaque suivante relance son propre
+`borgHelper` : un échec n'est jamais partagé ni mis en cache. Routes mises en cache seulement : un appelant à périmètre restreint
+(`GROUPS_PATHS`) et `GET /report` en ligne gardent un lancement par requête. Le regroupement vit dans le processus
+serveur, comme le cache : avec `--workers N` chaque worker a le sien (la version autonome `dist/` n'a qu'un processus). Dans l'empreinte,
+un journal `-wal` de taille 0 (laissé par un lecteur SQLite en lecture seule, un processus tué ou un outil externe) compte pour absent : il
+ne périme plus le cache du nick ; un `-wal` non vide (Index, Bkp) l'invalide toujours.
+
 **Lancement de `borgHelper` (borgHelperWWW 1.36.0)** : une commande que ce cache ne sert pas (premier passage dans un répertoire de
 l'explorateur, base modifiée depuis) lance un `borgHelper`. Ce script de 2,8 Mo n'a jamais de `.pyc` quand il est lancé tel quel : il
 était recompilé à chaque lancement (~0,6-0,8 s). Le serveur lance donc `python3 <lanceur> <borgHelper> <arguments>` : le lanceur
